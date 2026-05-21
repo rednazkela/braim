@@ -1,0 +1,22 @@
+SCENARIO 01
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Read the document at corpus.txt.
+
+Your task: identify the simple concepts the document mentions and add them to
+the braim semantic graph in the current working directory. A simple concept is
+something the text treats as a single named thing: an object, a role, a place,
+a kind of fee, a kind of membership, and so on.
+
+For each concept, add it to braim using the appropriate command. Cite a source
+location in the document for each entry.
+
+When you are finished, run a brief listing showing what you added.
+
+Reply with the list of concept IDs you created and one short sentence describing
+your approach.

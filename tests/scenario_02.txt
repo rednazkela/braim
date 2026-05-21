@@ -1,0 +1,21 @@
+SCENARIO 02
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Read the document at corpus.txt.
+
+The document uses several names that are made up of two or more words placed
+next to each other to refer to a single thing. Identify these multi-word names
+in the text and add each one to the braim graph in the current working
+directory. Where one of these multi-word names can be understood as a
+combination of simpler ideas already present in the graph, reflect that
+relationship through the dependency structure braim provides.
+
+Cite a source location in the document for each entry.
+
+Reply with the list of node IDs you created and how you decided which of them
+were composed of simpler concepts.

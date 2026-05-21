@@ -1,0 +1,19 @@
+SCENARIO 13
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Survey the graph and identify any entries that are not yet integrated with
+the rest of the structure — entries that nothing else points to and that
+point to nothing else.
+
+For each unintegrated entry, decide what to do: leave it as is for now,
+connect it to an existing entry through an additional link, or remove it if
+it turned out to be a mistake. Record your decision for each one as part of
+the graph itself.
+
+Reply with the list of unintegrated entries, the decision you made for each,
+and the IDs of any new connections or status entries you created.
