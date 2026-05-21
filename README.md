@@ -6,6 +6,8 @@
 
 @[Every node must track: domain (Vec<String>), sources (Vec<String>), dependency weights, verification status] source: src/graph.rs:Node struct
 
+Serves the higher quality context to an LLM with an agent agnostic, multi source, cross-session approach, fully traceable and verifiable context window that an agent can't corrupt for highly accurate prompt results.
+
 ---
 
 ## Core Concepts
