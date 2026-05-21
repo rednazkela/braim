@@ -1,0 +1,20 @@
+SCENARIO 16
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+An earlier review of the graph in the current working directory flagged a
+handful of concept pairs that have no connecting structure between them —
+the audit's gap register lists them as pending investigations.
+
+Take each flagged pair and either:
+  - add the connection that the document supports, where one is justified,
+    by creating an appropriate new entry (concept or statement); or
+  - record an explicit note explaining why no such connection should exist,
+    so the gap is closed rather than left dangling.
+
+Reply with the original list of gap pairs, the action you took for each,
+and the IDs of any new entries you created.

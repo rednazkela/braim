@@ -1,0 +1,20 @@
+SCENARIO 06
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Read the document at corpus.txt.
+
+The document contains two figures for the size of the library's collection.
+One figure is older and is described in the text itself as no longer accurate;
+a more recent figure is presented as the current count.
+
+Record both figures as statements in the braim graph in the current working
+directory, then mark the older one as refuted, citing the newer figure and the
+relevant passage from the document.
+
+Reply with the IDs of both statements, which one you marked as refuted, and
+the reason you supplied.

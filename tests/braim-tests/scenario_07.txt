@@ -1,0 +1,21 @@
+SCENARIO 07
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Using the braim graph in the current working directory, explore how a few
+concepts in the library domain relate to each other.
+
+1. Show the directed paths braim can find from "Reading Room" to "Library
+   Card". For each path, note the combined weight braim reports.
+
+2. Show the directed paths from "Library Card" to "Late Fee" and the combined
+   weights.
+
+3. Report the shortest connection braim finds between "Member" and "Late Fee".
+
+Reply with the paths, the weight figures braim provided, and the commands you
+ran to obtain them.

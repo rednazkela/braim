@@ -1,0 +1,18 @@
+SCENARIO 17
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Add an entry to the graph that captures something the document does not
+state outright but that follows from reading it as a whole — a pattern or
+implication you concluded by piecing several passages together.
+
+When you record this entry, cite both the document passages that informed
+the conclusion and the kind of reasoning that connects them, so a future
+reader can trace how the observation was reached.
+
+Reply with the entry's ID, its current verification status in the graph,
+and the sources you attached to it.

@@ -1,0 +1,19 @@
+SCENARIO 15
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Add a single statement that ties together three distinct aspects of the
+library's operation: a member's borrowing privileges, the late-fee policy
+that can suspend them, and the membership tier that originally granted them.
+The statement should connect the three corresponding concept entries that
+already exist in the graph.
+
+Categorize the statement under topical categories so a future reader can
+retrieve it from any of those angles.
+
+Reply with the statement ID, the categories you chose, and how you chose
+them.

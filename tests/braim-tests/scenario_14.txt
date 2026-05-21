@@ -1,0 +1,19 @@
+SCENARIO 14
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Earlier in this batch of work an older claim about the size of the library's
+collection was marked as refuted by a newer, more reliable figure. That
+moment is worth a short follow-up entry: what does this single contradiction
+teach about how to weigh older versus newer sources in this domain?
+
+Add a brief observation to the graph that captures the lesson. Make sure the
+observation itself remains a trusted, active part of the graph regardless of
+what happens to the refuted claim it discusses.
+
+Reply with the new observation's ID, its current status in the graph, and
+how you linked it to the surrounding nodes.
