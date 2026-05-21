@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>BRAIM Semantic Graph Viewer</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f0f; color: #e0e0e0; }
+        #container { display: flex; height: 100vh; }
+        #network { flex: 1; background: #1a1a1a; }
+        #sidebar { width: 400px; background: #161616; border-left: 1px solid #333; overflow-y: auto; padding: 20px; }
+        #controls { padding: 15px; background: #202020; border-bottom: 1px solid #333; }
+        input, select { width: 100%; padding: 8px; margin: 5px 0; background: #2a2a2a; color: #e0e0e0; border: 1px solid #444; border-radius: 4px; font-size: 13px; }
+        button { width: 100%; padding: 8px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 5px; }
+        button:hover { background: #0052a3; }
+        h3 { margin: 15px 0 8px 0; font-size: 14px; color: #aaa; }
+        .node-info { background: #2a2a2a; padding: 12px; border-radius: 4px; margin: 10px 0; }
+        .label { font-size: 12px; color: #888; }
+        .value { font-size: 13px; margin-top: 4px; word-break: break-all; }
+        .domain { display: inline-block; background: #0066cc; padding: 2px 8px; border-radius: 3px; margin: 2px; font-size: 11px; }
+        .source { display: inline-block; background: #339933; padding: 3px 8px; border-radius: 3px; margin: 2px; font-size: 11px; }
+        .source.primary { background: #2ecc71; }
+        .source.secondary { background: #f39c12; }
+        .source.tertiary { background: #e74c3c; }
+        .verification { display: inline-block; padding: 4px 8px; border-radius: 3px; margin: 2px; font-size: 11px; font-weight: bold; }
+        .verification.proven_strong { background: #27ae60; color: #fff; }
+        .verification.proven { background: #4CAF50; color: #fff; }
+        .verification.partial { background: #81C784; color: #fff; }
+        .verification.unproven { background: #FDD835; color: #000; }
+        .badge { display: inline-block; font-weight: bold; margin-right: 4px; }
+        .badge-proven-strong { color: #27ae60; }
+        .badge-proven { color: #4CAF50; }
+        .badge-partial { color: #81C784; }
+        .badge-unproven { color: #FDD835; }
+        .inferred-badge { display: inline-block; padding: 3px 8px; border-radius: 3px; margin: 2px; font-size: 11px; font-weight: bold; background: #FF9800; color: #fff; }
+        .invalid-badge { display: inline-block; padding: 3px 8px; border-radius: 3px; margin: 2px; font-size: 11px; font-weight: bold; background: #f44336; color: #fff; }
+        .stats { font-size: 12px; color: #888; margin: 10px 0; }
+        .legend { font-size: 12px; margin-top: 20px; padding-top: 15px; border-top: 1px solid #333; }
+        .legend-item { display: flex; align-items: center; margin: 8px 0; }
+        .legend-color { width: 20px; height: 20px; border-radius: 50%; margin-right: 8px; }
+        .verification-details { background: #2a2a2a; padding: 8px; border-radius: 3px; margin-top: 8px; font-size: 11px; }
+        .verification-detail-item { margin: 4px 0; padding: 2px 0; border-left: 2px solid #666; padding-left: 6px; }
+        .source-type-legend { display: inline-block; padding: 2px 6px; border-radius: 2px; margin: 1px; font-size: 10px; }
+        .source-type-primary { background: #2ecc71; color: #fff; }
+        .source-type-secondary { background: #f39c12; color: #fff; }
+        .source-type-tertiary { background: #e74c3c; color: #fff; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="network"></div>
+        <div id="sidebar">
+            <div id="controls">
+                <input type="text" id="search" placeholder="Search by name or ID...">
+                <select id="filterDomain">
+                    <option value="">All domains</option>
+                </select>
+                <select id="filterSource">
+                    <option value="">All sources</option>
+                </select>
+                <select id="filterVerification" style="display: none;">
+                    <option value="">All verification</option>
+                    <option value="proven_strong">Proven Strong (3+ PRIMARY types)</option>
+                    <option value="proven">Proven (2 PRIMARY types)</option>
+                    <option value="partial">Partial (1 PRIMARY type)</option>
+                    <option value="unproven">Unproven (0 PRIMARY)</option>
+                    <option value="invalid">Invalid</option>
+                </select>
+                <select id="filterNodeType" style="display: none;">
+                    <option value="">All node types</option>
+                    <option value="concepts">Concepts only (atomic + compound)</option>
+                    <option value="facts">Facts only</option>
+                    <option value="claims">Claims only</option>
+                </select>
+                <select id="filterSourceType" style="display: none;">
+                    <option value="">All sources</option>
+                    <option value="primary">PRIMARY sources only</option>
+                </select>
+                <label style="display: block; margin: 8px 0; font-size: 12px; color: #aaa;">
+                    <input type="checkbox" id="includeInvalid" style="width: auto; margin-right: 6px;">
+                    Show invalid statements
+                </label>
+                <button onclick="resetView()">Reset View</button>
+            </div>
+            <div id="info">
+                <div class="stats">Loading...</div>
+            </div>
+            <div class="legend">
+                <strong style="font-size: 13px;">Node Shapes</strong>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #757575; border-radius: 30%;"></div>
+                    <span>Atomic / Compound concept (ellipse)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #757575; border-radius: 0px;"></div>
+                    <span>Statement: claim / fact / invalid_statement (rectangle)</span>
+                </div>
+                <strong style="font-size: 13px; margin-top: 12px; display: block;">Statement Verification Status</strong>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #27ae60;"></div>
+                    <span>✓✓✓ Proven Strong (3+ PRIMARY)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #4CAF50;"></div>
+                    <span>✓✓ Proven (2 PRIMARY)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #81C784;"></div>
+                    <span>✓ Partial (1 PRIMARY)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #FDD835;"></div>
+                    <span>✗ Unproven (0 PRIMARY)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #FF9800;"></div>
+                    <span>Inferred (derived, unverifiable)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #f44336;"></div>
+                    <span>Invalid (refuted)</span>
+                </div>
+                <strong style="font-size: 13px; margin-top: 12px; display: block;">Source Types</strong>
+                <div style="font-size: 11px; margin: 8px 0;">
+                    <span class="source-type-legend source-type-primary">PRIMARY</span> code, doc, schema, config, test, transcript
+                </div>
+                <div style="font-size: 11px; margin: 8px 0;">
+                    <span class="source-type-legend source-type-secondary">SECONDARY</span> phase_N, agent, narrative
+                </div>
+                <div style="font-size: 11px; margin: 8px 0;">
+                    <span class="source-type-legend source-type-tertiary">TERTIARY</span> logic, inference
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script id="data-script">
+        // BRAIM data will be loaded from Python server
+        let allNodes = new vis.DataSet();
+        let allEdges = new vis.DataSet();
+        let originalNodes = [];
+        let nodeMap = {};
+
+        // Color mapping for verification status (statements only)
+        const verificationColors = {
+            proven_strong: '#27ae60', // Dark green: 3+ PRIMARY types
+            proven: '#4CAF50',        // Green: 2 PRIMARY types
+            partial: '#81C784',       // Light green: 1 PRIMARY type
+            unproven: '#FDD835',      // Yellow: 0 PRIMARY
+            inferred: '#FF9800',      // Orange: derived
+            invalid: '#f44336'        // Red: refuted / cascaded
+        };
+
+        // node_type families per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §3.1.
+        // `statement` is legacy and may still appear in unmigrated data.
+        const STATEMENT_FAMILY = new Set(['statement', 'claim', 'fact', 'invalid_statement']);
+
+        function isStatementFamily(node) {
+            return STATEMENT_FAMILY.has(node.node_type);
+        }
+        function isInvalidStatement(node) {
+            return node.node_type === 'invalid_statement' || node.invalid === true
+                || node.verification_status === 'invalid';
+        }
+        function isClaim(node) {
+            return node.node_type === 'claim'
+                || (node.node_type === 'statement' && node.verification_status === 'unproven');
+        }
+        function isFact(node) {
+            return node.node_type === 'fact'
+                || (node.node_type === 'statement' &&
+                    ['partial','proven','proven_strong'].includes(node.verification_status));
+        }
+
+        // Source type classification
+        const sourceTypeTiers = {
+            primary: ['code', 'doc', 'schema', 'config', 'transcript', 'test'],
+            secondary: ['phase_', 'agent', 'narrative'],
+            tertiary: ['logic', 'inference']
+        };
+
+        function getSourceType(source) {
+            const prefix = source.split(':')[0];
+            if (sourceTypeTiers.primary.includes(prefix)) return 'primary';
+            if (sourceTypeTiers.secondary.some(p => prefix.startsWith(p))) return 'secondary';
+            if (sourceTypeTiers.tertiary.includes(prefix)) return 'tertiary';
+            return 'unknown';
+        }
+
+        function hasPrimarySource(sources) {
+            return sources && sources.some(s => getSourceType(s) === 'primary');
+        }
+
+        // Check if statement is inferred
+        function isInferred(node) {
+            return node.sources && node.sources.includes('inferred');
+        }
+
+        // Back-compat alias used in older render paths.
+        function isInvalid(node) { return isInvalidStatement(node); }
+
+        function getNodeColor(node) {
+            if (isStatementFamily(node)) {
+                if (isInvalidStatement(node)) {
+                    return verificationColors.invalid;
+                }
+                if (isInferred(node)) {
+                    return verificationColors.inferred;
+                }
+                return verificationColors[node.verification_status] || verificationColors.unproven;
+            }
+            // Atomic and Compound nodes: neutral gray
+            return '#757575';
+        }
+
+        function getNodeShape(node) {
+            if (isStatementFamily(node)) {
+                return 'box';  // rectangle
+            }
+            return 'ellipse';  // atomic and compound
+        }
+
+        // Try to load data from server
+        function loadData() {
+            // Try different possible server locations
+            const servers = [
+                'http://localhost:8000/current.json',
+                'http://127.0.0.1:8000/current.json',
+                'http://localhost:8001/current.json',
+                'http://localhost:3000/current.json'
+            ];
+
+            let loaded = false;
+            
+            // Try each server
+            const tryServers = async () => {
+                for (const url of servers) {
+                    try {
+                        const response = await fetch(url);
+                        if (response.ok) {
+                            const data = await response.json();
+                            processData(data);
+                            loaded = true;
+                            document.getElementById('info').innerHTML = '<div style="color: #0f0; margin: 10px 0;">✓ Data loaded from server</div>';
+                            return;
+                        }
+                    } catch (e) {
+                        // Server not available, try next
+                    }
+                }
+                
+                // If no server found, show error with instructions
+                if (!loaded) {
+                    showServerError();
+                }
+            };
+            
+            tryServers();
+        }
+
+        function getVerificationScore(node) {
+            if (isStatementFamily(node)) {
+                if (isInvalidStatement(node)) return 0;
+                if (isInferred(node)) return 1;
+                if (node.verification_status === 'unproven') return 1;
+                if (node.verification_status === 'partial') return 2;
+                if (node.verification_status === 'proven') return 3;
+                if (node.verification_status === 'proven_strong') return 4;
+            }
+            return 0;  // Atomic/compound default
+        }
+
+        function getVerificationBadge(status) {
+            const badges = {
+                proven_strong: '✓✓✓',
+                proven: '✓✓',
+                partial: '✓',
+                unproven: '✗',
+                invalid: '✗✗'
+            };
+            return badges[status] || '?';
+        }
+
+        function processData(data) {
+            // First pass: calculate scores and collect all nodes
+            const nodeList = Object.entries(data.nodes).map(([id, node]) => ({
+                id: parseInt(id),
+                node: node,
+                score: getVerificationScore(node)
+            }));
+
+            // Sort by score descending and assign tier
+            nodeList.sort((a, b) => b.score - a.score);
+            const tierSize = Math.ceil(nodeList.length / 4);
+            const sizeMap = { 0: 12, 1: 18, 2: 26, 3: 34 };  // Small, Normal, Big, Large
+
+            const tierMap = {};
+            nodeList.forEach((item, index) => {
+                const tier = Math.min(3, Math.floor(index / tierSize));
+                tierMap[item.id] = sizeMap[tier];
+            });
+
+            // Create nodes with calculated sizes
+            Object.entries(data.nodes).forEach(([id, node]) => {
+                const label = node.label.length > 20 ? node.label.substring(0, 17) + '...' : node.label;
+                const color = getNodeColor(node);
+                const shape = getNodeShape(node);
+                const size = tierMap[node.id] || 20;
+
+                allNodes.add({
+                    id: node.id,
+                    label: label,
+                    title: node.label,
+                    color: color,
+                    shape: shape,
+                    size: size,
+                    data: node,
+                    font: { size: 12, color: '#fff' },
+                    shadow: { enabled: true, color: 'rgba(0,0,0,0.5)', size: 10, x: 0, y: 0 }
+                });
+
+                originalNodes.push(node);
+                nodeMap[node.id] = node;
+            });
+
+            // Create edges (dependencies)
+            Object.values(data.nodes).forEach(node => {
+                Object.entries(node.depends_on).forEach(([depId, weight]) => {
+                    allEdges.add({
+                        from: parseInt(depId),
+                        to: node.id,
+                        label: weight.toFixed(2),
+                        width: Math.max(1, weight * 3),
+                        font: { size: 10, color: '#aaa' },
+                        color: { color: '#555', highlight: '#0066cc' },
+                        smooth: { type: 'continuous' },
+                        arrows: 'to'
+                    });
+                });
+            });
+
+            // Populate filter dropdowns
+            const domains = new Set();
+            const sources = new Set();
+            let hasStatements = false;
+            originalNodes.forEach(n => {
+                if (n.domains) n.domains.forEach(d => domains.add(d));
+                if (n.sources) n.sources.forEach(s => sources.add(s));
+                if (isStatementFamily(n)) hasStatements = true;
+            });
+
+            ['filterDomain', 'filterSource'].forEach(id => {
+                const select = document.getElementById(id);
+                const items = id === 'filterDomain' ? Array.from(domains).sort() : Array.from(sources).sort();
+                items.forEach(item => {
+                    const opt = document.createElement('option');
+                    opt.value = item;
+                    opt.textContent = item;
+                    select.appendChild(opt);
+                });
+            });
+
+            // Show verification + node-type + source-type filters only if there are statements
+            if (hasStatements) {
+                document.getElementById('filterVerification').style.display = 'block';
+                document.getElementById('filterNodeType').style.display = 'block';
+                document.getElementById('filterSourceType').style.display = 'block';
+            }
+
+            // Initialize network
+            initNetwork();
+            updateStats();
+        }
+
+        function showServerError() {
+            const errorHtml = `
+                <div style="color: #f00; margin: 20px 0; font-size: 12px;">
+                    <strong>⚠ Server Required</strong><br><br>
+                    To view the graph, start a local server:<br><br>
+                    <code style="background: #2a2a2a; padding: 8px; display: block; margin: 10px 0; border-radius: 3px;">
+                    cd .braim<br>python3 -m http.server 8000
+                    </code>
+                    Then reload this page.
+                </div>
+                <div style="font-size: 11px; color: #888; margin-top: 20px; padding-top: 20px; border-top: 1px solid #333;">
+                    <strong>Why?</strong><br>
+                    Browsers block loading local files via fetch() for security. A simple HTTP server solves this.
+                </div>
+            `;
+            document.getElementById('info').innerHTML = errorHtml;
+        }
+
+        function initNetwork() {
+            const container = document.getElementById('network');
+            const data = {
+                nodes: allNodes,
+                edges: allEdges
+            };
+            const options = {
+                physics: {
+                    enabled: true,
+                    forceAtlas2Based: {
+                        gravitationalConstant: -50,
+                        centralGravity: 0.01,
+                        springLength: 200,
+                        springConstant: 0.08
+                    },
+                    maxVelocity: 50,
+                    solver: 'forceAtlas2Based',
+                    timestep: 0.35,
+                    stabilization: { iterations: 150 }
+                },
+                interaction: {
+                    navigationButtons: true,
+                    keyboard: true,
+                    hover: true
+                }
+            };
+
+            window.network = new vis.Network(container, data, options);
+
+            network.on('click', (params) => {
+                if (params.nodes.length > 0) {
+                    showNodeInfo(params.nodes[0]);
+                } else {
+                    clearNodeInfo();
+                }
+            });
+
+            network.on('doubleClick', (params) => {
+                if (params.nodes.length > 0) {
+                    network.focus(params.nodes[0], { scale: 2, animation: true });
+                }
+            });
+        }
+
+        function showNodeInfo(nodeId) {
+            const node = nodeMap[nodeId];
+            if (!node) return;
+
+            let html = `<h3>${node.label}</h3>`;
+            html += `<div class="node-info">`;
+            html += `<div class="label">ID</div><div class="value">${node.id}</div>`;
+            html += `<div class="label">Type</div><div class="value" style="text-transform: capitalize;">${node.node_type}</div>`;
+
+            if (node.domains && node.domains.length) {
+                html += `<div class="label">Domains</div><div class="value">`;
+                node.domains.forEach(d => html += `<span class="domain">${d}</span>`);
+                html += `</div>`;
+            }
+
+            if (node.sources && node.sources.length) {
+                html += `<div class="label">Sources</div><div class="value">`;
+                node.sources.forEach(s => {
+                    const sType = getSourceType(s);
+                    html += `<span class="source source-${sType}" title="${sType.toUpperCase()}: ${s}">${s}</span>`;
+                });
+                html += `</div>`;
+            }
+
+            // Show invalid, inferred, or verification status for statement-family nodes
+            if (isStatementFamily(node)) {
+                if (isInvalidStatement(node)) {
+                    html += `<div class="label">Statement Status</div><div class="value">`;
+                    html += `<span class="invalid-badge">INVALID</span>`;
+                    html += `<div style="font-size: 10px; color: #999; margin-top: 4px;">Refuted, contradicted, or cascaded from invalidated dependency</div>`;
+                    if (node.invalid_reason) {
+                        html += `<div style="font-size: 11px; color: #ccc; margin-top: 6px;"><strong>Reason:</strong> ${node.invalid_reason}</div>`;
+                    }
+                    if (node.invalidated_at) {
+                        html += `<div style="font-size: 10px; color: #888; margin-top: 4px;">Invalidated: ${node.invalidated_at}</div>`;
+                    }
+                    html += `</div>`;
+                } else if (isInferred(node)) {
+                    html += `<div class="label">Statement Type</div><div class="value">`;
+                    html += `<span class="inferred-badge">INFERRED</span>`;
+                    html += `<div style="font-size: 10px; color: #999; margin-top: 4px;">Derived relationship (cannot be verified)</div>`;
+                    html += `</div>`;
+                } else if (node.verification_status) {
+                    html += `<div class="label">Verification Status</div><div class="value">`;
+                    html += `<span class="verification ${node.verification_status}">`;
+                    html += `<span class="badge">${getVerificationBadge(node.verification_status)}</span>`;
+                    html += `${node.verification_status.toUpperCase().replace('_', ' ')}`;
+                    if (node.verified_by) {
+                        html += ` (${Object.keys(node.verified_by).length}/3)`;
+                    }
+                    html += `</span></div>`;
+
+                    // Show PRIMARY source count
+                    const primaryCount = node.sources.filter(s => getSourceType(s) === 'primary').length;
+                    html += `<div class="label">PRIMARY Sources</div><div class="value">${primaryCount} of ${node.sources.length}</div>`;
+
+                    if (node.verified_by && Object.keys(node.verified_by).length > 0) {
+                        html += `<div class="verification-details">`;
+                        Object.entries(node.verified_by).forEach(([domain, note]) => {
+                            html += `<div class="verification-detail-item">`;
+                            html += `✓ <strong>${domain}</strong>`;
+                            if (note) html += ` — ${note}`;
+                            html += `</div>`;
+                        });
+                        html += `</div>`;
+                    }
+                }
+            }
+
+            if (Object.keys(node.depends_on).length > 0) {
+                html += `<div class="label">Depends On</div><div class="value">`;
+                Object.entries(node.depends_on).forEach(([id, weight]) => {
+                    const depNode = nodeMap[id];
+                    html += `<div>• ${depNode.label} (${weight.toFixed(2)})</div>`;
+                });
+                html += `</div>`;
+            }
+
+            html += `<div class="label">Status</div><div class="value">${node.status}</div>`;
+            html += `</div>`;
+
+            document.getElementById('info').innerHTML = html;
+        }
+
+        function clearNodeInfo() {
+            updateStats();
+        }
+
+        function updateStats() {
+            const nodeCount = allNodes.length;
+            const edgeCount = allEdges.length;
+            const types = {};
+            originalNodes.forEach(n => {
+                types[n.node_type] = (types[n.node_type] || 0) + 1;
+            });
+
+            let html = `<div class="stats">`;
+            html += `<strong>Graph Statistics</strong><br>`;
+            html += `Nodes: ${nodeCount}<br>`;
+            html += `Edges: ${edgeCount}<br>`;
+            Object.entries(types).forEach(([type, count]) => {
+                html += `${type.charAt(0).toUpperCase() + type.slice(1)}: ${count}<br>`;
+            });
+            html += `</div>`;
+            document.getElementById('info').innerHTML = html;
+        }
+
+        function resetView() {
+            document.getElementById('search').value = '';
+            document.getElementById('filterDomain').value = '';
+            document.getElementById('filterSource').value = '';
+            document.getElementById('filterVerification').value = '';
+            document.getElementById('filterNodeType').value = '';
+            document.getElementById('filterSourceType').value = '';
+            document.getElementById('includeInvalid').checked = false;
+            applyFilters();
+            network.fit({ animation: true });
+        }
+
+        document.getElementById('search').addEventListener('keyup', applyFilters);
+        document.getElementById('filterDomain').addEventListener('change', applyFilters);
+        document.getElementById('filterSource').addEventListener('change', applyFilters);
+        document.getElementById('filterVerification').addEventListener('change', applyFilters);
+        document.getElementById('filterNodeType').addEventListener('change', applyFilters);
+        document.getElementById('filterSourceType').addEventListener('change', applyFilters);
+        document.getElementById('includeInvalid').addEventListener('change', applyFilters);
+
+        function applyFilters() {
+            const searchInput = document.getElementById('search').value.toLowerCase().trim();
+            const domain = document.getElementById('filterDomain').value;
+            const source = document.getElementById('filterSource').value;
+            const verification = document.getElementById('filterVerification').value;
+            const nodeTypeFilter = document.getElementById('filterNodeType').value;
+            const sourceType = document.getElementById('filterSourceType').value;
+            const includeInvalid = document.getElementById('includeInvalid').checked;
+
+            const visibleIds = new Set();
+
+            // Check if search is a number (ID search)
+            const searchId = /^\d+$/.test(searchInput) ? parseInt(searchInput) : null;
+
+            originalNodes.forEach(node => {
+                let match = true;
+
+                // Search by ID or label
+                if (searchInput) {
+                    if (searchId !== null) {
+                        if (node.id !== searchId) match = false;
+                    } else {
+                        if (!node.label.toLowerCase().includes(searchInput)) match = false;
+                    }
+                }
+                if (domain && !node.domains.includes(domain)) match = false;
+                if (source && !node.sources.includes(source)) match = false;
+                if (verification && node.verification_status !== verification) match = false;
+
+                // Per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §3.5: invalid hidden by default.
+                // Concepts (atomic/compound) and the explicit "Invalid" verification
+                // filter selection are not gated by the checkbox.
+                if (!includeInvalid && verification !== 'invalid' && isInvalidStatement(node)) {
+                    match = false;
+                }
+
+                if (nodeTypeFilter === 'concepts' && isStatementFamily(node)) match = false;
+                if (nodeTypeFilter === 'facts' && !isFact(node)) match = false;
+                if (nodeTypeFilter === 'claims' && !isClaim(node)) match = false;
+
+                if (sourceType === 'primary' && !hasPrimarySource(node.sources)) match = false;
+
+                if (match) visibleIds.add(node.id);
+            });
+
+            // Show/hide nodes
+            allNodes.forEach(node => {
+                if (visibleIds.has(node.id)) {
+                    allNodes.update({ id: node.id, hidden: false });
+                } else {
+                    allNodes.update({ id: node.id, hidden: true });
+                }
+            });
+
+            // Hide edges where either endpoint is hidden
+            allEdges.forEach(edge => {
+                const visible = visibleIds.has(edge.from) && visibleIds.has(edge.to);
+                allEdges.update({ id: edge.id, hidden: !visible });
+            });
+
+            updateStats();
+        }
+
+        // Load data when page loads
+        window.addEventListener('load', loadData);
+    </script>
+</body>
+</html>

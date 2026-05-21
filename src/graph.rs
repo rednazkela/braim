@@ -381,6 +381,50 @@ impl Braim {
         }
     }
 
+    pub fn validate_duplicate_sources(sources: &[String]) -> (bool, Vec<String>) {
+        let mut seen = std::collections::HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for source in sources {
+            *seen.entry(source.clone()).or_insert(0) += 1;
+        }
+
+        for (source, count) in seen {
+            if count > 1 {
+                duplicates.push(source);
+            }
+        }
+
+        (duplicates.len() > 0, duplicates)
+    }
+
+    pub fn validate_primary_tertiary_mix(sources: &[String]) -> bool {
+        let mut has_primary = false;
+        let mut has_tertiary = false;
+
+        for source in sources {
+            let (source_type, _location) = Self::parse_source(source);
+            match source_type.tier() {
+                "PRIMARY" => has_primary = true,
+                "TERTIARY" => has_tertiary = true,
+                _ => {}
+            }
+        }
+
+        has_primary && has_tertiary
+    }
+
+    pub fn validate_duplicate_domains(domains: &[String]) -> (bool, std::collections::HashMap<String, usize>) {
+        let mut counts = std::collections::HashMap::new();
+
+        for domain in domains {
+            *counts.entry(domain.clone()).or_insert(0) += 1;
+        }
+
+        let has_dups = counts.values().any(|&count| count > 1);
+        (has_dups, counts)
+    }
+
     pub fn new(data_dir: &str) -> Result<Self, String> {
         let path = PathBuf::from(data_dir);
         fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
@@ -860,7 +904,7 @@ impl Braim {
             // Per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §3.3 — derive node_type from status.
             node_type: NodeType::from_verification_status(verification_status),
             label: text.to_string(),
-            depends_on,
+            depends_on: depends_on.clone(),
             status: NodeStatus::Active,
             created_at: now,
             verified_by: HashMap::new(),
@@ -871,6 +915,23 @@ impl Braim {
         };
 
         self.state.nodes.insert(id, node);
+
+        // Auto-clear gap register for newly connected pairs.
+        let new_statement_deps: Vec<u32> = depends_on.keys().cloned().collect();
+        self.state.gaps.retain(|gap| {
+            for i in 0..new_statement_deps.len() {
+                for j in (i + 1)..new_statement_deps.len() {
+                    let id_a = new_statement_deps[i];
+                    let id_b = new_statement_deps[j];
+                    if (gap.concept_a == id_a && gap.concept_b == id_b) ||
+                       (gap.concept_a == id_b && gap.concept_b == id_a) {
+                        return false;  // remove this gap
+                    }
+                }
+            }
+            true  // keep this gap
+        });
+
         self.flush()?;
         Ok(id)
     }
@@ -1459,6 +1520,28 @@ impl Braim {
         }
 
         Ok(header)
+    }
+
+    pub fn find_decomposable_atomics(&self, label: &str) -> Vec<(u32, String)> {
+        let tokens: Vec<&str> = label.split_whitespace().collect();
+        if tokens.len() < 2 {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        for token in tokens {
+            let lowercase = token.to_lowercase();
+            if let Some(ids) = self.state.dictionary.get(&lowercase) {
+                for id in ids {
+                    if let Some(node) = self.state.nodes.get(id) {
+                        if node.node_type == NodeType::Atomic {
+                            matches.push((*id, node.label.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        matches
     }
 
     /// Returns transitive statement-typed dependents of `node_id`

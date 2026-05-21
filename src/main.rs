@@ -217,6 +217,8 @@ enum ConceptCommands {
         sources: String,
         #[arg(long, help = "Compound dependencies: \"ID:0.5,ID:0.5\" (weights sum to 1.0)")]
         depends: Option<String>,
+        #[arg(long, help = "Reject concepts with duplicate sources or PRIMARY+TERTIARY mix")]
+        strict_sources: bool,
     },
     #[command(about = "Delete a concept (requires --force unless unused)", long_about = "Concept Delete: Remove a concept from the graph.\n\nUsage:\n  braim concept delete 42         # Fails if concept is referenced\n  braim concept delete 42 --force # Force delete (dangerous, breaks statements)\n\nSafety: Deleting a concept breaks any statements/compounds that depend on it.\nUse --force only if you're certain no statements reference this ID.")]
     Delete {
@@ -247,6 +249,10 @@ enum StatementCommands {
         inferred: bool,
         #[arg(long, help = "Skip validation checks")]
         assume: bool,
+        #[arg(long, help = "Reject statements with duplicate sources or PRIMARY+TERTIARY mix")]
+        strict_sources: bool,
+        #[arg(long, help = "Reject statements with duplicate domains")]
+        strict_domains: bool,
     },
     #[command(about = "Add verification evidence for a statement", long_about = "Statement Verify: Record evidence that supports a statement.\n\n⚠ NOTE: Verification status is now AUTO-CALCULATED from typed sources at statement creation.\nThis command is maintained for backward compatibility but is rarely needed.\n\nModern approach (preferred):\n  braim statement add \"...\" --sources \"code:a.rs,doc:b.md\" ...\n  → Status auto-calculated to PROVEN (2 PRIMARY sources)\n\nLegacy approach (still supported):\n  braim statement verify 42 wikipedia --note \"https://en.wikipedia.org/wiki/Payment\"\n  braim statement verify 42 rfc --note \"RFC 3501 section 3.2\"\n\nOld Verification Levels (deprecated, kept for audit trail):\n  • 0-1 verified_by domains: Unproven\n  • 2 verified_by domains: Partial\n  • 3+ verified_by domains: Proven\n\nUse statement add with typed sources instead. Sources determine verification automatically.")]
     Verify {
@@ -372,9 +378,31 @@ fn main() {
             domains,
             sources,
             depends,
+            strict_sources,
         }) => {
             let domains_list = parse_list(&domains);
             let sources_list = parse_list(&sources);
+
+            // Validate duplicate sources
+            let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
+            if has_dup_sources {
+                if strict_sources {
+                    eprintln!("Error: duplicate source entries detected");
+                    std::process::exit(1);
+                } else {
+                    tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
+                }
+            }
+
+            // Validate PRIMARY+TERTIARY mix
+            if Braim::validate_primary_tertiary_mix(&sources_list) {
+                if strict_sources {
+                    eprintln!("Error: PRIMARY and TERTIARY sources mixed on same statement");
+                    std::process::exit(1);
+                } else {
+                    tips::emit_tip_primary_tertiary_mix(cli.quiet);
+                }
+            }
 
             let depends_map = match depends {
                 Some(d) => Some(match parse_depends(&d) {
@@ -413,6 +441,24 @@ fn main() {
                         println!("}}");
                     }
                     tips::emit_tip_concept_add(node, cli.quiet);
+
+                    // Check for decomposable atomics (Issue 5)
+                    if node.node_type == NodeType::Atomic {
+                        let decomposable = braim.find_decomposable_atomics(&node.label);
+                        if decomposable.len() >= 2 {
+                            let dep_spec = decomposable
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, (id, _))| {
+                                    let weight = 1.0 / decomposable.len() as f64;
+                                    format!("{}:{:.1}", id, weight)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            tips::emit_tip_decomposable_compound(&node.label, &decomposable, &dep_spec, cli.quiet);
+                        }
+                    }
+
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -489,6 +535,8 @@ fn main() {
             depends,
             inferred,
             assume,
+            strict_sources,
+            strict_domains,
         }) => {
             // Validation: inferred flag is mutually exclusive with explicit sources
             if inferred && sources.is_some() {
@@ -529,6 +577,40 @@ fn main() {
                 }
                 (parse_list(domains.as_ref().unwrap()), parse_list(sources.as_ref().unwrap()))
             };
+
+            // Validate duplicate sources (Issue 1)
+            if !inferred {
+                let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
+                if has_dup_sources {
+                    if strict_sources {
+                        eprintln!("Error: duplicate source entries detected");
+                        std::process::exit(1);
+                    } else {
+                        tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
+                    }
+                }
+
+                // Validate PRIMARY+TERTIARY mix (Issue 2)
+                if Braim::validate_primary_tertiary_mix(&sources_list) {
+                    if strict_sources {
+                        eprintln!("Error: PRIMARY and TERTIARY sources mixed on same statement");
+                        std::process::exit(1);
+                    } else {
+                        tips::emit_tip_primary_tertiary_mix(cli.quiet);
+                    }
+                }
+            }
+
+            // Validate duplicate domains (Issue 3)
+            let (has_dup_domains, dup_domain_counts) = Braim::validate_duplicate_domains(&domains_list);
+            if has_dup_domains {
+                if strict_domains {
+                    eprintln!("Error: duplicate domain entries detected");
+                    std::process::exit(1);
+                } else {
+                    tips::emit_tip_duplicate_domains(&dup_domain_counts, cli.quiet);
+                }
+            }
 
             match braim.add_statement(&text, domains_list.clone(), sources_list.clone(), depends_map, assume) {
                 Ok(id) => {

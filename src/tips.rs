@@ -112,6 +112,70 @@ pub fn emit_tip_concept_add(node: &Node, quiet: bool) {
     }
 }
 
+pub fn emit_tip_duplicate_sources(dups: &[String], quiet: bool) {
+    if quiet || tip_disabled() {
+        return;
+    }
+
+    let dup_list = dups
+        .iter()
+        .map(|d| format!("\"{}\"", d))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "⚠ duplicate source entries detected: [{}]. Consider using distinct citations (line numbers, sections) per source slot.",
+        dup_list
+    );
+}
+
+pub fn emit_tip_primary_tertiary_mix(quiet: bool) {
+    if quiet || tip_disabled() {
+        return;
+    }
+
+    eprintln!(
+        "⚠ source taxonomy mix: PRIMARY (doc:, code:, etc.) and TERTIARY (inference:, logic:) on the same statement. Inference is a derivation, not evidence — prefer PRIMARY-only sources here, and record reasoning in label or as a separate inference-only statement that --depends on this one."
+    );
+}
+
+pub fn emit_tip_duplicate_domains(counts: &std::collections::HashMap<String, usize>, quiet: bool) {
+    if quiet || tip_disabled() {
+        return;
+    }
+
+    let dup_list = counts
+        .iter()
+        .filter(|&(_, &count)| count > 1)
+        .map(|(domain, &count)| format!("\"{}\"×{}", domain, count))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "⚠ duplicate domain entries detected: [{}]. The arity rule requires count equality, not value equality — consider using distinct domains (e.g. \"library,operations,finance\") per dependency slot.",
+        dup_list
+    );
+}
+
+pub fn emit_tip_decomposable_compound(
+    label: &str,
+    atomics: &[(u32, String)],
+    dep_spec: &str,
+    quiet: bool,
+) {
+    if quiet || tip_disabled() {
+        return;
+    }
+
+    let atomic_names = atomics
+        .iter()
+        .map(|(_, name)| format!("'{}'", name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "⚠ label '{}' contains existing atomic names: {}. Consider adding this as a compound depending on those atomics: braim concept add '{}' --depends '{}'",
+        label, atomic_names, label, dep_spec
+    );
+}
+
 fn tip_disabled() -> bool {
     std::env::var("BRAIM_NO_TIPS").is_ok()
 }
