@@ -1,0 +1,1849 @@
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::PathBuf;
+use chrono::Utc;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeType {
+    Atomic,
+    Compound,
+    /// Legacy variant kept for permissive deserialization.
+    /// Post-load migration converts these to Claim/Fact/InvalidStatement
+    /// based on verification_status (per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6).
+    Statement,
+    Claim,
+    Fact,
+    InvalidStatement,
+}
+
+impl NodeType {
+    /// True for statement-family nodes (legacy `Statement`, `Claim`, `Fact`,
+    /// `InvalidStatement`). Concepts (`Atomic`, `Compound`) return false.
+    pub fn is_statement_family(&self) -> bool {
+        matches!(self,
+            NodeType::Statement | NodeType::Claim | NodeType::Fact | NodeType::InvalidStatement)
+    }
+
+    /// Derive node_type from verification_status per spec §3.2.
+    pub fn from_verification_status(status: VerificationStatus) -> NodeType {
+        match status {
+            VerificationStatus::Invalid => NodeType::InvalidStatement,
+            VerificationStatus::Unproven => NodeType::Claim,
+            VerificationStatus::Partial
+            | VerificationStatus::Proven
+            | VerificationStatus::ProvenStrong => NodeType::Fact,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeStatus {
+    Active,
+    Pending,
+    Deprecated,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Invalid,
+    #[default]
+    Unproven,
+    Partial,
+    Proven,
+    ProvenStrong,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SourceType {
+    Code,
+    Doc,
+    Schema,
+    Config,
+    Transcript,
+    Test,
+    PhaseN,
+    Agent,
+    Narrative,
+    Logic,
+    Inference,
+}
+
+impl SourceType {
+    pub fn tier(&self) -> &'static str {
+        match self {
+            SourceType::Code | SourceType::Doc | SourceType::Schema |
+            SourceType::Config | SourceType::Transcript | SourceType::Test => "PRIMARY",
+            SourceType::PhaseN | SourceType::Agent | SourceType::Narrative => "SECONDARY",
+            SourceType::Logic | SourceType::Inference => "TERTIARY",
+        }
+    }
+
+    pub fn from_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "code" => Some(SourceType::Code),
+            "doc" => Some(SourceType::Doc),
+            "schema" => Some(SourceType::Schema),
+            "config" => Some(SourceType::Config),
+            "transcript" => Some(SourceType::Transcript),
+            "test" => Some(SourceType::Test),
+            s if s.starts_with("phase_") => Some(SourceType::PhaseN),
+            "agent" => Some(SourceType::Agent),
+            "narrative" => Some(SourceType::Narrative),
+            "logic" => Some(SourceType::Logic),
+            "inference" => Some(SourceType::Inference),
+            _ => None,
+        }
+    }
+}
+
+impl VerificationStatus {
+    pub fn badge(&self) -> &'static str {
+        match self {
+            VerificationStatus::ProvenStrong => "✓✓✓",
+            VerificationStatus::Proven => "✓✓",
+            VerificationStatus::Partial => "✓",
+            VerificationStatus::Unproven => "✗",
+            VerificationStatus::Invalid => "✗✗",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            VerificationStatus::ProvenStrong => "proven_strong",
+            VerificationStatus::Proven => "proven",
+            VerificationStatus::Partial => "partial",
+            VerificationStatus::Unproven => "unproven",
+            VerificationStatus::Invalid => "invalid",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            VerificationStatus::ProvenStrong => "proven_strong (3+ PRIMARY sources)",
+            VerificationStatus::Proven => "proven (2+ PRIMARY sources)",
+            VerificationStatus::Partial => "partial (1 PRIMARY source)",
+            VerificationStatus::Unproven => "unproven (0 PRIMARY sources)",
+            VerificationStatus::Invalid => "invalid (contradicted/superseded)",
+        }
+    }
+
+    /// Canonical rank for inheritance capping per
+    /// BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.1.
+    pub fn rank(&self) -> u8 {
+        match self {
+            VerificationStatus::Invalid => 0,
+            VerificationStatus::Unproven => 1,
+            VerificationStatus::Partial => 2,
+            VerificationStatus::Proven => 3,
+            VerificationStatus::ProvenStrong => 4,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Node {
+    pub id: u32,
+    pub domains: Vec<String>,
+    pub sources: Vec<String>,
+    pub node_type: NodeType,
+    pub label: String,
+    pub depends_on: HashMap<u32, f64>,
+    pub status: NodeStatus,
+    pub created_at: String,
+    #[serde(default)]
+    pub verified_by: HashMap<String, Option<String>>,
+    #[serde(default)]
+    pub verification_status: VerificationStatus,
+    #[serde(default)]
+    pub invalid: bool,
+    #[serde(default)]
+    pub invalid_reason: Option<String>,
+    #[serde(default)]
+    pub invalidated_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GapRecord {
+    pub concept_a: u32,
+    pub concept_b: u32,
+    pub label_a: String,
+    pub label_b: String,
+    pub status: String,
+    pub note: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GraphState {
+    pub nodes: HashMap<u32, Node>,
+    pub dictionary: HashMap<String, Vec<u32>>,
+    pub id_to_domain: HashMap<u32, String>,
+    pub gaps: Vec<GapRecord>,
+    pub next_id: u32,
+    pub version: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VersionMeta {
+    pub description: String,
+    pub saved_at: String,
+    pub data: GraphState,
+}
+
+#[derive(Clone, Debug)]
+pub struct PathInfo {
+    pub path: Vec<u32>,
+    pub weight: f64,
+    #[allow(dead_code)]
+    pub domains: Vec<String>,
+}
+
+pub struct AuditReport {
+    pub orphans: Vec<Node>,
+    pub pending: Vec<Node>,
+    pub gaps: Vec<GapRecord>,
+    pub deprecated_referenced: Vec<Node>,
+}
+
+/// A single candidate source returned by `verify_suggest`.
+/// Per BRAIM_VERIFY_SUGGEST_SPEC §3.2 each candidate carries the concrete
+/// `type:location` source string, a one-line rationale explaining why it
+/// was selected, the promotion-impact prediction (status label the target
+/// would reach if this source is added), and a numeric rank used for sorting.
+#[derive(Clone, Debug)]
+pub struct SuggestedSource {
+    pub source: String,
+    pub rationale: String,
+    pub impact: String,
+    pub rank: u8,
+}
+
+/// Full result of `verify_suggest`. `message` short-circuits everything else
+/// (used for proven_strong / invalid / no-candidates outcomes).
+#[derive(Clone, Debug)]
+pub struct VerifySuggestion {
+    pub statement_id: u32,
+    pub label: String,
+    pub status_label: String,
+    pub primary_count: usize,
+    pub distinct_primary_types: usize,
+    pub message: Option<String>,
+    pub candidates: Vec<SuggestedSource>,
+    pub already_attached_types: Vec<String>,
+    pub missing_primary_types: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DuplicateRecord {
+    pub source_id: u32,
+    pub source_label: String,
+    pub target_id: u32,
+    pub target_label: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportManifest {
+    pub source_path: String,
+    pub imported_count: usize,
+    pub deduplicated_count: usize,
+    pub skipped_count: usize,
+    pub id_mappings: HashMap<u32, u32>,
+    pub duplicates: Vec<DuplicateRecord>,
+}
+
+pub struct Braim {
+    pub data_dir: PathBuf,
+    pub state: GraphState,
+    /// Number of nodes that had a legacy `statement` node_type rewritten
+    /// in-memory during the most recent load. Drives the migration command
+    /// summary so users know whether the on-disk file was already canonical.
+    pub legacy_node_types_migrated: usize,
+}
+
+/// Canonical list of PRIMARY-tier source type prefix names.
+/// Used by verify-suggest to enumerate "missing types that would promote"
+/// and to keep candidate ranking consistent with `SourceType::tier()`.
+const ALL_PRIMARY_TYPES: &[&str] = &[
+    "code", "doc", "schema", "config", "transcript", "test",
+];
+
+fn primary_type_name(t: &SourceType) -> &'static str {
+    match t {
+        SourceType::Code => "code",
+        SourceType::Doc => "doc",
+        SourceType::Schema => "schema",
+        SourceType::Config => "config",
+        SourceType::Transcript => "transcript",
+        SourceType::Test => "test",
+        _ => "",
+    }
+}
+
+fn predicted_status_label(distinct_primary_count: usize) -> &'static str {
+    match distinct_primary_count {
+        0 => "unproven",
+        1 => "partial",
+        2 => "proven",
+        _ => "proven_strong",
+    }
+}
+
+/// Tokenize a label into lowercase alphanumeric terms of length ≥3.
+/// Used by verify-suggest to measure label similarity across statements.
+fn extract_label_terms(label: &str) -> HashSet<String> {
+    label.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.' && c != '/')
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|t| t.len() >= 3)
+        .collect()
+}
+
+fn shared_term_count(a: &HashSet<String>, b: &HashSet<String>) -> usize {
+    a.intersection(b).count()
+}
+
+/// Extract file-path-like substrings from a label and classify them by
+/// extension. Returns (full_token_path, primary_type_prefix).
+/// `full_token_path` preserves any trailing `:line[-range]` location suffix
+/// so the resulting source string can be attached verbatim.
+fn extract_label_paths(label: &str) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for raw in label.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '(' || c == ')') {
+        let token = raw.trim_matches(|c: char|
+            !c.is_alphanumeric() && c != '/' && c != '.' && c != ':' && c != '-' && c != '_');
+        if token.is_empty() {
+            continue;
+        }
+        // Strip any trailing :line[-range] suffix to inspect the extension on the path itself.
+        let path_only = token.split(':').next().unwrap_or(token);
+        let dot_idx = match path_only.rfind('.') {
+            Some(idx) => idx,
+            None => continue,
+        };
+        let ext = path_only[dot_idx + 1..].to_lowercase();
+        let type_prefix = match ext.as_str() {
+            "js" | "ts" | "tsx" | "jsx" | "py" | "rs" | "go" | "java"
+            | "kt" | "rb" | "php" | "c" | "cpp" | "h" | "hpp" | "cs"
+            | "swift" | "scala" | "ex" | "exs" | "el" | "lua" | "sh" => Some("code"),
+            "sql" => Some("schema"),
+            "md" | "mdx" | "rst" | "txt" | "adoc" => Some("doc"),
+            "yml" | "yaml" | "json" | "toml" | "ini" | "conf" | "env" => Some("config"),
+            _ => None,
+        };
+        if let Some(t) = type_prefix {
+            out.push((token.to_string(), t));
+        }
+    }
+    out
+}
+
+impl Braim {
+    pub fn parse_source(source: &str) -> (SourceType, String) {
+        if let Some(colon_idx) = source.find(':') {
+            let prefix = &source[..colon_idx];
+            let location = &source[colon_idx + 1..];
+            if let Some(source_type) = SourceType::from_prefix(prefix) {
+                return (source_type, location.to_string());
+            }
+        }
+        (SourceType::Narrative, source.to_string())
+    }
+
+    pub fn validate_source_prefix(source: &str) -> Result<(), String> {
+        if !source.contains(':') {
+            return Err(format!(
+                "Error: source '{}' missing required type prefix (code:|doc:|schema:|config:|transcript:|test:|phase_N:|agent:|narrative:|logic:|inference:)",
+                source
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn calculate_verification_status_from_sources(sources: &[String]) -> VerificationStatus {
+        let mut primary_types = std::collections::HashSet::new();
+
+        for source in sources {
+            let (source_type, _location) = Self::parse_source(source);
+            if source_type.tier() == "PRIMARY" {
+                primary_types.insert(source_type);
+            }
+        }
+
+        let primary_count = primary_types.len();
+        match primary_count {
+            0 => VerificationStatus::Unproven,
+            1 => VerificationStatus::Partial,
+            2 => VerificationStatus::Proven,
+            _ => VerificationStatus::ProvenStrong,
+        }
+    }
+
+    pub fn new(data_dir: &str) -> Result<Self, String> {
+        let path = PathBuf::from(data_dir);
+        fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
+
+        let current_path = path.join("current.json");
+        let mut state: GraphState = if current_path.exists() {
+            let content = fs::read_to_string(&current_path)
+                .map_err(|e| format!("Failed to read current.json: {}", e))?;
+            serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse current.json: {}", e))?
+        } else {
+            GraphState {
+                nodes: HashMap::new(),
+                dictionary: HashMap::new(),
+                id_to_domain: HashMap::new(),
+                gaps: Vec::new(),
+                next_id: 1,
+                version: 0,
+            }
+        };
+
+        // Permissive read-time migration per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6:
+        // rewrite legacy `statement` node_type in-memory to claim/fact/invalid_statement
+        // based on verification_status. Persistence happens on next flush() or
+        // explicitly via `migrate_node_types()`.
+        let mut legacy_count = 0usize;
+        for node in state.nodes.values_mut() {
+            if matches!(node.node_type, NodeType::Statement) {
+                node.node_type = NodeType::from_verification_status(node.verification_status);
+                legacy_count += 1;
+            }
+        }
+
+        Ok(Braim {
+            data_dir: path,
+            state,
+            legacy_node_types_migrated: legacy_count,
+        })
+    }
+
+    /// Force-rewrite all node_type fields from verification_status and flush
+    /// the result to disk. Returns the total number of nodes that were
+    /// migrated, including any that were already converted in-memory by the
+    /// post-load step in `Braim::new`. Idempotent.
+    pub fn migrate_node_types(&mut self) -> Result<usize, String> {
+        let mut changed = self.legacy_node_types_migrated;
+        for node in self.state.nodes.values_mut() {
+            if !node.node_type.is_statement_family() {
+                continue;
+            }
+            let expected = NodeType::from_verification_status(node.verification_status);
+            if node.node_type != expected {
+                node.node_type = expected;
+                changed += 1;
+            }
+        }
+        // Always flush — the post-load step may already have updated the
+        // in-memory state but not the on-disk file.
+        self.flush()?;
+        self.legacy_node_types_migrated = 0;
+        Ok(changed)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        let path = self.data_dir.join("current.json");
+        let content = serde_json::to_string_pretty(&self.state)
+            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        fs::write(&path, content)
+            .map_err(|e| format!("Failed to write current.json: {}", e))?;
+        Ok(())
+    }
+
+    pub fn add_concept(
+        &mut self,
+        term: &str,
+        domains: Vec<String>,
+        sources: Vec<String>,
+        depends_on: Option<HashMap<u32, f64>>,
+    ) -> Result<u32, String> {
+        if domains.is_empty() || sources.is_empty() {
+            return Err("Error: domains and sources must not be empty".to_string());
+        }
+        if domains.len() != sources.len() {
+            return Err("Error: domains and sources must have equal length".to_string());
+        }
+
+        for source in &sources {
+            Self::validate_source_prefix(source)?;
+        }
+
+        let lower_term = term.to_lowercase();
+        if let Some(existing_ids) = self.state.dictionary.get(&lower_term) {
+            for &existing_id in existing_ids {
+                if let Some(node) = self.state.nodes.get(&existing_id) {
+                    if node.domains == domains {
+                        return Err(format!(
+                            "Error: Concept '{}' already exists in domain {:?} (ID {})",
+                            term, domains, existing_id
+                        ));
+                    }
+                }
+            }
+        }
+
+        let (node_type, final_depends_on) = match depends_on {
+            Some(deps) => {
+                if deps.is_empty() {
+                    return Err("Error: Compound concept must have dependencies".to_string());
+                }
+                if deps.len() != domains.len() {
+                    return Err(format!(
+                        "Error: Number of dependencies ({}) must match domains ({})",
+                        deps.len(),
+                        domains.len()
+                    ));
+                }
+                for &dep_id in deps.keys() {
+                    if !self.state.nodes.contains_key(&dep_id) {
+                        return Err(format!("Error: Dependency ID {} does not exist", dep_id));
+                    }
+                }
+                let sum: f64 = deps.values().sum();
+                if (sum - 1.0).abs() > 0.001 {
+                    return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
+                }
+                (NodeType::Compound, deps)
+            }
+            None => {
+                if domains.len() != 1 {
+                    return Err("Error: Atomic concepts must have exactly 1 domain/source pair".to_string());
+                }
+                (NodeType::Atomic, HashMap::new())
+            }
+        };
+
+        let id = self.state.next_id;
+        self.state.next_id += 1;
+
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let verification_status = Self::calculate_verification_status_from_sources(&sources);
+        let node = Node {
+            id,
+            domains: domains.clone(),
+            sources: sources.clone(),
+            node_type,
+            label: term.to_string(),
+            depends_on: final_depends_on,
+            status: NodeStatus::Active,
+            created_at: now,
+            verified_by: HashMap::new(),
+            verification_status,
+            invalid: false,
+            invalid_reason: None,
+            invalidated_at: None,
+        };
+
+        self.state.nodes.insert(id, node);
+        self.state.dictionary.entry(lower_term).or_insert_with(Vec::new).push(id);
+        self.state.id_to_domain.insert(id, domains[0].clone());
+
+        self.flush()?;
+        Ok(id)
+    }
+
+    fn count_content_words(text: &str) -> usize {
+        let stopwords = [
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "to", "in", "on", "at", "by", "of", "and", "or", "but", "for", "with"
+        ];
+        text.to_lowercase()
+            .split_whitespace()
+            .filter(|word| {
+                word.len() >= 3 && !stopwords.contains(&word)
+            })
+            .count()
+    }
+
+    fn has_compound_dependency(&self, depends_on: &HashMap<u32, f64>) -> bool {
+        depends_on.keys().any(|&id| {
+            if let Some(node) = self.state.nodes.get(&id) {
+                node.node_type == NodeType::Compound
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn get_node(&self, id: u32) -> Option<&Node> {
+        self.state.nodes.get(&id)
+    }
+
+    pub fn get_related_nodes(&self, id: u32) -> (Vec<(u32, &Node)>, Vec<(u32, &Node)>) {
+        let mut depends_on = Vec::new();
+        let mut depended_by = Vec::new();
+
+        if let Some(node) = self.state.nodes.get(&id) {
+            for &dep_id in node.depends_on.keys() {
+                if let Some(dep_node) = self.state.nodes.get(&dep_id) {
+                    depends_on.push((dep_id, dep_node));
+                }
+            }
+        }
+
+        for (other_id, other_node) in &self.state.nodes {
+            if other_node.depends_on.contains_key(&id) {
+                depended_by.push((*other_id, other_node));
+            }
+        }
+
+        (depends_on, depended_by)
+    }
+
+    pub fn get_related_nodes_bounded(&self, id: u32) -> (Vec<(u32, &Node)>, Vec<(u32, &Node)>) {
+        let (depends_on, depended_by) = self.get_related_nodes(id);
+        (
+            depends_on.into_iter().take(10).collect(),
+            depended_by.into_iter().take(10).collect(),
+        )
+    }
+
+    pub fn get_domain_stats(&self) -> Vec<(String, usize)> {
+        let mut domain_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        for node in self.state.nodes.values() {
+            if node.status == NodeStatus::Active {
+                for domain in &node.domains {
+                    *domain_counts.entry(domain.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut result: Vec<_> = domain_counts.into_iter().collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    fn find_concepts_fuzzy(&self, query: &str) -> Vec<u32> {
+        let lower_query = query.to_lowercase();
+
+        if let Some(ids) = self.state.dictionary.get(&lower_query) {
+            return ids.clone();
+        }
+
+        let mut matches: Vec<(u32, f64)> = Vec::new();
+
+        for (node_id, node) in &self.state.nodes {
+            if node.status != NodeStatus::Active {
+                continue;
+            }
+
+            let lower_label = node.label.to_lowercase();
+
+            let score = if lower_label.starts_with(&lower_query) {
+                0.8
+            } else if lower_label.contains(&lower_query) {
+                0.6
+            } else {
+                continue;
+            };
+
+            matches.push((*node_id, score));
+        }
+
+        matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        matches.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn validate_statement_concepts(&self, text: &str, depends_on: &HashMap<u32, f64>) -> Result<(), String> {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let mut concept_positions: Vec<(usize, u32, String)> = Vec::new();
+
+        for (i, token) in tokens.iter().enumerate() {
+            let lower = token.to_lowercase();
+            if let Some(ids) = self.state.dictionary.get(&lower) {
+                for &id in ids {
+                    if let Some(node) = self.state.nodes.get(&id) {
+                        concept_positions.push((i, id, node.label.clone()));
+                    }
+                }
+            }
+        }
+
+        if concept_positions.is_empty() {
+            return Ok(());
+        }
+
+        let mut i = 0;
+        let mut concerns = Vec::new();
+
+        while i < concept_positions.len() {
+            let mut j = i;
+            let mut sequence = vec![concept_positions[i].1];
+
+            while j + 1 < concept_positions.len()
+                && concept_positions[j + 1].0 == concept_positions[j].0 + 1 {
+                j += 1;
+                sequence.push(concept_positions[j].1);
+            }
+
+            if sequence.len() >= 2 {
+                let concern = self.check_adjacent_sequence(&sequence, depends_on)?;
+                if !concern.is_empty() {
+                    concerns.push(concern);
+                }
+            }
+
+            i = j + 1;
+        }
+
+        if !concerns.is_empty() {
+            return Err(format!(
+                "⚠ Adjacency validation concerns:\n{}\n\nUse --assume to bypass.",
+                concerns.join("\n")
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn check_adjacent_sequence(&self, sequence: &[u32], depends_on: &HashMap<u32, f64>) -> Result<String, String> {
+        let mut concern = String::new();
+        let mut seq = sequence.to_vec();
+
+        while seq.len() >= 2 {
+            let right_idx = seq.len() - 2;
+            let pair = &seq[right_idx..];
+
+            let labels: Vec<String> = pair.iter()
+                .filter_map(|&id| self.state.nodes.get(&id).map(|n| n.label.clone()))
+                .collect();
+
+            if labels.len() == 2 {
+                let pair_name = format!("{} {}", labels[0], labels[1]);
+                let pair_found = self.find_compound_by_label(&pair_name);
+
+                match pair_found {
+                    Some(compound_id) => {
+                        if !depends_on.contains_key(&compound_id) {
+                            return Err(format!(
+                                "Error: Compound '{}' (ID:{}) exists but statement doesn't use it.\n  \
+                                This creates branching paths. Use compound in statement or investigate first.",
+                                pair_name, compound_id
+                            ));
+                        }
+                    }
+                    None => {
+                        concern.push_str(&format!("  • Adjacent concepts '{}' → suggest creating compound\n", pair_name));
+                    }
+                }
+            }
+
+            seq.pop();
+        }
+
+        Ok(concern)
+    }
+
+    fn find_compound_by_label(&self, label: &str) -> Option<u32> {
+        for (id, node) in &self.state.nodes {
+            if node.label.eq_ignore_ascii_case(label) && node.node_type == NodeType::Compound {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    pub fn add_statement(
+        &mut self,
+        text: &str,
+        domains: Vec<String>,
+        sources: Vec<String>,
+        depends_on: HashMap<u32, f64>,
+        assume: bool,
+    ) -> Result<u32, String> {
+        if depends_on.is_empty() {
+            return Err("Error: Statement must have at least 1 dependency".to_string());
+        }
+        if domains.is_empty() || sources.is_empty() {
+            return Err("Error: domains and sources must not be empty".to_string());
+        }
+        if domains.len() != sources.len() {
+            return Err("Error: domains and sources must have equal length".to_string());
+        }
+        if domains.len() != depends_on.len() {
+            return Err(format!(
+                "Error: Number of domains ({}) must match dependencies ({})",
+                domains.len(),
+                depends_on.len()
+            ));
+        }
+
+        for source in &sources {
+            if source != &"inferred".to_string() {
+                Self::validate_source_prefix(source)?;
+            }
+        }
+
+        for &dep_id in depends_on.keys() {
+            if !self.state.nodes.contains_key(&dep_id) {
+                return Err(format!("Error: Dependency ID {} does not exist", dep_id));
+            }
+        }
+
+        let sum: f64 = depends_on.values().sum();
+        if (sum - 1.0).abs() > 0.001 {
+            return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
+        }
+
+        if !assume {
+            if let Err(validation_msg) = self.validate_statement_concepts(text, &depends_on) {
+                return Err(validation_msg);
+            }
+        }
+
+        let id = self.state.next_id;
+        self.state.next_id += 1;
+
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Source-derived status per BRAIM_AUTOPROMOTION_SPEC §3.2.
+        let source_derived = Self::calculate_verification_status_from_sources(&sources);
+
+        // Dependency inheritance per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.2:
+        // Only statement-typed deps participate; concept deps are skipped.
+        // Invalid deps propagate fully (mark the new node invalid).
+        // Otherwise cap source_derived to the weakest statement dep.
+        let mut invalid_from_dep: Option<u32> = None;
+        let mut dep_cap: Option<u8> = None;
+        for dep_id in depends_on.keys() {
+            if let Some(dep_node) = self.state.nodes.get(dep_id) {
+                if !dep_node.node_type.is_statement_family() {
+                    continue;
+                }
+                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
+                    invalid_from_dep = Some(*dep_id);
+                    break;
+                }
+                let r = dep_node.verification_status.rank();
+                dep_cap = Some(match dep_cap {
+                    Some(prev) => prev.min(r),
+                    None => r,
+                });
+            }
+        }
+
+        let (verification_status, invalid_flag, invalid_reason, invalidated_at) =
+            if let Some(dep_id) = invalid_from_dep {
+                (
+                    VerificationStatus::Invalid,
+                    true,
+                    Some(format!("depends_on_invalidated:{}", dep_id)),
+                    Some(now.clone()),
+                )
+            } else {
+                let final_status = match dep_cap {
+                    None => source_derived,
+                    Some(cap) => {
+                        if source_derived.rank() <= cap {
+                            source_derived
+                        } else {
+                            match cap {
+                                0 => VerificationStatus::Invalid,
+                                1 => VerificationStatus::Unproven,
+                                2 => VerificationStatus::Partial,
+                                3 => VerificationStatus::Proven,
+                                _ => VerificationStatus::ProvenStrong,
+                            }
+                        }
+                    }
+                };
+                (final_status, false, None, None)
+            };
+
+        let node = Node {
+            id,
+            domains: domains.clone(),
+            sources: sources.clone(),
+            // Per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §3.3 — derive node_type from status.
+            node_type: NodeType::from_verification_status(verification_status),
+            label: text.to_string(),
+            depends_on,
+            status: NodeStatus::Active,
+            created_at: now,
+            verified_by: HashMap::new(),
+            verification_status,
+            invalid: invalid_flag,
+            invalid_reason,
+            invalidated_at,
+        };
+
+        self.state.nodes.insert(id, node);
+        self.flush()?;
+        Ok(id)
+    }
+
+    pub fn update_weights(
+        &mut self,
+        node_id: u32,
+        new_weights: HashMap<u32, f64>,
+    ) -> Result<(), String> {
+        if new_weights.is_empty() {
+            return Err("Error: Node must have at least 1 dependency".to_string());
+        }
+
+        if !self.state.nodes.contains_key(&node_id) {
+            return Err(format!("Error: Node ID {} does not exist", node_id));
+        }
+
+        for &dep_id in new_weights.keys() {
+            if !self.state.nodes.contains_key(&dep_id) {
+                return Err(format!("Error: Dependency ID {} does not exist", dep_id));
+            }
+        }
+
+        let sum: f64 = new_weights.values().sum();
+        if (sum - 1.0).abs() > 0.001 {
+            return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
+        }
+
+        let current_count = self.state.nodes.get(&node_id).unwrap().depends_on.len();
+        if new_weights.len() != current_count {
+            return Err(format!(
+                "Error: Cannot change number of dependencies. Current: {}, provided: {}",
+                current_count,
+                new_weights.len()
+            ));
+        }
+
+        self.state.nodes.get_mut(&node_id).unwrap().depends_on = new_weights;
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn propagate(&self, term: &str) -> (HashMap<u32, f64>, bool) {
+        let source_ids = self.find_concepts_fuzzy(term);
+
+        if source_ids.is_empty() {
+            return (HashMap::new(), false);
+        }
+
+        let is_fuzzy = !self.state.dictionary.contains_key(&term.to_lowercase());
+
+        let mut scores: HashMap<u32, f64> = HashMap::new();
+        let mut queue: VecDeque<(u32, f64)> = VecDeque::new();
+
+        for source_id in source_ids {
+            scores.insert(source_id, 1.0);
+            queue.push_back((source_id, 1.0));
+        }
+
+        let max_iterations = self.state.nodes.len() * self.state.nodes.len();
+        let mut iterations = 0;
+
+        while let Some((current_id, acc)) = queue.pop_front() {
+            if iterations >= max_iterations {
+                break;
+            }
+            iterations += 1;
+
+            for (node_id, node) in &self.state.nodes {
+                if node.status == NodeStatus::Active {
+                    if let Some(&edge_w) = node.depends_on.get(&current_id) {
+                        let new_acc = acc * edge_w;
+                        *scores.entry(*node_id).or_insert(0.0) += new_acc;
+                        queue.push_back((*node_id, new_acc));
+                    }
+                }
+            }
+        }
+
+        (scores, is_fuzzy)
+    }
+
+    pub fn lookup(&self, term: &str) -> Result<(Vec<(u32, f64)>, bool), String> {
+        let (mut scores, is_fuzzy) = self.propagate(term);
+
+        if scores.is_empty() && !is_fuzzy {
+            return Err(format!("Error: Unknown concept '{}'", term));
+        }
+
+        let lower_term = term.to_lowercase();
+        if let Some(source_ids) = self.state.dictionary.get(&lower_term) {
+            for &source_id in source_ids {
+                scores.remove(&source_id);
+            }
+        }
+
+        let mut result: Vec<_> = scores
+            .into_iter()
+            .map(|(id, score)| (id, (score * 10000.0).round() / 10000.0))
+            .collect();
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        Ok((result, is_fuzzy))
+    }
+
+    pub fn lookup_exact(&self, term: &str) -> Result<(Vec<(u32, f64)>, bool), String> {
+        let lower_term = term.to_lowercase();
+
+        if let Some(source_ids) = self.state.dictionary.get(&lower_term) {
+            let result: Vec<(u32, f64)> = source_ids.iter().map(|&id| (id, 1.0)).collect();
+            Ok((result, false))
+        } else {
+            Err(format!("Error: Unknown concept '{}'", term))
+        }
+    }
+
+    pub fn query(&self, terms: &[&str]) -> Result<Vec<(u32, f64)>, String> {
+        let mut has_any_match = false;
+        for term in terms {
+            let fuzzy_ids = self.find_concepts_fuzzy(term);
+            if !fuzzy_ids.is_empty() {
+                has_any_match = true;
+                break;
+            }
+        }
+        if !has_any_match {
+            return Ok(Vec::new());
+        }
+
+        let score_maps: Vec<_> = terms.iter().map(|t| self.propagate(t).0).collect();
+
+        let source_ids: HashSet<u32> = terms
+            .iter()
+            .flat_map(|t| self.find_concepts_fuzzy(t))
+            .collect();
+
+        if score_maps.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut common: HashSet<u32> = score_maps[0].keys().copied().collect();
+        for map in &score_maps[1..] {
+            common.retain(|k| map.contains_key(k));
+        }
+
+        common.retain(|id| !source_ids.contains(id));
+
+        let mut result: Vec<(u32, f64)> = common
+            .into_iter()
+            .map(|node_id| {
+                let total: f64 = score_maps.iter().map(|m| m.get(&node_id).copied().unwrap_or(0.0)).sum();
+                (node_id, (total * 10000.0).round() / 10000.0)
+            })
+            .collect();
+
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        Ok(result)
+    }
+
+    fn dfs(
+        &self,
+        current: u32,
+        target: u32,
+        visited: &mut HashSet<u32>,
+        path: &mut Vec<u32>,
+        acc: f64,
+        paths: &mut Vec<PathInfo>,
+    ) {
+        if current == target {
+            let domains: Vec<String> = path
+                .iter()
+                .filter_map(|&id| self.state.nodes.get(&id).map(|n| n.domains[0].clone()))
+                .collect();
+            let weight = (acc * 10000.0).round() / 10000.0;
+            paths.push(PathInfo {
+                path: path.clone(),
+                weight,
+                domains,
+            });
+            return;
+        }
+
+        let candidates: Vec<(u32, f64)> = self
+            .state
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.status == NodeStatus::Active
+                    && node.depends_on.contains_key(&current)
+                    && !visited.contains(&node.id)
+            })
+            .map(|(_, node)| (node.id, node.depends_on[&current]))
+            .collect();
+
+        for (nid, edge_w) in candidates {
+            visited.insert(nid);
+            path.push(nid);
+            self.dfs(nid, target, visited, path, acc * edge_w, paths);
+            path.pop();
+            visited.remove(&nid);
+        }
+    }
+
+    fn find_paths(&mut self, ids_a: &[u32], ids_b: &[u32]) -> (Vec<PathInfo>, Option<(u32, u32)>) {
+        let mut paths = Vec::new();
+
+        for id_a in ids_a {
+            for &id_b in ids_b {
+                let mut visited = HashSet::new();
+                visited.insert(*id_a);
+                let mut path = vec![*id_a];
+                self.dfs(*id_a, id_b, &mut visited, &mut path, 1.0, &mut paths);
+            }
+        }
+
+        let gap = if paths.is_empty() {
+            ids_a.first().copied().zip(ids_b.first().copied())
+        } else {
+            None
+        };
+
+        paths.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap());
+        (paths, gap)
+    }
+
+    pub fn proximity(&mut self, term_a: &str, term_b: &str) -> Result<Vec<PathInfo>, String> {
+        let ids_a = self.find_concepts_fuzzy(term_a);
+        if ids_a.is_empty() {
+            return Err(format!("Error: Unknown concept '{}'", term_a));
+        }
+
+        let ids_b = self.find_concepts_fuzzy(term_b);
+        if ids_b.is_empty() {
+            return Err(format!("Error: Unknown concept '{}'", term_b));
+        }
+
+        let (paths, gap) = self.find_paths(&ids_a, &ids_b);
+
+        if let Some((id_a, id_b)) = gap {
+            let labels = {
+                let node_a = self.state.nodes.get(&id_a).map(|n| n.label.clone());
+                let node_b = self.state.nodes.get(&id_b).map(|n| n.label.clone());
+                (node_a, node_b)
+            };
+            if let (Some(label_a), Some(label_b)) = labels {
+                self.register_gap(id_a, id_b, &label_a, &label_b);
+                self.flush()?;
+            }
+        }
+
+        Ok(paths)
+    }
+
+    pub fn perspective(&mut self, term_a: &str, term_b: &str) -> Result<HashMap<String, f64>, String> {
+        let ids_a = self.find_concepts_fuzzy(term_a);
+        if ids_a.is_empty() {
+            return Err(format!("Error: Unknown concept '{}'", term_a));
+        }
+
+        let ids_b = self.find_concepts_fuzzy(term_b);
+        if ids_b.is_empty() {
+            return Err(format!("Error: Unknown concept '{}'", term_b));
+        }
+
+        let (paths, gap) = self.find_paths(&ids_a, &ids_b);
+
+        if let Some((id_a, id_b)) = gap {
+            let labels = {
+                let node_a = self.state.nodes.get(&id_a).map(|n| n.label.clone());
+                let node_b = self.state.nodes.get(&id_b).map(|n| n.label.clone());
+                (node_a, node_b)
+            };
+            if let (Some(label_a), Some(label_b)) = labels {
+                self.register_gap(id_a, id_b, &label_a, &label_b);
+                self.flush()?;
+            }
+        }
+
+        let mut domain_weights: HashMap<String, f64> = HashMap::new();
+        for path in paths {
+            if let Some(domain) = path.domains.first() {
+                *domain_weights.entry(domain.clone()).or_insert(0.0) += path.weight;
+            }
+        }
+
+        Ok(domain_weights)
+    }
+
+    fn register_gap(&mut self, id_a: u32, id_b: u32, label_a: &str, label_b: &str) {
+        for gap in &self.state.gaps {
+            if (gap.concept_a == id_a && gap.concept_b == id_b)
+                || (gap.concept_a == id_b && gap.concept_b == id_a)
+            {
+                return;
+            }
+        }
+
+        self.state.gaps.push(GapRecord {
+            concept_a: id_a,
+            concept_b: id_b,
+            label_a: label_a.to_string(),
+            label_b: label_b.to_string(),
+            status: "pending".to_string(),
+            note: format!("No path found between '{}' and '{}'", label_a, label_b),
+        });
+    }
+
+    pub fn audit(&self) -> AuditReport {
+        let mut referenced = HashSet::new();
+        for node in self.state.nodes.values() {
+            for &dep_id in node.depends_on.keys() {
+                referenced.insert(dep_id);
+            }
+        }
+
+        let mut orphans = Vec::new();
+        let mut pending = Vec::new();
+        let mut deprecated_referenced = Vec::new();
+
+        for node in self.state.nodes.values() {
+            if node.status == NodeStatus::Active
+                && node.depends_on.is_empty()
+                && !referenced.contains(&node.id)
+            {
+                orphans.push(node.clone());
+            }
+            if node.status == NodeStatus::Pending {
+                pending.push(node.clone());
+            }
+            if node.status == NodeStatus::Deprecated && referenced.contains(&node.id) {
+                deprecated_referenced.push(node.clone());
+            }
+        }
+
+        AuditReport {
+            orphans,
+            pending,
+            gaps: self.state.gaps.clone(),
+            deprecated_referenced,
+        }
+    }
+
+    pub fn version_save(&mut self, description: &str) -> Result<u32, String> {
+        self.state.version += 1;
+        let version_num = self.state.version;
+
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let meta = VersionMeta {
+            description: description.to_string(),
+            saved_at: now,
+            data: self.state.clone(),
+        };
+
+        let filename = format!("v{:04}.json", version_num);
+        let path = self.data_dir.join(&filename);
+        let content = serde_json::to_string_pretty(&meta)
+            .map_err(|e| format!("Failed to serialize version: {}", e))?;
+        fs::write(&path, content)
+            .map_err(|e| format!("Failed to write version file: {}", e))?;
+
+        self.flush()?;
+        Ok(version_num)
+    }
+
+    pub fn version_restore(&mut self, n: u32) -> Result<(), String> {
+        let filename = format!("v{:04}.json", n);
+        let path = self.data_dir.join(&filename);
+
+        let content = fs::read_to_string(&path)
+            .map_err(|_| format!("Error: Version {} not found", n))?;
+        let meta: VersionMeta = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse version file: {}", e))?;
+
+        self.state = meta.data;
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn version_list(&self) -> Result<Vec<VersionMeta>, String> {
+        let mut versions = Vec::new();
+
+        for entry in fs::read_dir(&self.data_dir)
+            .map_err(|e| format!("Failed to read data dir: {}", e))?
+        {
+            let entry = entry.map_err(|e| format!("Failed to read dir entry: {}", e))?;
+            let path = entry.path();
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if filename.starts_with('v') && filename.ends_with(".json") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(meta) = serde_json::from_str::<VersionMeta>(&content) {
+                        versions.push(meta);
+                    }
+                }
+            }
+        }
+
+        versions.sort_by(|a, b| a.saved_at.cmp(&b.saved_at));
+        Ok(versions)
+    }
+
+    pub fn delete_node(&mut self, node_id: u32) -> Result<Vec<u32>, String> {
+        // Check if node exists
+        let node = self.state.nodes.get(&node_id)
+            .ok_or(format!("Error: Node ID {} not found", node_id))?;
+
+        // Find nodes that depend on this node
+        let mut dependents = Vec::new();
+        for (other_id, other_node) in &self.state.nodes {
+            if other_node.depends_on.contains_key(&node_id) {
+                dependents.push(*other_id);
+            }
+        }
+
+        // Remove from dictionary
+        let lower_label = node.label.to_lowercase();
+        if let Some(ids) = self.state.dictionary.get_mut(&lower_label) {
+            ids.retain(|&id| id != node_id);
+        }
+
+        // Remove from id_to_domain
+        self.state.id_to_domain.remove(&node_id);
+
+        // Remove from nodes
+        self.state.nodes.remove(&node_id);
+
+        // Remove from gaps if referenced
+        self.state.gaps.retain(|gap| gap.concept_a != node_id && gap.concept_b != node_id);
+
+        self.flush()?;
+        Ok(dependents)
+    }
+
+    /// Implements BRAIM_VERIFY_SUGGEST_SPEC §3.3 — surface concrete candidate
+    /// PRIMARY-typed sources that would promote `statement_id` toward a higher
+    /// verification status. See spec §3.4 for the edge-case responses
+    /// (concept target, already-proven_strong, invalidated).
+    pub fn verify_suggest(&self, statement_id: u32) -> Result<VerifySuggestion, String> {
+        let statement = self.state.nodes.get(&statement_id)
+            .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+
+        // Header info — shared across all return paths.
+        let primary_types: HashSet<&'static str> = statement.sources.iter()
+            .filter_map(|s| {
+                let (t, _) = Self::parse_source(s);
+                if t.tier() == "PRIMARY" { Some(primary_type_name(&t)) } else { None }
+            })
+            .collect();
+        let primary_count = statement.sources.iter().filter(|s| {
+            let (t, _) = Self::parse_source(s);
+            t.tier() == "PRIMARY"
+        }).count();
+
+        let mut header = VerifySuggestion {
+            statement_id,
+            label: statement.label.clone(),
+            status_label: statement.verification_status.label().to_string(),
+            primary_count,
+            distinct_primary_types: primary_types.len(),
+            message: None,
+            candidates: Vec::new(),
+            already_attached_types: {
+                let mut v: Vec<String> = primary_types.iter().map(|s| s.to_string()).collect();
+                v.sort();
+                v
+            },
+            missing_primary_types: {
+                let mut v: Vec<String> = ALL_PRIMARY_TYPES.iter()
+                    .filter(|t| !primary_types.contains(*t))
+                    .map(|s| s.to_string())
+                    .collect();
+                v.sort();
+                v
+            },
+        };
+
+        // Edge cases per §3.4.
+        if !statement.node_type.is_statement_family() {
+            return Err(format!("Error: Node ID {} is a concept (atomic/compound); verify-suggest applies to statements only.", statement_id));
+        }
+        match statement.verification_status {
+            VerificationStatus::Invalid => {
+                header.message = Some(
+                    "Statement is invalidated. Cannot upgrade. Use `statement add` to create a replacement.".to_string()
+                );
+                return Ok(header);
+            }
+            VerificationStatus::ProvenStrong => {
+                header.message = Some("Statement already at maximum verification.".to_string());
+                return Ok(header);
+            }
+            _ => {}
+        }
+        if header.missing_primary_types.is_empty() {
+            header.message = Some("Statement has all available PRIMARY source types.".to_string());
+            return Ok(header);
+        }
+
+        // Extract label terms and file-path-like substrings.
+        let target_terms = extract_label_terms(&statement.label);
+        let target_paths = extract_label_paths(&statement.label);
+
+        // Find related verified facts in the same domain sharing ≥2 terms.
+        let mut candidates: Vec<SuggestedSource> = Vec::new();
+        let mut related_facts: Vec<(u32, &Node)> = self.state.nodes.iter()
+            .filter(|(other_id, other_node)| {
+                // §3.3 specifies shared_terms >= 2 but §5 VS2 description requires
+                // matching on a single shared term. Use >= 1 to match the test
+                // expectations; this is the more useful threshold for short labels.
+                **other_id != statement_id
+                    && matches!(other_node.node_type, NodeType::Fact)
+                    && other_node.domains.iter().any(|d| statement.domains.contains(d))
+                    && shared_term_count(&target_terms, &extract_label_terms(&other_node.label)) >= 1
+            })
+            .map(|(id, n)| (*id, n))
+            .collect();
+        related_facts.sort_by_key(|(id, _)| *id);
+
+        for (rid, rnode) in &related_facts {
+            for src in &rnode.sources {
+                let (stype, _) = Self::parse_source(src);
+                if stype.tier() != "PRIMARY" {
+                    continue;
+                }
+                candidates.push(SuggestedSource {
+                    source: src.clone(),
+                    rationale: format!("related fact ID:{} uses {}", rid, src),
+                    impact: String::new(),
+                    rank: 0,
+                });
+            }
+        }
+
+        // Augment with label-extracted paths.
+        for (path, type_prefix) in &target_paths {
+            candidates.push(SuggestedSource {
+                source: format!("{}:{}", type_prefix, path),
+                rationale: format!("label contains path '{}'; suggest {}: source", path, type_prefix),
+                impact: String::new(),
+                rank: 0,
+            });
+        }
+
+        // Rank by promotion impact: candidates that introduce a new PRIMARY
+        // type rank by the resulting distinct-type count (higher = bigger
+        // jump); candidates duplicating an attached type rank 0.
+        let existing = &primary_types;
+        for c in &mut candidates {
+            let c_type = c.source.split(':').next().unwrap_or("");
+            if existing.contains(&c_type) {
+                c.impact = "no change (type already attached)".to_string();
+                c.rank = 0;
+            } else {
+                let new_count = existing.len() + 1;
+                c.impact = predicted_status_label(new_count).to_string();
+                c.rank = new_count as u8;
+            }
+        }
+
+        // Deduplicate by source string, keeping highest-rank rationale.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut deduped: Vec<SuggestedSource> = Vec::new();
+        for c in candidates {
+            if let Some(&idx) = seen.get(&c.source) {
+                if c.rank > deduped[idx].rank {
+                    deduped[idx] = c;
+                }
+            } else {
+                seen.insert(c.source.clone(), deduped.len());
+                deduped.push(c);
+            }
+        }
+
+        deduped.sort_by(|a, b| b.rank.cmp(&a.rank));
+        deduped.truncate(10);
+
+        if deduped.is_empty() {
+            header.message = Some(
+                "No candidates found. Add a `code:`, `doc:`, `schema:`, `config:`, `transcript:`, or `test:` source manually to upgrade verification."
+                .to_string()
+            );
+        } else {
+            header.candidates = deduped;
+        }
+
+        Ok(header)
+    }
+
+    /// Returns transitive statement-typed dependents of `node_id`
+    /// (only statements participate in inheritance cascade — concepts skipped).
+    /// Result is ordered by BFS discovery from the root.
+    pub fn find_cascade_nodes(&self, node_id: u32) -> Vec<(u32, String)> {
+        let mut cascade = Vec::new();
+        let mut queue: VecDeque<u32> = VecDeque::from([node_id]);
+        let mut visited: HashSet<u32> = HashSet::new();
+        visited.insert(node_id);
+
+        while let Some(current_id) = queue.pop_front() {
+            let mut direct: Vec<(u32, String)> = self.state.nodes.iter()
+                .filter(|(oid, on)| {
+                    on.node_type.is_statement_family()
+                        && on.depends_on.contains_key(&current_id)
+                        && !visited.contains(oid)
+                })
+                .map(|(oid, on)| (*oid, on.label.clone()))
+                .collect();
+            direct.sort_by_key(|(id, _)| *id);
+            for (dep_id, label) in direct {
+                visited.insert(dep_id);
+                cascade.push((dep_id, label));
+                queue.push_back(dep_id);
+            }
+        }
+
+        cascade
+    }
+
+    /// Invalidate a statement and cascade-invalidate all transitively dependent
+    /// statements per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3.
+    /// Returns the list of cascade-invalidated IDs (excluding the target).
+    pub fn invalidate_statement(&mut self, statement_id: u32, reason: &str) -> Result<Vec<u32>, String> {
+        {
+            let node = self.state.nodes.get(&statement_id)
+                .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+
+            if !node.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", statement_id));
+            }
+
+            if node.sources.contains(&"inferred".to_string()) {
+                return Err(format!("Error: Cannot invalidate inferred statement ID {}. Inferred statements are derived relationships.", statement_id));
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let cascade_ids: Vec<u32> = self.find_cascade_nodes(statement_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        {
+            let node = self.state.nodes.get_mut(&statement_id).unwrap();
+            node.invalid = true;
+            node.invalid_reason = Some(reason.to_string());
+            node.invalidated_at = Some(now.clone());
+            node.verification_status = VerificationStatus::Invalid;
+            // Per BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §3.4 — set node_type to InvalidStatement.
+            node.node_type = NodeType::InvalidStatement;
+        }
+
+        for dep_id in &cascade_ids {
+            if let Some(dep_node) = self.state.nodes.get_mut(dep_id) {
+                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
+                    continue;
+                }
+                dep_node.invalid = true;
+                dep_node.invalid_reason = Some(format!("depends_on_invalidated:{}", statement_id));
+                dep_node.invalidated_at = Some(now.clone());
+                dep_node.verification_status = VerificationStatus::Invalid;
+                dep_node.node_type = NodeType::InvalidStatement;
+            }
+        }
+
+        self.flush()?;
+        Ok(cascade_ids)
+    }
+
+    pub fn verify_statement(&mut self, statement_id: u32, domain: &str, note: Option<String>) -> Result<(), String> {
+        let node = self.state.nodes.get_mut(&statement_id)
+            .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+
+        if !node.node_type.is_statement_family() {
+            return Err(format!("Error: Node ID {} is not a statement", statement_id));
+        }
+
+        // Prevent verification of inferred statements
+        if node.sources.contains(&"inferred".to_string()) {
+            return Err(format!("Error: Cannot verify inferred statement ID {}. Inferred statements are derived, not verified.", statement_id));
+        }
+
+        node.verified_by.insert(domain.to_string(), note);
+
+        let num_verifications = node.verified_by.len();
+        node.verification_status = match num_verifications {
+            0 | 1 => VerificationStatus::Unproven,
+            2 => VerificationStatus::Partial,
+            _ => VerificationStatus::Proven,
+        };
+
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn import_graph(
+        &mut self,
+        source_path: &str,
+        filter_domain: Option<&str>,
+        only_proven: bool,
+        domain_mappings: HashMap<String, String>,
+    ) -> Result<ImportManifest, String> {
+        // Load source graph
+        let source_content = fs::read_to_string(source_path)
+            .map_err(|e| format!("Error reading source file: {}", e))?;
+        let mut source_state: GraphState = serde_json::from_str(&source_content)
+            .map_err(|e| format!("Error parsing source graph: {}", e))?;
+
+        // Apply domain mappings to source nodes
+        for node in source_state.nodes.values_mut() {
+            let mut remapped_domains = Vec::new();
+            for domain in &node.domains {
+                let remapped = domain_mappings.get(domain).cloned().unwrap_or_else(|| domain.clone());
+                remapped_domains.push(remapped);
+            }
+            node.domains = remapped_domains;
+        }
+
+        let mut id_mappings: HashMap<u32, u32> = HashMap::new();
+        let mut duplicates: Vec<DuplicateRecord> = Vec::new();
+        let mut imported_count = 0;
+        let mut deduplicated_count = 0;
+        let mut skipped_count = 0;
+
+        // Collect nodes by type for ordered processing
+        let mut atomics = Vec::new();
+        let mut compounds = Vec::new();
+        let mut statements = Vec::new();
+
+        for (_, node) in &source_state.nodes {
+            match node.node_type {
+                NodeType::Atomic => atomics.push(node.clone()),
+                NodeType::Compound => compounds.push(node.clone()),
+                NodeType::Statement
+                | NodeType::Claim
+                | NodeType::Fact
+                | NodeType::InvalidStatement => statements.push(node.clone()),
+            }
+        }
+
+        // Process atomics first
+        for node in atomics {
+            if let Some(domain_filter) = filter_domain {
+                if !node.domains.contains(&domain_filter.to_string()) {
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+
+            if only_proven && node.verification_status != VerificationStatus::Proven {
+                skipped_count += 1;
+                continue;
+            }
+
+            let key = (node.label.to_lowercase(), node.domains.clone());
+            let mut is_duplicate = false;
+
+            // Check for existing atomic with same name and domain
+            for (target_id, target_node) in &self.state.nodes {
+                if target_node.node_type == NodeType::Atomic
+                    && target_node.label.to_lowercase() == key.0
+                    && target_node.domains == key.1
+                {
+                    id_mappings.insert(node.id, *target_id);
+                    duplicates.push(DuplicateRecord {
+                        source_id: node.id,
+                        source_label: node.label.clone(),
+                        target_id: *target_id,
+                        target_label: target_node.label.clone(),
+                        reason: "same name and domain".to_string(),
+                    });
+                    is_duplicate = true;
+                    deduplicated_count += 1;
+                    break;
+                }
+            }
+
+            if !is_duplicate {
+                let new_id = self.state.next_id;
+                id_mappings.insert(node.id, new_id);
+
+                let mut new_node = node.clone();
+                new_node.id = new_id;
+                new_node.verification_status = VerificationStatus::Unproven;
+                new_node.verified_by = HashMap::new();
+
+                self.state.nodes.insert(new_id, new_node.clone());
+                self.state.next_id += 1;
+                imported_count += 1;
+
+                // Update dictionary
+                let lower_label = node.label.to_lowercase();
+                self.state.dictionary.entry(lower_label).or_insert_with(Vec::new).push(new_id);
+            }
+        }
+
+        // Process compounds
+        for node in compounds {
+            if let Some(domain_filter) = filter_domain {
+                if !node.domains.contains(&domain_filter.to_string()) {
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+
+            if only_proven && node.verification_status != VerificationStatus::Proven {
+                skipped_count += 1;
+                continue;
+            }
+
+            // Check if all dependencies were imported
+            let mut all_deps_imported = true;
+            for dep_id in node.depends_on.keys() {
+                if !id_mappings.contains_key(dep_id) {
+                    all_deps_imported = false;
+                    skipped_count += 1;
+                    break;
+                }
+            }
+            if !all_deps_imported {
+                continue;
+            }
+
+            let key = (node.label.to_lowercase(), node.domains.clone());
+            let mut is_duplicate = false;
+
+            // Check for existing compound with same name and domain
+            for (target_id, target_node) in &self.state.nodes {
+                if target_node.node_type == NodeType::Compound
+                    && target_node.label.to_lowercase() == key.0
+                    && target_node.domains == key.1
+                {
+                    id_mappings.insert(node.id, *target_id);
+                    duplicates.push(DuplicateRecord {
+                        source_id: node.id,
+                        source_label: node.label.clone(),
+                        target_id: *target_id,
+                        target_label: target_node.label.clone(),
+                        reason: "same name and domain".to_string(),
+                    });
+                    is_duplicate = true;
+                    deduplicated_count += 1;
+                    break;
+                }
+            }
+
+            if !is_duplicate {
+                let new_id = self.state.next_id;
+
+                // Remap dependency IDs
+                let mut new_depends_on = HashMap::new();
+                for (dep_id, weight) in &node.depends_on {
+                    let mapped_id = id_mappings
+                        .get(dep_id)
+                        .ok_or_else(|| format!("Error: Dependency ID {} not found in mappings", dep_id))?;
+                    new_depends_on.insert(*mapped_id, *weight);
+                }
+
+                id_mappings.insert(node.id, new_id);
+
+                let mut new_node = node.clone();
+                new_node.id = new_id;
+                new_node.depends_on = new_depends_on;
+                new_node.verification_status = VerificationStatus::Unproven;
+                new_node.verified_by = HashMap::new();
+
+                self.state.nodes.insert(new_id, new_node.clone());
+                self.state.next_id += 1;
+                imported_count += 1;
+
+                // Update dictionary
+                let lower_label = node.label.to_lowercase();
+                self.state.dictionary.entry(lower_label).or_insert_with(Vec::new).push(new_id);
+            }
+        }
+
+        // Process statements
+        for node in statements {
+            if let Some(domain_filter) = filter_domain {
+                if !node.domains.contains(&domain_filter.to_string()) {
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+
+            if only_proven && node.verification_status != VerificationStatus::Proven {
+                skipped_count += 1;
+                continue;
+            }
+
+            // Check if all dependencies were imported
+            let mut all_deps_imported = true;
+            for dep_id in node.depends_on.keys() {
+                if !id_mappings.contains_key(dep_id) {
+                    all_deps_imported = false;
+                    skipped_count += 1;
+                    break;
+                }
+            }
+            if !all_deps_imported {
+                continue;
+            }
+
+            // Remap dependency IDs for comparison
+            let mut remapped_deps = Vec::new();
+            for dep_id in node.depends_on.keys() {
+                if let Some(mapped_id) = id_mappings.get(dep_id) {
+                    remapped_deps.push(*mapped_id);
+                }
+            }
+            remapped_deps.sort();
+
+            let mut is_duplicate = false;
+
+            // Check for existing statement with same text and remapped dependencies
+            for (target_id, target_node) in &self.state.nodes {
+                if target_node.node_type.is_statement_family()
+                    && target_node.label == node.label
+                {
+                    let mut target_deps: Vec<u32> = target_node.depends_on.keys().copied().collect();
+                    target_deps.sort();
+
+                    if target_deps == remapped_deps {
+                        id_mappings.insert(node.id, *target_id);
+                        duplicates.push(DuplicateRecord {
+                            source_id: node.id,
+                            source_label: node.label.clone(),
+                            target_id: *target_id,
+                            target_label: target_node.label.clone(),
+                            reason: "same text and dependencies".to_string(),
+                        });
+                        is_duplicate = true;
+                        deduplicated_count += 1;
+                        break;
+                    }
+                }
+            }
+
+            if !is_duplicate {
+                let new_id = self.state.next_id;
+
+                // Remap dependency IDs
+                let mut new_depends_on = HashMap::new();
+                for (dep_id, weight) in &node.depends_on {
+                    let mapped_id = id_mappings
+                        .get(dep_id)
+                        .ok_or_else(|| format!("Error: Dependency ID {} not found in mappings", dep_id))?;
+                    new_depends_on.insert(*mapped_id, *weight);
+                }
+
+                id_mappings.insert(node.id, new_id);
+
+                let mut new_node = node.clone();
+                new_node.id = new_id;
+                new_node.depends_on = new_depends_on;
+                new_node.verification_status = VerificationStatus::Unproven;
+                new_node.verified_by = HashMap::new();
+
+                self.state.nodes.insert(new_id, new_node.clone());
+                self.state.next_id += 1;
+                imported_count += 1;
+            }
+        }
+
+        self.flush()?;
+
+        Ok(ImportManifest {
+            source_path: source_path.to_string(),
+            imported_count,
+            deduplicated_count,
+            skipped_count,
+            id_mappings,
+            duplicates,
+        })
+    }
+}
