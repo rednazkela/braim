@@ -184,8 +184,9 @@ fn status_rank(status: &VerificationStatus) -> u8 {
     match status {
         VerificationStatus::Invalid => 0,
         VerificationStatus::Unproven => 1,
-        VerificationStatus::Partial => 2,
-        VerificationStatus::Proven => 3,
-        VerificationStatus::ProvenStrong => 4,
+        VerificationStatus::Contested => 2,
+        VerificationStatus::Partial => 3,
+        VerificationStatus::Proven => 4,
+        VerificationStatus::ProvenStrong => 5,
     }
 }

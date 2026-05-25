@@ -1,0 +1,17 @@
+SCENARIO 20
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+A researcher has located a certified photograph in the Riverside city archives
+(doc:city_archives_photo_1995.jpg:caption). Its caption, verified by the city
+archivist, reads: "Ribbon-cutting ceremony for the Children's Section,
+Riverside Public Library, October 14, 1995."
+
+There are currently two entries in the graph that disagree about when the
+Children's Section opened. Attach this photograph as a source to the entry
+that it corroborates, then report what happens to both of the disagreeing
+entries and what state they end up in.

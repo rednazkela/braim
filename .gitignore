@@ -2,3 +2,8 @@
 OldDocs/
 Cargo.lock
 .DS_Store
+
+# local run artifacts (not source)
+.braim/
+.claude/
+.rctags/
