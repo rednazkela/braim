@@ -466,21 +466,119 @@ FAIL signal:
   - LLM hand-waves the status without running `braim node <id>` to read it
 
 ═══════════════════════════════════════════════════════════════
+SCENARIO 18 — first-class source entity registration
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim source add` with --type and --location
+  - node_type=source, source_type field, ingested_at auto-set
+  - distinct source types for distinct document kinds
+
+Expected targets: dedication plaque (doc), town annual report (doc or
+transcript), library catalog (doc or schema).
+
+PASS signal:
+  - At least 3 source entities created via `braim source add`
+  - `braim node <id>` for each shows node_type: source
+  - source_type field is set and matches the document kind (doc for the
+    plaque and annual report; doc or schema for the catalog — any
+    defensible PRIMARY type accepted)
+  - LLM reports each entity's ID and justifies the type choice
+  - No source entity created with node_type other than source
+
+FAIL signal:
+  - LLM adds documents as --sources strings on a statement instead of
+    registering them as named entities
+  - `braim node <id>` shows node_type other than source
+  - source_type field missing or set to a non-PRIMARY type (narrative,
+    inference, logic, agent)
+  - LLM reports IDs without running `braim node <id>` to confirm fields
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 19 — contradicts edge and contested state
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim statement contradict <A> <B> --reason "..."`
+  - verification_status=contested on both sides after the edge is created
+  - default query hides contested statements
+  - `--include-contested` flag surfaces them
+
+Document anchors:
+  Existing statement about Children's Section opening in 1995 (from
+  scenario 01 or later); new claim from acquisition_records.txt:3
+  stating October 1998.
+
+PASS signal:
+  - Two statements exist: one citing 1995, one citing 1998
+  - `braim statement contradict` used to link them
+  - `braim node <id>` for both shows verification_status: contested
+    (or node_type: contested_statement)
+  - `braim query "Children"` (default) does NOT return either entry
+  - `braim query "Children" --include-contested` returns at least one
+  - LLM reports both IDs and explicitly states neither appears in the
+    default query
+
+FAIL signal:
+  - LLM uses `statement invalidate` on the 1998 claim without a
+    tiebreaker source (premature resolution — the contested tool exists
+    precisely for this unresolved case)
+  - Only one statement recorded (the 1998 claim silently discarded)
+  - Default query still returns the contested entries
+  - LLM does not run `braim query "Children"` to verify hiding
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 20 — third-source auto-resolution (Mechanism A)
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim statement add-source <id> --source-id <source_id>`
+  - Mechanism A: attaching a PRIMARY source to one contested side
+    auto-resolves the contradiction — winner recomputes status,
+    loser becomes invalid_statement
+  - The contradicts edge marks resolved=true automatically
+
+Pre-condition: two contested statements from scenario 19 (1995 vs 1998).
+
+PASS signal:
+  - LLM first registers the photograph as a source entity via
+    `braim source add` (doc type), obtaining a source_id
+  - `braim statement add-source <1995_stmt_id> --source-id <photo_id>`
+    called to attach it to the 1995 entry
+  - After the call, `braim node <1995_stmt_id>` shows
+    verification_status != contested (partial, proven, or proven_strong)
+  - `braim node <1998_stmt_id>` shows node_type: invalid_statement
+  - Resolution was automatic — LLM did NOT need to call
+    `statement resolve-contradiction` manually
+  - LLM reports the final state of both entries
+
+FAIL signal:
+  - LLM skips `braim source add` and attaches the photograph only as
+    a --sources string (no source entity → Mechanism A cannot fire)
+  - LLM uses `statement resolve-contradiction` manually instead of
+    letting Mechanism A trigger (bypasses the auto-resolution path)
+  - 1995 entry remains contested after the source is attached
+  - 1998 entry remains contested or is manually invalidated without
+    going through the resolution mechanism
+  - LLM does not run `braim node` to confirm final states
+
+═══════════════════════════════════════════════════════════════
 SCORING
 ═══════════════════════════════════════════════════════════════
 
 Each scenario yields a single PASS or FAIL based on its own oracle row.
 
-  12 or more PASS  -> braim end-to-end behavior + anti-pattern discipline
-                      verified across the suite
-  8 to 11 PASS     -> partial regression; note which scenario rows failed
-  fewer than 8     -> base behavior or anti-pattern detection is broken;
-                      investigate the failing oracle rows first before
-                      further scenarios are run
+  15 or more PASS -> braim end-to-end behavior + anti-pattern discipline
+                     verified across the full suite including cross-source
+                     verification primitives
+  12 to 14 PASS  -> partial regression; note which scenario rows failed
+  fewer than 12  -> base behavior or anti-pattern detection is broken;
+                    investigate the failing oracle rows first before
+                    further scenarios are run
 
 Optional weighting: scenarios 09, 11, 14 carry higher signal because the
-underlying violations show up most often in real-world graphs. If those
-three pass and others fail, the LLM is probably building correctly but
-choosing weak labels or skipping audits; if those three fail and the
-others pass, the LLM is following surface form without grasping the type
-discipline.
+underlying violations show up most often in real-world graphs. Scenarios
+19 and 20 carry high signal for the cross-source verification primitives —
+if 19 fails (LLM uses invalidate instead of contradict), the contested
+workflow is not understood; if 20 fails (LLM bypasses Mechanism A), the
+auto-resolution path is not being used.

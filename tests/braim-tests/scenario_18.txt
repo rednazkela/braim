@@ -1,0 +1,20 @@
+SCENARIO 18
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Several key claims in the graph cite specific documents from the library's
+history: the dedication plaque on the building entrance, the town's annual
+report from 1985, and the library catalog. These are referenced in existing
+statements but have not been registered as named, referenceable entities in
+the graph.
+
+Register each of these three documents as a named entity in the graph, using
+the appropriate source type for each. Where the document type is ambiguous,
+use the type that best matches how the document is described in the corpus.
+
+Reply with the ID of each entity you created, the source type you assigned,
+and a one-sentence justification for each choice.

@@ -1,0 +1,21 @@
+SCENARIO 19
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+A scanned acquisition record (transcript:acquisition_records.txt:3) has just
+been digitized from the library's physical files. It reads: "Children's
+Section expansion completed and open to the public: October 1998."
+
+The document in the graph states 1995 for this same event. Both records are
+real and both are sourced — neither can simply be discarded. Record the new
+claim from the acquisition record alongside the existing one, and handle the
+disagreement between the two using whatever tool the help text describes for
+this situation.
+
+Reply with the IDs of both entries, the state each is in after you handle the
+disagreement, and what a default query for "Children's Section" will return
+for these entries.

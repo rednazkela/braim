@@ -2,7 +2,7 @@ mod graph;
 mod tips;
 
 use clap::{Parser, Subcommand};
-use graph::{Braim, NodeType};
+use graph::{Braim, NodeType, AddSourceResult};
 use std::collections::HashMap;
 
 #[derive(Parser)]
@@ -21,18 +21,22 @@ REQUIRED RULES:\n\
   9. Use ASYMMETRIC --depends weights when dependencies have unequal importance.\n\
      Default-even split (e.g. 0.5,0.5 or 0.25×4) means \"no opinion about importance\"\n\
      — a code smell when one dep is clearly more central. Weights propagate\n\
-     multiplicatively along paths; query/perspective/proximity scores depend on them.\n\n\
+     multiplicatively along paths; query/perspective/proximity scores depend on them.\n\
+10. When two statements about the same subject disagree, mark them contested\n\
+    via 'statement contradict' rather than asserting one as fact. Resolve via\n\
+    a third PRIMARY source (auto) or 'statement resolve-contradiction' (manual).\n\n\
 SOURCE TYPES (verification determined by PRIMARY type diversity):\n\
   PRIMARY (independent evidence):   code:, doc:, schema:, config:, transcript:, test:\n\
   SECONDARY (derived or contextual): phase_N:, agent:, narrative:\n\
   TERTIARY (logical derivation):     logic:, inference:\n\n\
 VERIFICATION STATUS (auto-calculated; can only be LOWERED by dependencies, never raised):\n\
   Source-derived (from your --sources):\n\
-    ✗   Unproven      (0 PRIMARY types)   → claim, not trusted\n\
-    ✓   Partial       (1 PRIMARY type)    → fact, use with caution\n\
-    ✓✓  Proven        (2 PRIMARY types)   → fact, verified\n\
-    ✓✓✓ ProvenStrong  (3+ PRIMARY types)  → fact, strongly verified\n\
-    ✗✗  Invalid       (via 'statement invalidate')  → refuted, preserved for audit\n\n\
+    ✗   Unproven         (0 PRIMARY types)   → claim, not trusted\n\
+    ⚠   Contested        (active contradiction) → hidden; use --include-contested\n\
+    ✓   Partial          (1 PRIMARY type)    → fact, use with caution\n\
+    ✓✓  Proven           (2 PRIMARY types)   → fact, verified\n\
+    ✓✓✓ ProvenStrong     (3+ PRIMARY types)  → fact, strongly verified\n\
+    ✗✗  Invalid          (via 'statement invalidate' or lost contradiction) → refuted\n\n\
   INHERITANCE RULE: final status = MIN(source-derived, weakest statement dependency)\n\
     • Any unproven --depends statement caps your new statement at unproven\n\
     • Any invalid  --depends statement makes your new statement invalid (full propagation)\n\
@@ -40,11 +44,13 @@ VERIFICATION STATUS (auto-calculated; can only be LOWERED by dependencies, never
   To raise verification: add more PRIMARY-typed sources from different types.\n\
   Use 'braim statement verify-suggest <ID>' to get concrete candidate sources.\n\n\
 CORE CONCEPTS (node_type values):\n\
-  • atomic              — base concept ('Payment', 'Invoice')\n\
-  • compound            — groups 2+ atomics (must have >1 dependency)\n\
-  • claim               — unproven statement, hidden from default queries\n\
-  • fact                — partial/proven/proven_strong statement, returned by default\n\
-  • invalid_statement   — refuted statement, hidden unless --include-invalid\n\n\
+  • atomic                — base concept ('Payment', 'Invoice')\n\
+  • compound              — groups 2+ atomics (must have >1 dependency)\n\
+  • claim                 — unproven statement, hidden from default queries\n\
+  • fact                  — partial/proven/proven_strong statement, returned by default\n\
+  • contested_statement   — disputed; hidden unless --include-contested; resolves to fact or invalid\n\
+  • invalid_statement     — refuted statement, hidden unless --include-invalid\n\
+  • source                — first-class source entity (type + location + ingested_at)\n\n\
 TAXONOMY & VALIDATION (prevent common hygiene issues):\n\
   All validations default to WARN (write succeeds + stderr notice). Use --strict-* flags to REJECT.\n\
   \n  Duplicate source strings:\n\
@@ -100,6 +106,7 @@ QUERY DEFAULTS (filter flags compose orthogonally):\n\
   (default)                                  → facts only\n\
   --include-claims                           → facts + claims\n\
   --only-claims                              → claims only (overrides default)\n\
+  --include-contested                        → facts + contested_statements\n\
   --include-invalid                          → facts + invalid_statements\n\
   --include-claims --include-invalid         → full audit view\n\
   --min-trust partial|proven                 → filter by verification level\n\
@@ -124,6 +131,18 @@ WORKFLOW:\n\
   # Inspect + checkpoint\n\
   braim node 42\n\
   braim version save \"milestone description\"\n\n\
+CONTRADICTION RESOLUTION (when sources disagree):\n\
+  Two statements about the same subject can be marked contested:\n\
+    braim statement contradict <stmt_A> <stmt_B> --reason \"...\"\n\
+  Both move to 'contested' state — hidden from default queries.\n\n\
+  Resolution:\n\
+    • Add a third PRIMARY source to one side → auto-resolves to fact;\n\
+      the unsupported side becomes invalid (cascades to its dependents).\n\
+    • Or explicit: braim statement resolve-contradiction <winner> <loser>\n\
+      --reason \"...\"\n\n\
+  Contested statements:\n\
+    • Cannot promote past 'contested' until resolved\n\
+    • Surface via 'braim query <term> --include-contested'\n\n\
 FOR AGENTS:\n\
   This help text is the authoritative usage contract. Re-read it after any prompt-context\n\
   reset or when uncertain. Constraints here are structural; constraints in your prompt are\n\
@@ -155,6 +174,8 @@ enum Commands {
     Concept(ConceptCommands),
     #[command(subcommand, about = "Create and manage statements (claims linking concepts)")]
     Statement(StatementCommands),
+    #[command(subcommand, about = "Manage source entities")]
+    Source(SourceCommands),
     #[command(about = "Find a single concept by name or ID", long_about = "Lookup: Find exact or fuzzy match for a concept by name or ID.\n\nExamples:\n  braim lookup Payment                           # Exact or fuzzy match with related nodes\n  braim lookup charge                            # Fuzzy: finds 'Charge', 'Charge Service'\n  braim lookup Payment --exact                   # Fast exact match only (O(1) lookup)\n  braim lookup Payment --no-related              # Skip related node enumeration\n  braim lookup payment --include-claims          # Show both facts and claims\n\nBy default, shows FACTS only (verified statements with ≥1 PRIMARY source).\nUse --include-claims to show CLAIMS (unproven statements with 0 PRIMARY sources).\n\nOutput shows:\n  • Badge (✓✓, ✓, ✗) indicating verification status\n  • ID, domains, label\n  • Immediate neighbors: nodes this concept depends on (up to 10)\n  • Immediate neighbors: nodes that reference this concept (up to 10)\n\nPerformance:\n  --exact: Fast path, skips fuzzy matching. Use when you know the exact name.\n  --no-related: Skip related node enumeration for instant results (shows concept only).\n  Without flags: Full lookup with fuzzy matching and up to 10 neighbors per category.")]
     Lookup {
         term: String,
@@ -182,6 +203,8 @@ enum Commands {
         primary_only: bool,
         #[arg(long, help = "Include invalid statements (excluded by default)")]
         include_invalid: bool,
+        #[arg(long, help = "Include contested statements (hidden by default)")]
+        include_contested: bool,
     },
     #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.")]
     Proximity {
@@ -211,6 +234,8 @@ enum Commands {
         domain: Option<String>,
         #[arg(long, help = "Filter by type (atomic, compound, statement)")]
         r#type: Option<String>,
+        #[arg(long, help = "Filter by metadata key=value (e.g. scope=cognitivex_flow)")]
+        meta: Option<String>,
     },
     #[command(about = "Start HTTP server for HTML graph viewer", long_about = "Serve: Launch web interface for browsing the graph.\n\nUsage:\n  braim serve          # Start on port 8000 (default)\n  braim serve --port 9000\n\nThen open: http://localhost:8000\n\nFeatures:\n  • Visual graph navigation\n  • Search by name or ID\n  • Verification status colors\n  • Node size by verification strength (word-cloud layout)\n  • Filter by domain/source\n  • Click nodes to inspect details")]
     Serve {
@@ -229,6 +254,14 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
+    #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
+    Meta {
+        id: u32,
+        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow)")]
+        set: Option<String>,
+        #[arg(long, help = "Increment a numeric key (e.g. recurrence)")]
+        inc: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -309,6 +342,46 @@ enum StatementCommands {
         #[arg(long, help = "New weights: \"ID:weight,ID:weight\" (must sum to 1.0)")]
         weights: String,
     },
+    #[command(about = "Attach a source entity to an existing statement", long_about = "Statement AddSource: Link a first-class source entity to a statement after creation.\n\nUsage:\n  braim statement add-source 42 --source-id 5001\n\nEffect on non-contested statements:\n  • Appends source entity to the statement's source_ids list\n  • Recomputes verification_status from all string sources + source entities\n  • A new PRIMARY-typed source can raise the verification level\n\nEffect on contested statements (Mechanism A auto-resolution):\n  • If the source is PRIMARY-typed AND the other contested statement does NOT\n    have this source, auto-resolution fires:\n      Winner (this statement) → status recomputed (likely partial/proven/proven_strong)\n      Loser  (other statement) → invalid; cascades to its dependents\n      Contradicts edge → marked resolved\n  • If the new source is on both sides (corroborates both), no auto-resolution;\n    use 'statement resolve-contradiction' instead.\n\nWorkflow:\n  braim source add \"Audit log entry\" --type transcript --location \"transcript:audit.txt:88\"\n  # → ID:5001\n  braim statement add-source 42 --source-id 5001\n  # If 42 is contested and the other side lacks source 5001 → auto-resolved")]
+    AddSource {
+        id: u32,
+        #[arg(long, help = "Source entity ID to attach (from 'braim source add')")]
+        source_id: u32,
+    },
+    #[command(about = "Mark two statements as contradicting each other", long_about = "Statement Contradict: Record that two statements make incompatible claims about the same subject.\n\nUsage:\n  braim statement contradict 42 99 \\\n    --reason \"Statement 42 says 24h, statement 99 says 48h per spec_v2\"\n\n  braim statement contradict 42 99 \\\n    --reason \"Contradicted by spec_v2\" --source 5001\n\nEffect:\n  • Both statements move to 'contested' verification_status\n  • Both are hidden from default queries (use --include-contested to surface them)\n  • Neither can be auto-promoted while contested — new sources do not raise them\n  • Dependents of contested statements inherit the contested state\n\nResolution:\n  Explicit:  braim statement resolve-contradiction <winner> <loser> --winner <id> --reason \"...\"\n  → Winner: status restored to pre-contested level (or recomputed from sources)\n  → Loser:  becomes invalid, cascades to its dependents\n\nQuery contested statements:\n  braim query \"term\" --include-contested\n\nSee CONTRADICTION RESOLUTION section in 'braim --help' for full workflow.")]
+    Contradict {
+        stmt_a: u32,
+        stmt_b: u32,
+        #[arg(long, help = "Reason for the contradiction")]
+        reason: String,
+        #[arg(long, help = "Source ID that revealed the conflict (optional)")]
+        source: Option<u32>,
+    },
+    #[command(about = "Resolve a contradiction between two statements", long_about = "Statement ResolveContradiction: Declare a winner and loser for an active contradiction.\n\nUsage:\n  braim statement resolve-contradiction 42 99 \\\n    --winner 42 --reason \"spec_v1 is authoritative; spec_v2 was a draft\"\n\n  braim statement resolve-contradiction 42 99 \\\n    --winner 99 --reason \"Confirmed by code review\" --source 5002\n\nArguments:\n  stmt_a, stmt_b:  The two statement IDs involved in the contradiction\n  --winner:        ID of the statement that is correct\n  --reason:        Explanation for why this side wins\n  --source:        Optional source entity ID that corroborates the winner\n\nEffect:\n  Winner:\n    • verification_status restored to pre-contested level (or recomputed from sources)\n    • node_type updated accordingly (claim / fact)\n  Loser:\n    • verification_status → invalid\n    • node_type → invalid_statement\n    • Cascade-invalidates all transitive dependents of the loser\n  Contradicts edge:\n    • Marked resolved=true with resolution_winner and resolution_source recorded\n\nPre-conditions:\n  • An unresolved 'contradicts' edge must exist between stmt_a and stmt_b\n  • Neither statement can already be invalid\n  • --winner must be one of the two statement IDs provided")]
+    ResolveContradiction {
+        stmt_a: u32,
+        stmt_b: u32,
+        #[arg(long, help = "ID of the winning statement")]
+        winner: u32,
+        #[arg(long, help = "Reason for the resolution")]
+        reason: String,
+        #[arg(long, help = "Source ID that corroborates the winner (optional)")]
+        source: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCommands {
+    #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim source add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim source add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
+    Add {
+        label: String,
+        #[arg(long, help = "Source type: code, doc, schema, config, transcript, test, phase_N, agent, narrative, logic, inference")]
+        r#type: String,
+        #[arg(long, help = "Location (file path, URL, doc reference)")]
+        location: Option<String>,
+        #[arg(long, help = "Agent or user who ingested this source")]
+        ingested_by: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -363,6 +436,8 @@ fn get_node_symbol(node_type: &NodeType) -> &'static str {
         NodeType::Statement | NodeType::Fact => "▶",
         NodeType::Claim => "?",
         NodeType::InvalidStatement => "✗",
+        NodeType::ContestedStatement => "⚠",
+        NodeType::Source => "◈",
     }
 }
 
@@ -377,12 +452,15 @@ fn statement_family_visible(
     only_claims: bool,
     include_claims: bool,
     include_invalid: bool,
+    include_contested: bool,
 ) -> bool {
     match node_type {
         NodeType::Atomic | NodeType::Compound => true,
         NodeType::Fact | NodeType::Statement => !only_claims,
         NodeType::Claim => only_claims || include_claims,
         NodeType::InvalidStatement => include_invalid,
+        NodeType::ContestedStatement => include_contested,
+        NodeType::Source => false,
     }
 }
 
@@ -450,6 +528,8 @@ fn main() {
                         NodeType::Claim => "claim",
                         NodeType::Fact => "fact",
                         NodeType::InvalidStatement => "invalid_statement",
+                        NodeType::ContestedStatement => "contested_statement",
+                        NodeType::Source => "source",
                     };
                     println!("✓ {} concept added", node_type_str);
                     println!("  ID:{}  domains: {:?}  sources: {:?}  {}", id, domains_list, sources_list, term);
@@ -666,6 +746,7 @@ fn main() {
                     let status_str = match node.verification_status {
                         graph::VerificationStatus::Invalid => "invalid",
                         graph::VerificationStatus::Unproven => "unproven",
+                        graph::VerificationStatus::Contested => "contested",
                         graph::VerificationStatus::Partial => "partial",
                         graph::VerificationStatus::Proven => "proven",
                         graph::VerificationStatus::ProvenStrong => "proven_strong",
@@ -816,7 +897,7 @@ fn main() {
 
                     let filtered: Vec<_> = results.into_iter().filter(|(node_id, _)| {
                         let node = &braim.state.nodes[node_id];
-                        statement_family_visible(&node.node_type, only_claims, include_claims, include_invalid)
+                        statement_family_visible(&node.node_type, only_claims, include_claims, include_invalid, false)
                     }).collect();
 
                     println!("Lookup: '{}'  ({} results)\n", term, filtered.len());
@@ -850,6 +931,8 @@ fn main() {
                                         graph::NodeType::Claim => "claim",
                                         graph::NodeType::Fact => "fact",
                                         graph::NodeType::InvalidStatement => "invalid_statement",
+                                        graph::NodeType::ContestedStatement => "contested_statement",
+                                        graph::NodeType::Source => "source",
                                     });
                                 }
                                 if depended_by_nodes.len() > 10 {
@@ -863,7 +946,7 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Query { terms, include_claims, only_claims, min_trust, primary_only, include_invalid } => {
+        Commands::Query { terms, include_claims, only_claims, min_trust, primary_only, include_invalid, include_contested } => {
             let term_list: Vec<&str> = terms.split(',').map(|s| s.trim()).collect();
             match braim.query(&term_list) {
                 Ok(results) => {
@@ -871,7 +954,7 @@ fn main() {
                         let node = &braim.state.nodes[node_id];
 
                         // Filter by node_type (claim/fact/invalid) per spec §3.5
-                        if !statement_family_visible(&node.node_type, only_claims, include_claims, include_invalid) {
+                        if !statement_family_visible(&node.node_type, only_claims, include_claims, include_invalid, include_contested) {
                             return false;
                         }
 
@@ -1026,6 +1109,8 @@ fn main() {
                         NodeType::Claim => "claim",
                         NodeType::Fact => "fact",
                         NodeType::InvalidStatement => "invalid_statement",
+                        NodeType::ContestedStatement => "contested_statement",
+                        NodeType::Source => "source",
                     };
                     let status_str = match node.status {
                         graph::NodeStatus::Active => "active",
@@ -1041,10 +1126,11 @@ fn main() {
                     println!("  Status: {}", status_str);
                     println!("  Created: {}", node.created_at);
 
-                    if node.node_type == NodeType::Statement {
+                    if node.node_type.is_statement_family() {
                         let verify_str = match node.verification_status {
                             graph::VerificationStatus::Invalid => "invalid",
                             graph::VerificationStatus::Unproven => "unproven",
+                            graph::VerificationStatus::Contested => "contested",
                             graph::VerificationStatus::Partial => "partial",
                             graph::VerificationStatus::Proven => "proven",
                             graph::VerificationStatus::ProvenStrong => "proven_strong",
@@ -1074,6 +1160,8 @@ fn main() {
                                     NodeType::Claim => "claim",
                                     NodeType::Fact => "fact",
                                     NodeType::InvalidStatement => "invalid_statement",
+                                    NodeType::ContestedStatement => "contested_statement",
+                                    NodeType::Source => "source",
                                 });
                             }
                         }
@@ -1128,7 +1216,7 @@ fn main() {
             }
 
             let statements: Vec<_> = braim.state.nodes.values()
-                .filter(|n| n.node_type == graph::NodeType::Statement)
+                .filter(|n| n.node_type.is_statement_family())
                 .collect();
             println!("\n── Statement verification status (Rule of 3) ──");
             if statements.is_empty() {
@@ -1145,6 +1233,7 @@ fn main() {
                     graph::VerificationStatus::ProvenStrong,
                     graph::VerificationStatus::Proven,
                     graph::VerificationStatus::Partial,
+                    graph::VerificationStatus::Contested,
                     graph::VerificationStatus::Unproven,
                     graph::VerificationStatus::Invalid,
                 ];
@@ -1155,6 +1244,7 @@ fn main() {
                             graph::VerificationStatus::ProvenStrong => "✓✓✓",
                             graph::VerificationStatus::Proven => "✓✓",
                             graph::VerificationStatus::Partial => "✓",
+                            graph::VerificationStatus::Contested => "⚠",
                             graph::VerificationStatus::Unproven => "○",
                             graph::VerificationStatus::Invalid => "✗",
                         };
@@ -1169,7 +1259,7 @@ fn main() {
 
             // Show invalidated statements
             let invalid_stmts: Vec<_> = braim.state.nodes.values()
-                .filter(|n| n.node_type == graph::NodeType::Statement && n.invalid)
+                .filter(|n| n.node_type.is_statement_family() && n.invalid)
                 .collect();
 
             if !invalid_stmts.is_empty() {
@@ -1206,12 +1296,22 @@ fn main() {
 
             Ok(())
         }
-        Commands::List { domain, r#type } => {
+        Commands::List { domain, r#type, meta } => {
             let mut nodes: Vec<_> = braim.state.nodes.values().collect();
             nodes.sort_by_key(|n| n.id);
 
             if let Some(d) = &domain {
                 nodes.retain(|n| n.domains.contains(d));
+            }
+
+            if let Some(kv) = &meta {
+                match kv.split_once('=') {
+                    Some((k, v)) => nodes.retain(|n| n.metadata.get(k).map(|x| x == v).unwrap_or(false)),
+                    None => {
+                        eprintln!("--meta must be key=value (e.g. scope=cognitivex_flow)");
+                        std::process::exit(1);
+                    }
+                }
             }
 
             if let Some(t) = &r#type {
@@ -1239,6 +1339,8 @@ fn main() {
                     NodeType::Claim => "? claim",
                     NodeType::Fact => "▶ fact",
                     NodeType::InvalidStatement => "✗ invalid",
+                    NodeType::ContestedStatement => "⚠ contested",
+                    NodeType::Source => "◈ source",
                 };
                 let verify_str = if node.node_type.is_statement_family() {
                     format!("{} {}", node.verification_status.badge(), node.verification_status.label())
@@ -1252,6 +1354,33 @@ fn main() {
                 );
             }
 
+            Ok(())
+        }
+        Commands::Meta { id, set, inc } => {
+            if let Some(kv) = set {
+                match kv.split_once('=') {
+                    Some((k, v)) => match braim.set_meta(id, k, v) {
+                        Ok(_) => println!("set {}.metadata[{}] = {}", id, k, v),
+                        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                    },
+                    None => { eprintln!("--set must be key=value"); std::process::exit(1); }
+                }
+            } else if let Some(k) = inc {
+                match braim.inc_meta(id, &k) {
+                    Ok(n) => println!("{}.metadata[{}] = {}", id, k, n),
+                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                }
+            } else {
+                match braim.state.nodes.get(&id) {
+                    Some(node) if node.metadata.is_empty() => println!("node {} has no metadata", id),
+                    Some(node) => {
+                        let mut keys: Vec<_> = node.metadata.keys().collect();
+                        keys.sort();
+                        for k in keys { println!("  {} = {}", k, node.metadata[k]); }
+                    }
+                    None => { eprintln!("Error: Node ID {} does not exist", id); std::process::exit(1); }
+                }
+            }
             Ok(())
         }
         Commands::Serve { port } => {
@@ -1307,6 +1436,57 @@ fn main() {
                         }
                     }
 
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Source(SourceCommands::Add { label, r#type, location, ingested_by }) => {
+            match braim.add_source(&label, &r#type, location, ingested_by) {
+                Ok(id) => {
+                    println!("✓ source added");
+                    println!("  ID:{}  type: {}  label: {}", id, r#type, label);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::AddSource { id, source_id }) => {
+            match braim.add_source_to_statement(id, source_id) {
+                Ok(AddSourceResult { auto_resolved: true, winner_id, loser_id, winner_status, .. }) => {
+                    println!("✓ Source ID:{} attached to statement ID:{}", source_id, id);
+                    println!("  ⚡ Auto-resolved contradiction (Mechanism A):");
+                    println!("    Winner ID:{} → {}", winner_id.unwrap(), winner_status.map(|s| s.label()).unwrap_or("?"));
+                    println!("    Loser  ID:{} → invalid", loser_id.unwrap());
+                    Ok(())
+                }
+                Ok(AddSourceResult { auto_resolved: false, .. }) => {
+                    let node = &braim.state.nodes[&id];
+                    println!("✓ Source ID:{} attached to statement ID:{}", source_id, id);
+                    println!("  Verification: {} {}", node.verification_status.badge(), node.verification_status.label());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::Contradict { stmt_a, stmt_b, reason, source }) => {
+            match braim.contradict_statements(stmt_a, stmt_b, &reason, source) {
+                Ok(()) => {
+                    println!("⚠ Statements ID:{} and ID:{} marked CONTESTED", stmt_a, stmt_b);
+                    println!("  Reason: {}", reason);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::ResolveContradiction { stmt_a, stmt_b, winner, reason, source }) => {
+            let loser = if winner == stmt_a { stmt_b } else { stmt_a };
+            match braim.resolve_contradiction(winner, loser, &reason, source) {
+                Ok(()) => {
+                    println!("✓ Contradiction resolved");
+                    println!("  Winner: ID:{}", winner);
+                    println!("  Loser: ID:{} → invalid", loser);
+                    println!("  Reason: {}", reason);
                     Ok(())
                 }
                 Err(e) => Err(e),

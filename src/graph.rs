@@ -16,14 +16,17 @@ pub enum NodeType {
     Claim,
     Fact,
     InvalidStatement,
+    ContestedStatement,
+    Source,
 }
 
 impl NodeType {
     /// True for statement-family nodes (legacy `Statement`, `Claim`, `Fact`,
-    /// `InvalidStatement`). Concepts (`Atomic`, `Compound`) return false.
+    /// `InvalidStatement`, `ContestedStatement`). Concepts (`Atomic`, `Compound`) return false.
     pub fn is_statement_family(&self) -> bool {
         matches!(self,
-            NodeType::Statement | NodeType::Claim | NodeType::Fact | NodeType::InvalidStatement)
+            NodeType::Statement | NodeType::Claim | NodeType::Fact |
+            NodeType::InvalidStatement | NodeType::ContestedStatement)
     }
 
     /// Derive node_type from verification_status per spec §3.2.
@@ -31,6 +34,7 @@ impl NodeType {
         match status {
             VerificationStatus::Invalid => NodeType::InvalidStatement,
             VerificationStatus::Unproven => NodeType::Claim,
+            VerificationStatus::Contested => NodeType::ContestedStatement,
             VerificationStatus::Partial
             | VerificationStatus::Proven
             | VerificationStatus::ProvenStrong => NodeType::Fact,
@@ -52,6 +56,7 @@ pub enum VerificationStatus {
     Invalid,
     #[default]
     Unproven,
+    Contested,
     Partial,
     Proven,
     ProvenStrong,
@@ -106,6 +111,7 @@ impl VerificationStatus {
             VerificationStatus::ProvenStrong => "✓✓✓",
             VerificationStatus::Proven => "✓✓",
             VerificationStatus::Partial => "✓",
+            VerificationStatus::Contested => "⚠",
             VerificationStatus::Unproven => "✗",
             VerificationStatus::Invalid => "✗✗",
         }
@@ -116,6 +122,7 @@ impl VerificationStatus {
             VerificationStatus::ProvenStrong => "proven_strong",
             VerificationStatus::Proven => "proven",
             VerificationStatus::Partial => "partial",
+            VerificationStatus::Contested => "contested",
             VerificationStatus::Unproven => "unproven",
             VerificationStatus::Invalid => "invalid",
         }
@@ -126,6 +133,7 @@ impl VerificationStatus {
             VerificationStatus::ProvenStrong => "proven_strong (3+ PRIMARY sources)",
             VerificationStatus::Proven => "proven (2+ PRIMARY sources)",
             VerificationStatus::Partial => "partial (1 PRIMARY source)",
+            VerificationStatus::Contested => "contested (unresolved contradiction)",
             VerificationStatus::Unproven => "unproven (0 PRIMARY sources)",
             VerificationStatus::Invalid => "invalid (contradicted/superseded)",
         }
@@ -137,9 +145,10 @@ impl VerificationStatus {
         match self {
             VerificationStatus::Invalid => 0,
             VerificationStatus::Unproven => 1,
-            VerificationStatus::Partial => 2,
-            VerificationStatus::Proven => 3,
-            VerificationStatus::ProvenStrong => 4,
+            VerificationStatus::Contested => 2,
+            VerificationStatus::Partial => 3,
+            VerificationStatus::Proven => 4,
+            VerificationStatus::ProvenStrong => 5,
         }
     }
 }
@@ -164,6 +173,22 @@ pub struct Node {
     pub invalid_reason: Option<String>,
     #[serde(default)]
     pub invalidated_at: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub ingested_by: Option<String>,
+    #[serde(default)]
+    pub source_ids: Vec<u32>,
+    #[serde(default)]
+    pub pre_contested_status: Option<VerificationStatus>,
+    /// First-class structured metadata (queryable, incrementable). Used by the
+    /// open-SIC register so scope, recurrence_count, affected_feature, status,
+    /// action_deadline are real fields — not label-string or domain encoded
+    /// (braim 6336). `#[serde(default)]` keeps existing current.json loadable.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -177,6 +202,18 @@ pub struct GapRecord {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContradictEdge {
+    pub from: u32,
+    pub to: u32,
+    pub reason: String,
+    pub source_id: Option<u32>,
+    pub created_at: String,
+    pub resolved: bool,
+    pub resolution_source: Option<u32>,
+    pub resolution_winner: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GraphState {
     pub nodes: HashMap<u32, Node>,
     pub dictionary: HashMap<String, Vec<u32>>,
@@ -184,6 +221,8 @@ pub struct GraphState {
     pub gaps: Vec<GapRecord>,
     pub next_id: u32,
     pub version: u32,
+    #[serde(default)]
+    pub contradicts: Vec<ContradictEdge>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -246,6 +285,14 @@ pub struct DuplicateRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct AddSourceResult {
+    pub source_id: u32,
+    pub auto_resolved: bool,
+    pub winner_id: Option<u32>,
+    pub loser_id: Option<u32>,
+    pub winner_status: Option<VerificationStatus>,
+}
+
 pub struct ImportManifest {
     pub source_path: String,
     pub imported_count: usize,
@@ -262,6 +309,12 @@ pub struct Braim {
     /// in-memory during the most recent load. Drives the migration command
     /// summary so users know whether the on-disk file was already canonical.
     pub legacy_node_types_migrated: usize,
+    /// Reverse-adjacency index built at load: dependents[X] = list of
+    /// (node_id, edge_weight) for every ACTIVE node whose depends_on contains X.
+    /// Replaces the O(n) full-scan-per-step in propagate() with O(1) lookup,
+    /// which (with the visited-set) bounds traversal to O(V+E) and fixes the
+    /// high-fan-out query hang.
+    pub dependents: HashMap<u32, Vec<(u32, f64)>>,
 }
 
 /// Canonical list of PRIMARY-tier source type prefix names.
@@ -443,6 +496,7 @@ impl Braim {
                 gaps: Vec::new(),
                 next_id: 1,
                 version: 0,
+                contradicts: Vec::new(),
             }
         };
 
@@ -458,11 +512,31 @@ impl Braim {
             }
         }
 
+        // Build the reverse-adjacency index once at load (see field doc).
+        let dependents = Self::build_dependents(&state);
+
         Ok(Braim {
             data_dir: path,
             state,
             legacy_node_types_migrated: legacy_count,
+            dependents,
         })
+    }
+
+    /// dependents[X] = (node_id, weight) for every ACTIVE node whose
+    /// depends_on contains X. Mirrors the active-node filter the old
+    /// propagate() applied to the expanding node.
+    fn build_dependents(state: &GraphState) -> HashMap<u32, Vec<(u32, f64)>> {
+        let mut dependents: HashMap<u32, Vec<(u32, f64)>> = HashMap::new();
+        for node in state.nodes.values() {
+            if node.status != NodeStatus::Active {
+                continue;
+            }
+            for (&dep_id, &w) in &node.depends_on {
+                dependents.entry(dep_id).or_default().push((node.id, w));
+            }
+        }
+        dependents
     }
 
     /// Force-rewrite all node_type fields from verification_status and flush
@@ -486,6 +560,353 @@ impl Braim {
         self.flush()?;
         self.legacy_node_types_migrated = 0;
         Ok(changed)
+    }
+
+    pub fn add_source(
+        &mut self,
+        label: &str,
+        source_type_str: &str,
+        location: Option<String>,
+        ingested_by: Option<String>,
+    ) -> Result<u32, String> {
+        // Validate source_type_str is a known prefix
+        if SourceType::from_prefix(source_type_str).is_none() {
+            return Err(format!(
+                "Error: unknown source type '{}'. Use: code, doc, schema, config, transcript, test, phase_N, agent, narrative, logic, inference",
+                source_type_str
+            ));
+        }
+        let id = self.state.next_id;
+        self.state.next_id += 1;
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let node = Node {
+            id,
+            domains: vec![],
+            sources: vec![],
+            node_type: NodeType::Source,
+            label: label.to_string(),
+            depends_on: HashMap::new(),
+            status: NodeStatus::Active,
+            created_at: now.clone(),
+            verified_by: HashMap::new(),
+            verification_status: VerificationStatus::Unproven,
+            invalid: false,
+            invalid_reason: None,
+            invalidated_at: None,
+            source_type: Some(source_type_str.to_string()),
+            location,
+            ingested_by,
+            source_ids: vec![],
+            pre_contested_status: None,
+            metadata: HashMap::new(),
+        };
+        self.state.nodes.insert(id, node);
+        let lower = label.to_lowercase();
+        self.state.dictionary.entry(lower).or_insert_with(Vec::new).push(id);
+        self.flush()?;
+        Ok(id)
+    }
+
+    /// Compute verification status from both string sources and source entity IDs.
+    /// Source entity IDs are looked up to get their source_type for PRIMARY classification.
+    /// Pass pre-fetched entity types as &[String] to avoid borrow conflicts.
+    pub fn calculate_verification_status_from_all_sources(
+        sources: &[String],
+        source_entity_types: &[String],
+    ) -> VerificationStatus {
+        let mut primary_types = std::collections::HashSet::new();
+        for source in sources {
+            let (source_type, _) = Self::parse_source(source);
+            if source_type.tier() == "PRIMARY" {
+                primary_types.insert(source_type);
+            }
+        }
+        for st in source_entity_types {
+            if let Some(source_type) = SourceType::from_prefix(st) {
+                if source_type.tier() == "PRIMARY" {
+                    primary_types.insert(source_type);
+                }
+            }
+        }
+        match primary_types.len() {
+            0 => VerificationStatus::Unproven,
+            1 => VerificationStatus::Partial,
+            2 => VerificationStatus::Proven,
+            _ => VerificationStatus::ProvenStrong,
+        }
+    }
+
+    /// Collect the source_type strings for all source entity IDs on a node.
+    fn fetch_source_entity_types(&self, source_ids: &[u32]) -> Vec<String> {
+        source_ids.iter()
+            .filter_map(|&sid| {
+                self.state.nodes.get(&sid)
+                    .filter(|n| n.node_type == NodeType::Source)
+                    .and_then(|n| n.source_type.clone())
+            })
+            .collect()
+    }
+
+    pub fn add_source_to_statement(
+        &mut self,
+        statement_id: u32,
+        source_id: u32,
+    ) -> Result<AddSourceResult, String> {
+        // Validate statement
+        {
+            let stmt = self.state.nodes.get(&statement_id)
+                .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+            if !stmt.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", statement_id));
+            }
+            if stmt.verification_status == VerificationStatus::Invalid {
+                return Err(format!("Error: Cannot add source to invalid statement ID {}", statement_id));
+            }
+            if stmt.source_ids.contains(&source_id) {
+                return Err(format!("Error: Source ID {} already attached to statement ID {}", source_id, statement_id));
+            }
+        }
+        // Validate source entity
+        let source_type_str = {
+            let src = self.state.nodes.get(&source_id)
+                .ok_or(format!("Error: Source ID {} not found", source_id))?;
+            if src.node_type != NodeType::Source {
+                return Err(format!(
+                    "Error: Node ID {} is not a source entity (use 'braim source add' to create one)",
+                    source_id
+                ));
+            }
+            src.source_type.clone()
+        };
+        let source_is_primary = source_type_str
+            .as_deref()
+            .and_then(SourceType::from_prefix)
+            .map(|t| t.tier() == "PRIMARY")
+            .unwrap_or(false);
+
+        // Attach the source
+        {
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.source_ids.push(source_id);
+        }
+
+        let is_contested = self.state.nodes[&statement_id].verification_status
+            == VerificationStatus::Contested;
+
+        // Check for Mechanism A auto-resolution
+        if is_contested && source_is_primary {
+            let edge_idx = self.state.contradicts.iter().position(|e| {
+                !e.resolved && (e.from == statement_id || e.to == statement_id)
+            });
+            if let Some(idx) = edge_idx {
+                let other_id = {
+                    let e = &self.state.contradicts[idx];
+                    if e.from == statement_id { e.to } else { e.from }
+                };
+                let other_has_source = self.state.nodes.get(&other_id)
+                    .map(|n| n.source_ids.contains(&source_id))
+                    .unwrap_or(false);
+
+                if !other_has_source {
+                    let winner_status = {
+                        let stmt = self.state.nodes.get(&statement_id).unwrap();
+                        let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                        Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+                    };
+                    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    {
+                        let winner = self.state.nodes.get_mut(&statement_id).unwrap();
+                        winner.verification_status = winner_status;
+                        winner.node_type = NodeType::from_verification_status(winner_status);
+                        winner.pre_contested_status = None;
+                    }
+                    {
+                        let loser = self.state.nodes.get_mut(&other_id).unwrap();
+                        loser.verification_status = VerificationStatus::Invalid;
+                        loser.node_type = NodeType::InvalidStatement;
+                        loser.invalid = true;
+                        loser.invalid_reason = Some(format!(
+                            "contested_resolved_against_by_source_{}", source_id
+                        ));
+                        loser.invalidated_at = Some(now.clone());
+                        loser.pre_contested_status = None;
+                    }
+                    {
+                        let edge = &mut self.state.contradicts[idx];
+                        edge.resolved = true;
+                        edge.resolution_winner = Some(statement_id);
+                        edge.resolution_source = Some(source_id);
+                    }
+                    let cascade_ids: Vec<u32> = self.find_cascade_nodes(other_id)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                    for dep_id in cascade_ids {
+                        if let Some(dep) = self.state.nodes.get_mut(&dep_id) {
+                            if dep.invalid || dep.verification_status == VerificationStatus::Invalid {
+                                continue;
+                            }
+                            dep.invalid = true;
+                            dep.invalid_reason = Some(format!("depends_on_invalidated:{}", other_id));
+                            dep.invalidated_at = Some(now.clone());
+                            dep.verification_status = VerificationStatus::Invalid;
+                            dep.node_type = NodeType::InvalidStatement;
+                        }
+                    }
+                    self.flush()?;
+                    return Ok(AddSourceResult {
+                        source_id,
+                        auto_resolved: true,
+                        winner_id: Some(statement_id),
+                        loser_id: Some(other_id),
+                        winner_status: Some(winner_status),
+                    });
+                }
+            }
+        }
+
+        // No auto-resolution: recompute status if not contested
+        if !is_contested {
+            let new_status = {
+                let stmt = self.state.nodes.get(&statement_id).unwrap();
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+            };
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.verification_status = new_status;
+            stmt.node_type = NodeType::from_verification_status(new_status);
+        }
+
+        self.flush()?;
+        Ok(AddSourceResult {
+            source_id,
+            auto_resolved: false,
+            winner_id: None,
+            loser_id: None,
+            winner_status: None,
+        })
+    }
+
+    pub fn contradict_statements(
+        &mut self,
+        from: u32,
+        to: u32,
+        reason: &str,
+        source_id: Option<u32>,
+    ) -> Result<(), String> {
+        // Validate both IDs exist and are statements
+        for &id in &[from, to] {
+            let node = self.state.nodes.get(&id)
+                .ok_or(format!("Error: Statement ID {} not found", id))?;
+            if !node.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", id));
+            }
+            if node.verification_status == VerificationStatus::Invalid {
+                return Err(format!("Error: Statement ID {} is invalid and cannot be contested", id));
+            }
+        }
+        // Check no existing unresolved contradicts edge between them
+        for edge in &self.state.contradicts {
+            if !edge.resolved
+                && ((edge.from == from && edge.to == to) || (edge.from == to && edge.to == from))
+            {
+                return Err(format!(
+                    "Error: unresolved contradiction already exists between {} and {}",
+                    from, to
+                ));
+            }
+        }
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.state.contradicts.push(ContradictEdge {
+            from,
+            to,
+            reason: reason.to_string(),
+            source_id,
+            created_at: now,
+            resolved: false,
+            resolution_source: None,
+            resolution_winner: None,
+        });
+        // Move both to contested, preserving pre_contested_status
+        for &id in &[from, to] {
+            let node = self.state.nodes.get_mut(&id).unwrap();
+            if node.verification_status != VerificationStatus::Contested {
+                node.pre_contested_status = Some(node.verification_status);
+                node.verification_status = VerificationStatus::Contested;
+                node.node_type = NodeType::ContestedStatement;
+            }
+        }
+        self.flush()?;
+        Ok(())
+    }
+
+    pub fn resolve_contradiction(
+        &mut self,
+        winner_id: u32,
+        loser_id: u32,
+        reason: &str,
+        source_id: Option<u32>,
+    ) -> Result<(), String> {
+        // Validate
+        for &id in &[winner_id, loser_id] {
+            self.state.nodes.get(&id)
+                .ok_or(format!("Error: Statement ID {} not found", id))?;
+        }
+        // Find the contradicts edge (may have been from either direction)
+        let edge_idx = self.state.contradicts.iter().position(|e| {
+            !e.resolved
+                && ((e.from == winner_id && e.to == loser_id)
+                    || (e.from == loser_id && e.to == winner_id))
+        }).ok_or("Error: no active contradiction edge between these statements".to_string())?;
+
+        // Restore winner to pre_contested_status (or recompute from sources)
+        {
+            let winner = self.state.nodes.get_mut(&winner_id).unwrap();
+            let restored = winner.pre_contested_status
+                .unwrap_or_else(|| Self::calculate_verification_status_from_sources(&winner.sources));
+            winner.verification_status = restored;
+            winner.node_type = NodeType::from_verification_status(restored);
+            winner.pre_contested_status = None;
+        }
+
+        // Invalidate loser
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        {
+            let loser = self.state.nodes.get_mut(&loser_id).unwrap();
+            loser.verification_status = VerificationStatus::Invalid;
+            loser.node_type = NodeType::InvalidStatement;
+            loser.invalid = true;
+            loser.invalid_reason = Some(format!("contested_resolved_against: {}", reason));
+            loser.invalidated_at = Some(now.clone());
+            loser.pre_contested_status = None;
+        }
+
+        // Mark edge resolved
+        let edge = &mut self.state.contradicts[edge_idx];
+        edge.resolved = true;
+        edge.resolution_winner = Some(winner_id);
+        edge.resolution_source = source_id;
+
+        // Cascade-invalidate loser dependents
+        let cascade_ids: Vec<u32> = self.find_cascade_nodes(loser_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for dep_id in cascade_ids {
+            if let Some(dep_node) = self.state.nodes.get_mut(&dep_id) {
+                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
+                    continue;
+                }
+                dep_node.invalid = true;
+                dep_node.invalid_reason = Some(format!("depends_on_invalidated:{}", loser_id));
+                dep_node.invalidated_at = Some(now.clone());
+                dep_node.verification_status = VerificationStatus::Invalid;
+                dep_node.node_type = NodeType::InvalidStatement;
+            }
+        }
+
+        self.flush()?;
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -579,6 +1000,12 @@ impl Braim {
             invalid: false,
             invalid_reason: None,
             invalidated_at: None,
+            source_type: None,
+            location: None,
+            ingested_by: None,
+            source_ids: vec![],
+            pre_contested_status: None,
+            metadata: HashMap::new(),
         };
 
         self.state.nodes.insert(id, node);
@@ -887,8 +1314,9 @@ impl Braim {
                             match cap {
                                 0 => VerificationStatus::Invalid,
                                 1 => VerificationStatus::Unproven,
-                                2 => VerificationStatus::Partial,
-                                3 => VerificationStatus::Proven,
+                                2 => VerificationStatus::Contested,
+                                3 => VerificationStatus::Partial,
+                                4 => VerificationStatus::Proven,
                                 _ => VerificationStatus::ProvenStrong,
                             }
                         }
@@ -912,6 +1340,12 @@ impl Braim {
             invalid: invalid_flag,
             invalid_reason,
             invalidated_at,
+            source_type: None,
+            location: None,
+            ingested_by: None,
+            source_ids: vec![],
+            pre_contested_status: None,
+            metadata: HashMap::new(),
         };
 
         self.state.nodes.insert(id, node);
@@ -974,6 +1408,39 @@ impl Braim {
         Ok(())
     }
 
+    /// Set a first-class metadata key on a node (braim 6336). Structured, not
+    /// label/domain-encoded — so scope/status/affected_feature are queryable.
+    pub fn set_meta(&mut self, node_id: u32, key: &str, value: &str) -> Result<(), String> {
+        let node = self.state.nodes.get_mut(&node_id)
+            .ok_or_else(|| format!("Error: Node ID {} does not exist", node_id))?;
+        node.metadata.insert(key.to_string(), value.to_string());
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Increment a numeric metadata key (absent/non-numeric treated as 0).
+    /// Returns the new value. The clean recurrence_count increment (braim 6336).
+    pub fn inc_meta(&mut self, node_id: u32, key: &str) -> Result<i64, String> {
+        let node = self.state.nodes.get_mut(&node_id)
+            .ok_or_else(|| format!("Error: Node ID {} does not exist", node_id))?;
+        let cur = node.metadata.get(key).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let next = cur + 1;
+        node.metadata.insert(key.to_string(), next.to_string());
+        self.flush()?;
+        Ok(next)
+    }
+
+    /// All node ids whose metadata[key] == value — queryable differentiation
+    /// (e.g. scope=cognitivex_flow vs scope=deliverable, status=open).
+    pub fn nodes_by_meta(&self, key: &str, value: &str) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.state.nodes.values()
+            .filter(|n| n.metadata.get(key).map(|v| v == value).unwrap_or(false))
+            .map(|n| n.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn propagate(&self, term: &str) -> (HashMap<u32, f64>, bool) {
         let source_ids = self.find_concepts_fuzzy(term);
 
@@ -984,28 +1451,27 @@ impl Braim {
         let is_fuzzy = !self.state.dictionary.contains_key(&term.to_lowercase());
 
         let mut scores: HashMap<u32, f64> = HashMap::new();
+        let mut visited: HashSet<u32> = HashSet::new();
         let mut queue: VecDeque<(u32, f64)> = VecDeque::new();
 
         for source_id in source_ids {
             scores.insert(source_id, 1.0);
-            queue.push_back((source_id, 1.0));
+            if visited.insert(source_id) {
+                queue.push_back((source_id, 1.0));
+            }
         }
 
-        let max_iterations = self.state.nodes.len() * self.state.nodes.len();
-        let mut iterations = 0;
-
+        // Bounded BFS over the reverse-adjacency index: each node is expanded
+        // at most once (visited-set), and finding dependents is an O(1) index
+        // lookup rather than an O(n) full scan. Total work is O(V+E), replacing
+        // the old O(n^2)-capped scan that hung on high-fan-out terms.
         while let Some((current_id, acc)) = queue.pop_front() {
-            if iterations >= max_iterations {
-                break;
-            }
-            iterations += 1;
-
-            for (node_id, node) in &self.state.nodes {
-                if node.status == NodeStatus::Active {
-                    if let Some(&edge_w) = node.depends_on.get(&current_id) {
-                        let new_acc = acc * edge_w;
-                        *scores.entry(*node_id).or_insert(0.0) += new_acc;
-                        queue.push_back((*node_id, new_acc));
+            if let Some(deps) = self.dependents.get(&current_id) {
+                for &(node_id, edge_w) in deps {
+                    let new_acc = acc * edge_w;
+                    *scores.entry(node_id).or_insert(0.0) += new_acc;
+                    if visited.insert(node_id) {
+                        queue.push_back((node_id, new_acc));
                     }
                 }
             }
@@ -1690,7 +2156,9 @@ impl Braim {
                 NodeType::Statement
                 | NodeType::Claim
                 | NodeType::Fact
-                | NodeType::InvalidStatement => statements.push(node.clone()),
+                | NodeType::InvalidStatement
+                | NodeType::ContestedStatement => statements.push(node.clone()),
+                NodeType::Source => {} // skip source nodes during import
             }
         }
 
