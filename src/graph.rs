@@ -928,10 +928,6 @@ impl Braim {
         if domains.is_empty() || sources.is_empty() {
             return Err("Error: domains and sources must not be empty".to_string());
         }
-        if domains.len() != sources.len() {
-            return Err("Error: domains and sources must have equal length".to_string());
-        }
-
         for source in &sources {
             Self::validate_source_prefix(source)?;
         }
@@ -955,13 +951,6 @@ impl Braim {
                 if deps.is_empty() {
                     return Err("Error: Compound concept must have dependencies".to_string());
                 }
-                if deps.len() != domains.len() {
-                    return Err(format!(
-                        "Error: Number of dependencies ({}) must match domains ({})",
-                        deps.len(),
-                        domains.len()
-                    ));
-                }
                 for &dep_id in deps.keys() {
                     if !self.state.nodes.contains_key(&dep_id) {
                         return Err(format!("Error: Dependency ID {} does not exist", dep_id));
@@ -974,9 +963,6 @@ impl Braim {
                 (NodeType::Compound, deps)
             }
             None => {
-                if domains.len() != 1 {
-                    return Err("Error: Atomic concepts must have exactly 1 domain/source pair".to_string());
-                }
                 (NodeType::Atomic, HashMap::new())
             }
         };
@@ -1232,17 +1218,6 @@ impl Braim {
         if domains.is_empty() || sources.is_empty() {
             return Err("Error: domains and sources must not be empty".to_string());
         }
-        if domains.len() != sources.len() {
-            return Err("Error: domains and sources must have equal length".to_string());
-        }
-        if domains.len() != depends_on.len() {
-            return Err(format!(
-                "Error: Number of domains ({}) must match dependencies ({})",
-                domains.len(),
-                depends_on.len()
-            ));
-        }
-
         for source in &sources {
             if source != &"inferred".to_string() {
                 Self::validate_source_prefix(source)?;
