@@ -151,6 +151,19 @@ impl VerificationStatus {
             VerificationStatus::ProvenStrong => 5,
         }
     }
+
+    /// Inverse of `rank`: map a canonical rank back to a status.
+    /// Single source of truth for rank -> status so the two never drift.
+    pub fn from_rank(rank: u8) -> VerificationStatus {
+        match rank {
+            0 => VerificationStatus::Invalid,
+            1 => VerificationStatus::Unproven,
+            2 => VerificationStatus::Contested,
+            3 => VerificationStatus::Partial,
+            4 => VerificationStatus::Proven,
+            _ => VerificationStatus::ProvenStrong,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1034,9 +1047,7 @@ impl Braim {
         sources: Vec<String>,
         depends_on: Option<HashMap<u32, f64>>,
     ) -> Result<u32, String> {
-        if domains.is_empty() || sources.is_empty() {
-            return Err("Error: domains and sources must not be empty".to_string());
-        }
+        Self::validate_non_empty(&domains, &sources)?;
         for source in &sources {
             Self::validate_source_prefix(source)?;
         }
@@ -1060,15 +1071,8 @@ impl Braim {
                 if deps.is_empty() {
                     return Err("Error: Compound concept must have dependencies".to_string());
                 }
-                for &dep_id in deps.keys() {
-                    if !self.state.nodes.contains_key(&dep_id) {
-                        return Err(format!("Error: Dependency ID {} does not exist", dep_id));
-                    }
-                }
-                let sum: f64 = deps.values().sum();
-                if (sum - 1.0).abs() > 0.001 {
-                    return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
-                }
+                self.validate_deps_exist(&deps)?;
+                Self::validate_weights_sum_to_one(&deps)?;
                 (NodeType::Compound, deps)
             }
             None => {
@@ -1313,6 +1317,32 @@ impl Braim {
         None
     }
 
+    /// Shared validators (centralized so add_concept/add_statement don't drift).
+    /// Domain/source *arity* is intentionally not validated here (decoupled).
+    fn validate_non_empty(domains: &[String], sources: &[String]) -> Result<(), String> {
+        if domains.is_empty() || sources.is_empty() {
+            return Err("Error: domains and sources must not be empty".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_weights_sum_to_one(deps: &HashMap<u32, f64>) -> Result<(), String> {
+        let sum: f64 = deps.values().sum();
+        if (sum - 1.0).abs() > 0.001 {
+            return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
+        }
+        Ok(())
+    }
+
+    fn validate_deps_exist(&self, deps: &HashMap<u32, f64>) -> Result<(), String> {
+        for &dep_id in deps.keys() {
+            if !self.state.nodes.contains_key(&dep_id) {
+                return Err(format!("Error: Dependency ID {} does not exist", dep_id));
+            }
+        }
+        Ok(())
+    }
+
     pub fn add_statement(
         &mut self,
         text: &str,
@@ -1324,25 +1354,15 @@ impl Braim {
         if depends_on.is_empty() {
             return Err("Error: Statement must have at least 1 dependency".to_string());
         }
-        if domains.is_empty() || sources.is_empty() {
-            return Err("Error: domains and sources must not be empty".to_string());
-        }
+        Self::validate_non_empty(&domains, &sources)?;
         for source in &sources {
             if source != &"inferred".to_string() {
                 Self::validate_source_prefix(source)?;
             }
         }
 
-        for &dep_id in depends_on.keys() {
-            if !self.state.nodes.contains_key(&dep_id) {
-                return Err(format!("Error: Dependency ID {} does not exist", dep_id));
-            }
-        }
-
-        let sum: f64 = depends_on.values().sum();
-        if (sum - 1.0).abs() > 0.001 {
-            return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
-        }
+        self.validate_deps_exist(&depends_on)?;
+        Self::validate_weights_sum_to_one(&depends_on)?;
 
         if !assume {
             if let Err(validation_msg) = self.validate_statement_concepts(text, &depends_on) {
@@ -1395,14 +1415,7 @@ impl Braim {
                         if source_derived.rank() <= cap {
                             source_derived
                         } else {
-                            match cap {
-                                0 => VerificationStatus::Invalid,
-                                1 => VerificationStatus::Unproven,
-                                2 => VerificationStatus::Contested,
-                                3 => VerificationStatus::Partial,
-                                4 => VerificationStatus::Proven,
-                                _ => VerificationStatus::ProvenStrong,
-                            }
+                            VerificationStatus::from_rank(cap)
                         }
                     }
                 };
@@ -2480,5 +2493,24 @@ impl Braim {
             id_mappings,
             duplicates,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VerificationStatus as VS;
+
+    #[test]
+    fn from_rank_is_inverse_of_rank() {
+        for s in [
+            VS::Invalid,
+            VS::Unproven,
+            VS::Contested,
+            VS::Partial,
+            VS::Proven,
+            VS::ProvenStrong,
+        ] {
+            assert_eq!(VS::from_rank(s.rank()), s, "from_rank(rank()) must round-trip for {s:?}");
+        }
     }
 }
