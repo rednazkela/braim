@@ -478,6 +478,115 @@ impl Braim {
         (has_dups, counts)
     }
 
+    /// Returns the number of distinct domain values across all non-source active nodes.
+    pub fn distinct_domain_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for node in self.state.nodes.values() {
+            if node.node_type != NodeType::Source {
+                for d in &node.domains {
+                    seen.insert(d.clone());
+                }
+            }
+        }
+        seen.len()
+    }
+
+    /// Returns true if the label ends with a line-number suffix (e.g. `:104` or `:104-127`).
+    pub fn label_has_line_number_suffix(label: &str) -> bool {
+        if let Some(colon_pos) = label.rfind(':') {
+            let after = &label[colon_pos + 1..];
+            if after.is_empty() {
+                return false;
+            }
+            if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+            if let Some(dash_pos) = after.find('-') {
+                let before = &after[..dash_pos];
+                let tail = &after[dash_pos + 1..];
+                if !before.is_empty()
+                    && before.chars().all(|c| c.is_ascii_digit())
+                    && !tail.is_empty()
+                    && tail.chars().all(|c| c.is_ascii_digit())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Add, remove, or replace dependency edges on an existing compound, preserving node ID.
+    pub fn update_deps(
+        &mut self,
+        node_id: u32,
+        add: Option<HashMap<u32, f64>>,
+        remove: Option<Vec<u32>>,
+        set: Option<HashMap<u32, f64>>,
+    ) -> Result<HashMap<u32, f64>, String> {
+        if !self.state.nodes.contains_key(&node_id) {
+            return Err(format!("Error: Node ID {} does not exist", node_id));
+        }
+        {
+            let node = self.state.nodes.get(&node_id).unwrap();
+            if node.node_type != NodeType::Compound {
+                return Err(format!(
+                    "Error: Node ID {} is not a compound (node_type: {:?})",
+                    node_id, node.node_type
+                ));
+            }
+        }
+
+        let new_deps: HashMap<u32, f64> = if let Some(set_deps) = set {
+            for &dep_id in set_deps.keys() {
+                if !self.state.nodes.contains_key(&dep_id) {
+                    return Err(format!("Error: Dependency ID {} does not exist", dep_id));
+                }
+            }
+            set_deps
+        } else {
+            let mut deps = self.state.nodes.get(&node_id).unwrap().depends_on.clone();
+            if let Some(ids_to_remove) = remove {
+                for id in ids_to_remove {
+                    if !deps.contains_key(&id) {
+                        return Err(format!(
+                            "Error: ID {} is not a current dependency of node {}",
+                            id, node_id
+                        ));
+                    }
+                    deps.remove(&id);
+                }
+            }
+            if let Some(new_entries) = add {
+                for (id, weight) in new_entries {
+                    if deps.contains_key(&id) {
+                        return Err(format!(
+                            "Error: ID {} is already a dependency of node {}. Use --remove first or --set to replace all.",
+                            id, node_id
+                        ));
+                    }
+                    if !self.state.nodes.contains_key(&id) {
+                        return Err(format!("Error: Dependency ID {} does not exist", id));
+                    }
+                    deps.insert(id, weight);
+                }
+            }
+            deps
+        };
+
+        if new_deps.is_empty() {
+            return Err("Error: Compound must retain at least 1 dependency".to_string());
+        }
+        let sum: f64 = new_deps.values().sum();
+        if (sum - 1.0).abs() > 0.001 {
+            return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
+        }
+
+        self.state.nodes.get_mut(&node_id).unwrap().depends_on = new_deps.clone();
+        self.flush()?;
+        Ok(new_deps)
+    }
+
     pub fn new(data_dir: &str) -> Result<Self, String> {
         let path = PathBuf::from(data_dir);
         fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
