@@ -64,10 +64,11 @@ TAXONOMY & VALIDATION (prevent common hygiene issues):\n\
     Solution: Keep evidence separate. Record reasoning in label or as dependent inference statement.\n\
     Flag: --strict-sources (statement add, concept add)\n\
   \n  Duplicate domain entries:\n\
-    Issue: Same domain repeated (payment,payment,payment) for arity padding.\n\
+    Issue: Same domain repeated (payment,payment,payment).\n\
     Impact: Inflates occurrence counts; obscures true domain membership for queries.\n\
-    Solution: Use distinct domains (e.g., payment,operations,finance) per dependency.\n\
-    Flag: --strict-domains (statement add)\n\
+    Solution: Use distinct domains (e.g., payment,operations,finance).\n\
+    Note: Warning suppressed in single-domain graphs where uniform repetition is expected.\n\
+    Flag: --strict-domains (statement add) to reject instead of warn.\n\
   \n  Stale gap register entries:\n\
     Automatic: Gap register auto-clears when statements connect previously-separate concepts.\n\
     Example: Gap registered between A↔B; add statement --depends \"A:0.5,B:0.5\" → gap cleared.\n\
@@ -119,9 +120,9 @@ WORKFLOW:\n\
   # Create concept and statement\n\
   braim concept add \"Refund\" --domains billing --sources \"code:refund.rs\"\n\
   braim statement add \"Refund extends Payment\" \\\n\
-    --domains billing,billing --sources \"code:refund.rs,doc:billing.md\" \\\n\
+    --domains billing --sources \"code:refund.rs,doc:billing.md\" \\\n\
     --depends \"1:0.5,2:0.5\"\n\
-  # → Status: PROVEN (2 PRIMARY types)\n\n\
+  # → Status: PROVEN (2 PRIMARY types); --domains is free-count, 1 domain ok with 2 sources\n\n\
   # Upgrade an unproven statement\n\
   braim statement verify-suggest 42\n\n\
   # Query\n\
@@ -156,7 +157,12 @@ FOR AGENTS:\n\
     • Using default-even weights (0.5/0.5, 0.25×4) when one dependency is clearly\n\
       more central — express importance via asymmetric weights so query results,\n\
       perspective paths, and proximity scores reflect actual semantic structure.\n\
-      See DEPENDENCY WEIGHTS section.")]
+      See DEPENDENCY WEIGHTS section.\n\
+    • Putting line numbers in source node labels (braim source add 'file.rs:42')\n\
+      — node labels are stable identity; put ranges in --sources metadata strings.\n\
+    • Deleting and recreating a compound to change dependencies — use\n\
+      'braim concept update-deps <id> --add/--remove/--set' to preserve node ID\n\
+      and all referencing statements.")]
 struct Cli {
     #[arg(global = true, long, default_value = ".braim")]
     data_dir: String,
@@ -290,6 +296,16 @@ enum ConceptCommands {
         #[arg(long, help = "New weights: \"ID:weight,ID:weight\" (must sum to 1.0)")]
         weights: String,
     },
+    #[command(about = "Add, remove, or replace dependency edges on a compound concept", long_about = "Concept UpdateDeps: Modify the dependency edges of an existing compound without deleting it.\n\nPreserves node ID and all statements that reference it.\n\nUsage:\n  braim concept update-deps 42 --add \"5:0.3\" --remove \"3\"\n  braim concept update-deps 42 --set \"1:0.6,5:0.4\"\n\nFlags:\n  --add \"ID:weight[,ID:weight]\": Insert new dependency edges\n  --remove \"ID[,ID]\":           Remove existing dependency edges by ID\n  --set \"ID:weight[,ID:weight]\": Replace the full dependency list\n\nRules:\n  • --set is exclusive: --add and --remove are ignored when --set is provided\n  • Weights must sum to 1.0 after the operation\n  • --add errors if the ID is already a dependency (use --remove first)\n  • --remove errors if the ID is not a current dependency\n\nExample: Compound 42 depends on IDs 1 and 3. Replace ID 3 with ID 5 at 0.3 weight:\n  braim concept update-deps 42 --remove \"3\" --add \"5:0.3\"\n  (then adjust remaining weight: ID 1 must be updated via update-weights if needed)")]
+    UpdateDeps {
+        id: u32,
+        #[arg(long, help = "Add dependency edges: \"ID:weight[,ID:weight]\"")]
+        add: Option<String>,
+        #[arg(long, help = "Remove dependency edges by ID: \"ID[,ID]\"")]
+        remove: Option<String>,
+        #[arg(long, help = "Replace all dependencies: \"ID:weight[,ID:weight]\" (exclusive with --add/--remove)")]
+        set: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,7 +388,7 @@ enum StatementCommands {
 
 #[derive(Subcommand)]
 enum SourceCommands {
-    #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim source add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim source add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
+    #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim source add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim source add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n  --strict-sources: Reject if label contains a line-number suffix (default: warn)\n\nLine-number warning:\n  Labels like 'tests/oracle.txt:104-127' or 'file.rs:42' are warned by default\n  and rejected with --strict-sources. Source nodes are stable file-level identity;\n  line numbers belong in --sources metadata strings, not node labels.\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
     Add {
         label: String,
         #[arg(long, help = "Source type: code, doc, schema, config, transcript, test, phase_N, agent, narrative, logic, inference")]
@@ -381,6 +397,8 @@ enum SourceCommands {
         location: Option<String>,
         #[arg(long, help = "Agent or user who ingested this source")]
         ingested_by: Option<String>,
+        #[arg(long, help = "Reject if label contains a line-number suffix (default: warn)")]
+        strict_sources: bool,
     },
 }
 
@@ -633,6 +651,43 @@ fn main() {
                 }
             }
         }
+        Commands::Concept(ConceptCommands::UpdateDeps { id, add, remove, set }) => {
+            let add_map = match add.as_deref().map(parse_depends) {
+                Some(Ok(m)) => Some(m),
+                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                None => None,
+            };
+            let remove_ids: Option<Vec<u32>> = match remove.as_deref() {
+                Some(s) => {
+                    let parsed: Result<Vec<u32>, _> = s.split(',').map(|x| x.trim().parse::<u32>()).collect();
+                    match parsed {
+                        Ok(v) => Some(v),
+                        Err(_) => { eprintln!("Error: --remove must be comma-separated IDs (e.g. \"3,7\")"); std::process::exit(1); }
+                    }
+                }
+                None => None,
+            };
+            let set_map = match set.as_deref().map(parse_depends) {
+                Some(Ok(m)) => Some(m),
+                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                None => None,
+            };
+            if add_map.is_none() && remove_ids.is_none() && set_map.is_none() {
+                eprintln!("Error: provide at least one of --add, --remove, or --set");
+                std::process::exit(1);
+            }
+            match braim.update_deps(id, add_map, remove_ids, set_map) {
+                Ok(new_deps) => {
+                    println!("✓ Concept ID:{} dependencies updated", id);
+                    println!("  depends_on: {:?}", new_deps);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Statement(StatementCommands::Add {
             text,
             domains,
@@ -712,7 +767,8 @@ fn main() {
                 if strict_domains {
                     eprintln!("Error: duplicate domain entries detected");
                     std::process::exit(1);
-                } else {
+                } else if braim.distinct_domain_count() > 1 {
+                    // Suppress in single-domain graphs — uniform repetition is expected
                     tips::emit_tip_duplicate_domains(&dup_domain_counts, cli.quiet);
                 }
             }
@@ -1441,7 +1497,19 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Source(SourceCommands::Add { label, r#type, location, ingested_by }) => {
+        Commands::Source(SourceCommands::Add { label, r#type, location, ingested_by, strict_sources }) => {
+            if Braim::label_has_line_number_suffix(&label) {
+                let msg = format!(
+                    "Source label '{}' contains a line-number suffix. Line numbers are volatile — use the file path only and record the range in --sources metadata (e.g. test:{}:104-127).",
+                    label, label.rfind(':').map(|i| &label[..i]).unwrap_or(&label)
+                );
+                if strict_sources {
+                    eprintln!("Error: {}", msg);
+                    std::process::exit(1);
+                } else {
+                    eprintln!("⚠ {}", msg);
+                }
+            }
             match braim.add_source(&label, &r#type, location, ingested_by) {
                 Ok(id) => {
                     println!("✓ source added");

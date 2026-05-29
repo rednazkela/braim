@@ -150,7 +150,7 @@ pub fn emit_tip_duplicate_domains(counts: &std::collections::HashMap<String, usi
         .collect::<Vec<_>>()
         .join(", ");
     eprintln!(
-        "⚠ duplicate domain entries detected: [{}]. The arity rule requires count equality, not value equality — consider using distinct domains (e.g. \"library,operations,finance\") per dependency slot.",
+        "⚠ duplicate domain entries detected: [{}]. Consider using distinct domains (e.g. \"library,operations,finance\") for clearer categorization.",
         dup_list
     );
 }
