@@ -584,7 +584,7 @@ fn main() {
 
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.to_string()),
             }
         }
         Commands::Concept(ConceptCommands::Delete { id, force }) => {
@@ -792,7 +792,7 @@ fn main() {
                     tips::emit_tip_statement_add(node, &braim, cli.quiet);
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.to_string()),
             }
         }
         Commands::Statement(StatementCommands::Verify { statement_id, domain, note }) => {

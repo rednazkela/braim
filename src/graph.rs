@@ -166,6 +166,73 @@ impl VerificationStatus {
     }
 }
 
+/// Typed errors for node construction so callers can match on the failure
+/// kind instead of parsing strings. `Display` reproduces the original
+/// messages verbatim, so callers that surface the text are unaffected.
+/// (Domain/source arity is intentionally not represented — it is no longer
+/// validated since domains were decoupled from arity.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphError {
+    EmptyDomainsSources,
+    StatementNoDependency,
+    DependencyNotFound(u32),
+    WeightsNotOne(f64),
+    CompoundNoDependencies,
+    ConceptExists { term: String, domains: Vec<String>, id: u32 },
+    /// Errors raised outside the typed validation layer (source-prefix
+    /// validation, persistence, concept-graph checks). Carries the original
+    /// message so nothing is lost during the migration off `String` errors.
+    Other(String),
+}
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphError::EmptyDomainsSources => {
+                write!(f, "Error: domains and sources must not be empty")
+            }
+            GraphError::StatementNoDependency => {
+                write!(f, "Error: Statement must have at least 1 dependency")
+            }
+            GraphError::DependencyNotFound(id) => {
+                write!(f, "Error: Dependency ID {} does not exist", id)
+            }
+            GraphError::WeightsNotOne(sum) => {
+                write!(f, "Error: Weights must sum to 1.0 — got {:.4}", sum)
+            }
+            GraphError::CompoundNoDependencies => {
+                write!(f, "Error: Compound concept must have dependencies")
+            }
+            GraphError::ConceptExists { term, domains, id } => write!(
+                f,
+                "Error: Concept '{}' already exists in domain {:?} (ID {})",
+                term, domains, id
+            ),
+            GraphError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+impl From<String> for GraphError {
+    fn from(s: String) -> Self {
+        GraphError::Other(s)
+    }
+}
+
+impl From<&str> for GraphError {
+    fn from(s: &str) -> Self {
+        GraphError::Other(s.to_string())
+    }
+}
+
+impl From<GraphError> for String {
+    fn from(e: GraphError) -> Self {
+        e.to_string()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Node {
     pub id: u32,
@@ -1046,7 +1113,7 @@ impl Braim {
         domains: Vec<String>,
         sources: Vec<String>,
         depends_on: Option<HashMap<u32, f64>>,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, GraphError> {
         Self::validate_non_empty(&domains, &sources)?;
         for source in &sources {
             Self::validate_source_prefix(source)?;
@@ -1057,10 +1124,11 @@ impl Braim {
             for &existing_id in existing_ids {
                 if let Some(node) = self.state.nodes.get(&existing_id) {
                     if node.domains == domains {
-                        return Err(format!(
-                            "Error: Concept '{}' already exists in domain {:?} (ID {})",
-                            term, domains, existing_id
-                        ));
+                        return Err(GraphError::ConceptExists {
+                            term: term.to_string(),
+                            domains: domains.clone(),
+                            id: existing_id,
+                        });
                     }
                 }
             }
@@ -1069,7 +1137,7 @@ impl Braim {
         let (node_type, final_depends_on) = match depends_on {
             Some(deps) => {
                 if deps.is_empty() {
-                    return Err("Error: Compound concept must have dependencies".to_string());
+                    return Err(GraphError::CompoundNoDependencies);
                 }
                 self.validate_deps_exist(&deps)?;
                 Self::validate_weights_sum_to_one(&deps)?;
@@ -1319,25 +1387,25 @@ impl Braim {
 
     /// Shared validators (centralized so add_concept/add_statement don't drift).
     /// Domain/source *arity* is intentionally not validated here (decoupled).
-    fn validate_non_empty(domains: &[String], sources: &[String]) -> Result<(), String> {
+    fn validate_non_empty(domains: &[String], sources: &[String]) -> Result<(), GraphError> {
         if domains.is_empty() || sources.is_empty() {
-            return Err("Error: domains and sources must not be empty".to_string());
+            return Err(GraphError::EmptyDomainsSources);
         }
         Ok(())
     }
 
-    fn validate_weights_sum_to_one(deps: &HashMap<u32, f64>) -> Result<(), String> {
+    fn validate_weights_sum_to_one(deps: &HashMap<u32, f64>) -> Result<(), GraphError> {
         let sum: f64 = deps.values().sum();
         if (sum - 1.0).abs() > 0.001 {
-            return Err(format!("Error: Weights must sum to 1.0 — got {:.4}", sum));
+            return Err(GraphError::WeightsNotOne(sum));
         }
         Ok(())
     }
 
-    fn validate_deps_exist(&self, deps: &HashMap<u32, f64>) -> Result<(), String> {
+    fn validate_deps_exist(&self, deps: &HashMap<u32, f64>) -> Result<(), GraphError> {
         for &dep_id in deps.keys() {
             if !self.state.nodes.contains_key(&dep_id) {
-                return Err(format!("Error: Dependency ID {} does not exist", dep_id));
+                return Err(GraphError::DependencyNotFound(dep_id));
             }
         }
         Ok(())
@@ -1350,9 +1418,9 @@ impl Braim {
         sources: Vec<String>,
         depends_on: HashMap<u32, f64>,
         assume: bool,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, GraphError> {
         if depends_on.is_empty() {
-            return Err("Error: Statement must have at least 1 dependency".to_string());
+            return Err(GraphError::StatementNoDependency);
         }
         Self::validate_non_empty(&domains, &sources)?;
         for source in &sources {
@@ -1366,7 +1434,7 @@ impl Braim {
 
         if !assume {
             if let Err(validation_msg) = self.validate_statement_concepts(text, &depends_on) {
-                return Err(validation_msg);
+                return Err(validation_msg.into());
             }
         }
 
@@ -2512,5 +2580,57 @@ mod tests {
         ] {
             assert_eq!(VS::from_rank(s.rank()), s, "from_rank(rank()) must round-trip for {s:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::GraphError;
+
+    #[test]
+    fn display_matches_legacy_messages() {
+        assert_eq!(
+            GraphError::EmptyDomainsSources.to_string(),
+            "Error: domains and sources must not be empty"
+        );
+        assert_eq!(
+            GraphError::StatementNoDependency.to_string(),
+            "Error: Statement must have at least 1 dependency"
+        );
+        assert_eq!(
+            GraphError::WeightsNotOne(1.4).to_string(),
+            "Error: Weights must sum to 1.0 — got 1.4000"
+        );
+        assert_eq!(
+            GraphError::DependencyNotFound(99).to_string(),
+            "Error: Dependency ID 99 does not exist"
+        );
+        assert_eq!(
+            GraphError::CompoundNoDependencies.to_string(),
+            "Error: Compound concept must have dependencies"
+        );
+        assert_eq!(
+            GraphError::ConceptExists {
+                term: "X".to_string(),
+                domains: vec!["d".to_string()],
+                id: 3
+            }
+            .to_string(),
+            "Error: Concept 'X' already exists in domain [\"d\"] (ID 3)"
+        );
+    }
+
+    #[test]
+    fn errors_are_matchable_not_just_strings() {
+        let e = GraphError::DependencyNotFound(7);
+        assert!(matches!(e, GraphError::DependencyNotFound(7)));
+    }
+
+    #[test]
+    fn string_conversion_preserves_message() {
+        let e = GraphError::EmptyDomainsSources;
+        let s: String = e.clone().into();
+        assert_eq!(s, e.to_string());
+        assert_eq!(GraphError::from("boom".to_string()), GraphError::Other("boom".to_string()));
     }
 }
