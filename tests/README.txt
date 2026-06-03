@@ -24,7 +24,7 @@ FOLDER STRUCTURE
                           26 scored on the saved reply text)
   corpus_appendix.txt     second source document (digital services), the
                           ingestion target for scenarios 24-26
-  policies/               the agent-integration policies and traits validated
+  ../policies/            (repo root) the agent-integration policies and traits validated
                           by 21-26 (perturn_logging.json, compaction_rule.txt,
                           memory_braim_traits.md, README.md)
   oracle.txt              operator-side audit criteria (NOT shown to LLM)
@@ -33,12 +33,14 @@ FOLDER STRUCTURE
 HOW TO USE
 
   1. Initialize a fresh braim graph in a new directory:
-       mkdir braim-run && cd braim-run && cp <repo>/tests/corpus.txt .
+       mkdir braim-run && cd braim-run
+       cp <repo>/tests/corpus.txt <repo>/tests/corpus_appendix.txt .
+       cp -r <repo>/policies .
        braim --help > /dev/null
        (braim auto-creates ./.braim/current.json on first command)
 
   2. From a parent Claude Code session, invoke ONE sub-agent per scenario via
-     the Agent tool, in order from scenario_01 through scenario_08. Each
+     the Agent tool, in order from scenario_01 through scenario_26. Each
      agent's prompt is the verbatim contents of the corresponding
      scenario_NN.txt file plus the working directory path. Do not include
      oracle.txt, the other scenarios, or any framing about what feature is
@@ -56,7 +58,7 @@ HOW TO USE
   4. After each agent reports back, apply the oracle.txt checks for that
      scenario against the current braim graph and record the verdict.
 
-  5. Tally PASS / FAIL across the eight scenarios. See oracle.txt SCORING.
+  5. Tally PASS / FAIL across the twenty-six scenarios. See oracle.txt SCORING.
 
 DESIGN NOTE
 

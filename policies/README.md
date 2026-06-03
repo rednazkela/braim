@@ -1,9 +1,9 @@
 # Agent-integration policies
 
-These two files are the canonical agent-integration contracts that scenarios
-21-23 validate. They are not braim features; they are policies an LLM agent
-operates under while using braim. In deployment they are injected by Claude
-Code hooks.
+These files are the canonical agent-integration contracts that scenarios
+21-26 validate. They are not braim features; they are policies an LLM agent
+operates under while using braim. In deployment the first two are injected by
+Claude Code hooks; the third is the operator's evidence discipline.
 
 ## perturn_logging.json
 
@@ -22,6 +22,11 @@ reasoning turn the agent persists its reasoning markers to braim live:
 - Lifecycle: a confirmed `?[]` is promoted via `add-source` (>=2 PRIMARY types
   from different categories auto-promotes to proven, never by fiat), then the
   scratch tag is dropped; a refuted one is `braim statement invalidate`d.
+- RE-GROUND AT PROMOTION: before `add-source`, the claim's figures/wording are
+  verified against the attaching source document itself — a node label is a
+  pointer, not evidence. Label-vs-source disagreement blocks promotion; the
+  node is invalidated and re-added with the document's wording. The same
+  applies when an `#[inference]` carries figures from a dependency.
 
 Validated by scenario_21 (single-turn logging shape) and scenario_22
 (the lifecycle: scratch -> promoted, and conflict -> contested -> resolved).
@@ -42,8 +47,8 @@ The operator's memory evidence-discipline traits (marker system @[]/#[]/?[],
 citation binding, verbatim capture, generic-vocabulary ban, fact gate, catalog
 bootstrap, completeness, semantic compounds, validated inference, contradiction
 handling), updated to the current braim build. The atomic 'Concept: description'
-label rule is NOT restated here — braim enforces it natively since commit
-028dc3c, and oracle block 01 covers it.
+label rule is NOT restated here — braim enforces it natively (commit
+edd8183), and oracle block 01 covers it.
 
 Validated by scenario_24 (bootstrap/completeness/fact gate, graph oracle),
 scenario_25 (compounds/inference, graph oracle), and scenario_26 (marker and
@@ -52,7 +57,7 @@ vocabulary discipline, reply-text oracle on results_26.txt).
 ## Why these are tested in the agent harness, not as `cargo test`
 
 The braim CLI mechanics (contradict, add-source, meta, invalidate) are
-deterministic and already exercised by scenarios 19-20. These three scenarios
+deterministic and already exercised by scenarios 19-20. Scenarios 21-26
 test the harder thing: whether an LLM *operating under the policy* produces a
 conformant graph. That requires a live agent, so they follow the same
 blind-scenario + operator-oracle model as the rest of the suite. The agent is
