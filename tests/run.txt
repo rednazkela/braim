@@ -16,9 +16,9 @@ ONE-TIME SETUP
 From the parent session, prepare a dedicated working directory:
 
   mkdir ~/braim-test-run
-  cp ~/braim-tests/corpus.txt ~/braim-test-run/
-  cp ~/braim-tests/corpus_appendix.txt ~/braim-test-run/   # required by 24-26
-  cp -r ~/braim-tests/policies ~/braim-test-run/   # required by scenarios 21-26
+  cp <repo>/tests/corpus.txt ~/braim-test-run/
+  cp <repo>/tests/corpus_appendix.txt ~/braim-test-run/   # required by 24-26
+  cp -r <repo>/tests/policies ~/braim-test-run/   # required by scenarios 21-26
   cd ~/braim-test-run
   braim --help > /dev/null    # initializes ./.braim/current.json
 

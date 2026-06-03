@@ -33,7 +33,7 @@ FOLDER STRUCTURE
 HOW TO USE
 
   1. Initialize a fresh braim graph in a new directory:
-       mkdir braim-run && cd braim-run && cp /home/naranja/braim-tests/corpus.txt .
+       mkdir braim-run && cd braim-run && cp <repo>/tests/corpus.txt .
        braim --help > /dev/null
        (braim auto-creates ./.braim/current.json on first command)
 
