@@ -24,7 +24,7 @@ FOLDER STRUCTURE
                           26 scored on the saved reply text)
   corpus_appendix.txt     second source document (digital services), the
                           ingestion target for scenarios 24-26
-  policies/               the agent-integration policies and traits validated
+  ../policies/            (repo root) the agent-integration policies and traits validated
                           by 21-26 (perturn_logging.json, compaction_rule.txt,
                           memory_braim_traits.md, README.md)
   oracle.txt              operator-side audit criteria (NOT shown to LLM)
