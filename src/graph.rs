@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use chrono::Utc;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
     Atomic,
@@ -701,6 +701,22 @@ impl Braim {
             }
         }
 
+        // Ensure atomics are indexed by short name (part before ': ') for query-by-name support.
+        // Idempotent: skips IDs already present under the short key.
+        let atomic_shorts: Vec<(String, u32)> = state.nodes.iter()
+            .filter(|(_, n)| n.node_type == NodeType::Atomic)
+            .filter_map(|(&id, n)| {
+                let short = Self::atomic_short_name_key(&n.label)?;
+                if short != n.label.to_lowercase() { Some((short, id)) } else { None }
+            })
+            .collect();
+        for (short, id) in atomic_shorts {
+            let entry = state.dictionary.entry(short).or_insert_with(Vec::new);
+            if !entry.contains(&id) {
+                entry.push(id);
+            }
+        }
+
         // Build the reverse-adjacency index once at load (see field doc).
         let dependents = Self::build_dependents(&state);
 
@@ -1119,6 +1135,29 @@ impl Braim {
             Self::validate_source_prefix(source)?;
         }
 
+        // For atomics, normalize "Concept:description" → "Concept: description" and validate.
+        let normalized;
+        let term = if depends_on.is_none() {
+            let colon = term.find(':').ok_or_else(|| format!(
+                "Error: Atomic concept label must use 'Concept: description' format \
+                 (e.g. 'Library: public lending institution'). Got: '{}'",
+                term
+            ))?;
+            let name = term[..colon].trim();
+            let desc = term[colon + 1..].trim();
+            if name.is_empty() || desc.is_empty() {
+                return Err(format!(
+                    "Error: Atomic concept label must use 'Concept: description' format \
+                     (e.g. 'Library: public lending institution'). Got: '{}'",
+                    term
+                ));
+            }
+            normalized = format!("{}: {}", name, desc);
+            normalized.as_str()
+        } else {
+            term
+        };
+
         let lower_term = term.to_lowercase();
         if let Some(existing_ids) = self.state.dictionary.get(&lower_term) {
             for &existing_id in existing_ids {
@@ -1176,11 +1215,26 @@ impl Braim {
         };
 
         self.state.nodes.insert(id, node);
-        self.state.dictionary.entry(lower_term).or_insert_with(Vec::new).push(id);
+        self.state.dictionary.entry(lower_term.clone()).or_insert_with(Vec::new).push(id);
+        if node_type == NodeType::Atomic {
+            if let Some(short) = Self::atomic_short_name_key(term) {
+                if short != lower_term {
+                    self.state.dictionary.entry(short).or_insert_with(Vec::new).push(id);
+                }
+            }
+        }
         self.state.id_to_domain.insert(id, domains[0].clone());
 
         self.flush()?;
         Ok(id)
+    }
+
+    /// For atomic labels like "Library: public lending institution",
+    /// returns "library" so concepts can be found by short name alone.
+    fn atomic_short_name_key(label: &str) -> Option<String> {
+        let pos = label.find(": ")?;
+        let name = label[..pos].trim();
+        if name.is_empty() { None } else { Some(name.to_lowercase()) }
     }
 
     fn count_content_words(text: &str) -> usize {
@@ -1984,6 +2038,15 @@ impl Braim {
         if let Some(ids) = self.state.dictionary.get_mut(&lower_label) {
             ids.retain(|&id| id != node_id);
         }
+        if node.node_type == NodeType::Atomic {
+            if let Some(short) = Self::atomic_short_name_key(&node.label) {
+                if short != lower_label {
+                    if let Some(ids) = self.state.dictionary.get_mut(&short) {
+                        ids.retain(|&id| id != node_id);
+                    }
+                }
+            }
+        }
 
         // Remove from id_to_domain
         self.state.id_to_domain.remove(&node_id);
@@ -2379,7 +2442,12 @@ impl Braim {
 
                 // Update dictionary
                 let lower_label = node.label.to_lowercase();
-                self.state.dictionary.entry(lower_label).or_insert_with(Vec::new).push(new_id);
+                self.state.dictionary.entry(lower_label.clone()).or_insert_with(Vec::new).push(new_id);
+                if let Some(short) = Self::atomic_short_name_key(&node.label) {
+                    if short != lower_label {
+                        self.state.dictionary.entry(short).or_insert_with(Vec::new).push(new_id);
+                    }
+                }
             }
         }
 
