@@ -1138,19 +1138,19 @@ impl Braim {
         // For atomics, normalize "Concept:description" → "Concept: description" and validate.
         let normalized;
         let term = if depends_on.is_none() {
-            let colon = term.find(':').ok_or_else(|| format!(
+            let colon = term.find(':').ok_or_else(|| GraphError::Other(format!(
                 "Error: Atomic concept label must use 'Concept: description' format \
                  (e.g. 'Library: public lending institution'). Got: '{}'",
                 term
-            ))?;
+            )))?;
             let name = term[..colon].trim();
             let desc = term[colon + 1..].trim();
             if name.is_empty() || desc.is_empty() {
-                return Err(format!(
+                return Err(GraphError::Other(format!(
                     "Error: Atomic concept label must use 'Concept: description' format \
                      (e.g. 'Library: public lending institution'). Got: '{}'",
                     term
-                ));
+                )));
             }
             normalized = format!("{}: {}", name, desc);
             normalized.as_str()

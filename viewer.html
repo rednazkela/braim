@@ -81,6 +81,10 @@
                     <input type="checkbox" id="includeInvalid" style="width: auto; margin-right: 6px;">
                     Show invalid statements
                 </label>
+                <label style="display: block; margin: 8px 0; font-size: 12px; color: #aaa;">
+                    <input type="checkbox" id="togglePhysics" style="width: auto; margin-right: 6px;">
+                    Physics &amp; animations (slow on large graphs)
+                </label>
                 <button onclick="resetView()">Reset View</button>
             </div>
             <div id="info">
@@ -391,7 +395,32 @@
             document.getElementById('info').innerHTML = errorHtml;
         }
 
+        const PHYSICS_AUTO_DISABLE_THRESHOLD = 300;
+
+        function setPhysics(enabled) {
+            if (!window.network) return;
+            window.network.setOptions({
+                physics: { enabled },
+                edges: { smooth: { enabled } }
+            });
+            if (enabled) {
+                window.network.startSimulation();
+            } else {
+                window.network.stopSimulation();
+            }
+        }
+
         function initNetwork() {
+            const nodeCount = allNodes.length;
+            const physicsOn = nodeCount < PHYSICS_AUTO_DISABLE_THRESHOLD;
+
+            const toggleEl = document.getElementById('togglePhysics');
+            toggleEl.checked = physicsOn;
+            if (!physicsOn) {
+                toggleEl.parentElement.style.color = '#e67e22';
+                toggleEl.parentElement.title = `Auto-disabled: ${nodeCount} nodes exceed the ${PHYSICS_AUTO_DISABLE_THRESHOLD}-node threshold`;
+            }
+
             const container = document.getElementById('network');
             const data = {
                 nodes: allNodes,
@@ -399,7 +428,7 @@
             };
             const options = {
                 physics: {
-                    enabled: true,
+                    enabled: physicsOn,
                     forceAtlas2Based: {
                         gravitationalConstant: -50,
                         centralGravity: 0.01,
@@ -409,7 +438,10 @@
                     maxVelocity: 50,
                     solver: 'forceAtlas2Based',
                     timestep: 0.35,
-                    stabilization: { iterations: 150 }
+                    stabilization: { iterations: physicsOn ? 150 : 0 }
+                },
+                edges: {
+                    smooth: { enabled: physicsOn }
                 },
                 interaction: {
                     navigationButtons: true,
@@ -551,8 +583,14 @@
             document.getElementById('filterSourceType').value = '';
             document.getElementById('includeInvalid').checked = false;
             applyFilters();
-            network.fit({ animation: true });
+            const physicsOn = document.getElementById('togglePhysics').checked;
+            network.fit({ animation: physicsOn });
         }
+
+        document.getElementById('togglePhysics').addEventListener('change', function() {
+            setPhysics(this.checked);
+            this.parentElement.style.color = this.checked ? '#aaa' : '#e67e22';
+        });
 
         document.getElementById('search').addEventListener('keyup', applyFilters);
         document.getElementById('filterDomain').addEventListener('change', applyFilters);
