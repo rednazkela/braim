@@ -15,9 +15,18 @@ FOLDER STRUCTURE
 
   README.txt              this file
   corpus.txt              the source document (one page of prose)
-  scenario_01.txt..14.txt fourteen scenario prompts handed to the test LLM
+  scenario_01.txt..26.txt twenty-six scenario prompts handed to the test LLM
                           (01-08 cover basic feature coverage; 09-14 cover
-                          usage violations observed in real-world graphs)
+                          usage violations observed in real-world graphs;
+                          15-20 cover cross-source verification primitives;
+                          21-23 cover the agent-integration policies;
+                          24-26 cover the memory evidence-discipline traits,
+                          26 scored on the saved reply text)
+  corpus_appendix.txt     second source document (digital services), the
+                          ingestion target for scenarios 24-26
+  policies/               the agent-integration policies and traits validated
+                          by 21-26 (perturn_logging.json, compaction_rule.txt,
+                          memory_braim_traits.md, README.md)
   oracle.txt              operator-side audit criteria (NOT shown to LLM)
   run.txt                 suggested run procedure
 

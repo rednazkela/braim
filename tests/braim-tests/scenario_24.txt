@@ -1,0 +1,21 @@
+SCENARIO 24
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+  - Second mandatory step: read policies/memory_braim_traits.md. You operate
+    under that discipline for this scenario.
+
+A new document has arrived: corpus_appendix.txt, describing the library's
+digital services. Ingest it into the graph: capture the concepts the appendix
+refers to and the factual claims that connect them, so the graph reflects the
+appendix as faithfully as it reflects the original corpus.
+
+The graph already contains a substantial set of entries from the original
+corpus. Treat that existing content the way the discipline tells you to.
+
+Reply with: the IDs of every node you created, the existing entries you
+reused instead of creating, and any concept you decided NOT to capture with
+a one-line reason.
