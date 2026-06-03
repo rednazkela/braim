@@ -1,0 +1,33 @@
+SCENARIO 23
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+  - Second mandatory step: read policies/compaction_rule.txt. For this
+    scenario you apply that rule to the session notes below and produce the
+    compacted memory it prescribes.
+
+Below is a block of raw session notes. It mixes three things: references to
+work that is already recorded in this graph, prose restating facts that are
+already in the graph, and one fact that was established this session but never
+written to braim. Resolve the graph references to real braim IDs yourself
+(use `braim query` / `braim lookup`), then produce the compacted memory.
+
+--- SESSION NOTES ---
+We worked through the library's funding question. The conclusion about whether
+membership alone sustains the library was recorded earlier, and it rests on the
+bond fact and the fee fact. We also looked at the dispute over when the
+Children's Section opened; that got resolved this session once a dated
+photograph was attached, and the losing entry was retired.
+
+For the record, the Reading Room and the Children's Section are on opposite
+sides of the building — the Reading Room is left of the entrance and the
+Children's Section is at the back. (This is in the corpus.)
+
+One thing not yet in the graph: during this session the operator confirmed,
+from the 1995 treasurer's ledger, that the fundraising drive's final total was
+forty-two thousand dollars and that it cleared into the operating account.
+--- END SESSION NOTES ---
+
+Produce the compacted memory exactly as the policy requires. Reply with that
+compacted memory and nothing that the policy says to drop.

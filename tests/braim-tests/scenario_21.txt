@@ -1,0 +1,26 @@
+SCENARIO 21
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+  - Second mandatory step: read policies/perturn_logging.json in the test
+    directory. While you work this scenario you operate under that policy:
+    every reasoning marker you produce must be persisted to braim live, as
+    the policy describes. Use the operator's working-directory .braim graph
+    (pass --data-dir if the policy or help text calls for it).
+
+Read corpus.txt. Focus only on how the library is funded and sustained: the
+1985 municipal bond, the non-resident annual fee, and the 1995 fundraising
+drive.
+
+Assess whether the library appears financially self-sustaining from
+membership alone. Work the question honestly: some parts are supported by the
+corpus, some are conclusions you draw by combining facts, and some cannot be
+answered from the corpus at all. As you reason, record each marker the moment
+you commit to it, per the policy you read.
+
+Reply with: every braim ID you created this turn, what kind of marker each one
+is, and which corpus facts or other IDs each one draws on. Do not invent
+figures that are not in corpus.txt.

@@ -1,0 +1,26 @@
+SCENARIO 25
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+  - Second mandatory step: read policies/memory_braim_traits.md. You operate
+    under that discipline for this scenario.
+
+Two tasks, building on the appendix entries from the previous session:
+
+1. The graph now has several entries about how members obtain content
+   remotely (the website, patron accounts, digital loans, holds, renewals).
+   Compose the higher-level capability these add up to — the library's
+   remote lending capability — as a node a future reader can pivot from.
+
+2. The appendix says digital loans need no physical return and the original
+   corpus says a Library Card requires an annual fee for non-residents.
+   Record what these two together imply about a non-resident's ability to
+   use the library without ever visiting Riverside.
+
+Afterwards, demonstrate that a reader who starts from one of the base entries
+(for example the digital-loan entry) can actually navigate the graph to reach
+your new capability node. Show the command and its output in your reply.
+
+Reply with: the new node IDs, their dependency structure with the weights you
+chose and why, and the navigation evidence.

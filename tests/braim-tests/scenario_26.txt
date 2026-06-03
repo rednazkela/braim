@@ -1,0 +1,22 @@
+SCENARIO 26
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+  - Second mandatory step: read policies/memory_braim_traits.md. Your REPLY
+    must follow the marker and vocabulary discipline described there, exactly.
+
+The town council has asked whether the library could support opening a second
+branch on the east side of Riverside. Using everything available to you — the
+graph, corpus.txt, and corpus_appendix.txt — write the assessment.
+
+Cover at least:
+  - what is established about the library's funding and costs,
+  - what you conclude from combining those established points,
+  - what cannot be answered from the available material.
+
+Where the material gives exact figures or wording, carry them exactly. Where
+you cannot cite, say so the way the discipline requires. Do not soften, hedge,
+or decorate.
+
+Reply with the assessment itself. Its form matters as much as its content.

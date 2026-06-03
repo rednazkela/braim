@@ -1,0 +1,20 @@
+PRECOMPACT BRAIM DISCIPLINE.
+
+When compacting this conversation, do NOT preserve statements, narrative, or prose that already lives in braim. Store braim node IDs and the relationships joining them, not the text.
+
+Format the retained reasoning as an edge list:
+  ID:N --<relationship>--> ID:M
+Examples:
+  ID:6500 depends_on ID:6403,ID:6404
+  ID:6500 contradicts ID:6498
+  ID:6499 resolved_by ID:6501
+
+Rules:
+- For any fact/inference/claim already in braim, keep ONLY its ID plus its edges. Drop the wording; it is reconstructable via `braim node <id>` / `braim query`.
+- Keep prose ONLY for things not in braim (open user intent, in-flight task state, decisions not yet logged).
+- Orphan facts surfaced this session but not yet in braim → add to braim FIRST, then retain only the new ID and its edges. Two separate fields:
+    * --sources: cite a PRIMARY type (transcript:, code:) so it lands as a fact; agent:claude_code alone is SECONDARY (0 PRIMARY) and stays an unproven claim.
+    * meta tag: `braim meta <id> --set scope=agent_scratch` ONLY for scratch markers (the per-turn-policy mechanism), NOT for facts meant to persist.
+- Preserve the relationship type on every edge (depends_on, contradicts, resolved_by, enables, invalidated_by). An ID with no stated edge is not worth keeping.
+
+Goal: the compacted memory is a braim subgraph reference (IDs + edges), not a re-narration of what braim already holds.

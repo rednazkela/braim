@@ -1,0 +1,33 @@
+SCENARIO 22
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+  - Second mandatory step: read policies/perturn_logging.json. You continue to
+    operate under that policy, including its lifecycle rules for what happens
+    to a marker when new evidence arrives.
+
+The graph already holds some open questions and tentative conclusions about
+the library's finances that an earlier pass recorded (look for the
+lower-trust entries; the policy tells you how those were tagged).
+
+New material has arrived this session:
+
+  1. The 1995 town treasurer's ledger (treasurer_ledger_1995.pdf) records the
+     fundraising drive's final total and confirms it was deposited to the
+     library operating account. Source type: a primary financial document.
+
+  2. A separate 2002 audit memo (audit_memo_2002.txt) states the non-resident
+     fee was suspended between 1996 and 2001, directly conflicting with any
+     existing entry that treats the non-resident fee as a continuous revenue
+     source since 1985.
+
+Incorporate both. Let each piece of evidence act on the existing entries the
+way the policy and braim's own rules dictate — do not pick winners by hand
+where the tool resolves it for you.
+
+Reply with: which existing entries each new item acted on, the braim command
+you used for each, and the final state (verification status or node_type) of
+every entry you touched.
