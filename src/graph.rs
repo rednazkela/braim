@@ -1405,7 +1405,11 @@ impl Braim {
                 .collect();
 
             if labels.len() == 2 {
-                let pair_name = format!("{} {}", labels[0], labels[1]);
+                // Use name parts (before ': ') so "Library: lends books" + "Card: id token"
+                // → "Library Card", matching the compound label rather than the full descriptions.
+                let name0 = Self::label_name_part(&labels[0]);
+                let name1 = Self::label_name_part(&labels[1]);
+                let pair_name = format!("{} {}", name0, name1);
                 let pair_found = self.find_compound_by_label(&pair_name);
 
                 match pair_found {
@@ -1417,6 +1421,7 @@ impl Braim {
                                 pair_name, compound_id
                             ));
                         }
+                        // Compound exists and is in --depends → silent pass.
                     }
                     None => {
                         concern.push_str(&format!("  • Adjacent concepts '{}' → suggest creating compound\n", pair_name));
@@ -1428,6 +1433,16 @@ impl Braim {
         }
 
         Ok(concern)
+    }
+
+    /// Returns the concept name: the part before ": " for colon-format atomics,
+    /// or the full label for compounds and legacy bare-noun atomics.
+    fn label_name_part(label: &str) -> &str {
+        if let Some(pos) = label.find(": ") {
+            label[..pos].trim()
+        } else {
+            label
+        }
     }
 
     fn find_compound_by_label(&self, label: &str) -> Option<u32> {

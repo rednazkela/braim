@@ -1180,6 +1180,18 @@ fn main() {
                     println!("  Label: {}", node.label);
                     println!("  Domains: {:?}", node.domains);
                     println!("  Sources: {:?}", node.sources);
+                    if !node.source_ids.is_empty() {
+                        println!("  Source entities:");
+                        for &src_id in &node.source_ids {
+                            if let Some(src) = braim.get_node(src_id) {
+                                let type_str = src.source_type.as_deref().unwrap_or("?");
+                                let loc_str = src.location.as_deref().unwrap_or("");
+                                println!("    ID:{}  {}  ({})  {}", src_id, src.label, type_str, loc_str);
+                            } else {
+                                println!("    ID:{}  (not found)", src_id);
+                            }
+                        }
+                    }
                     println!("  Status: {}", status_str);
                     println!("  Created: {}", node.created_at);
 
