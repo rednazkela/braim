@@ -1316,6 +1316,12 @@ impl Braim {
             return ids.clone();
         }
 
+        // Pure-digit strings are ID-shaped. Never substring-match them against label text —
+        // "2" would spuriously hit "opened in 2024". Use resolve_term for numeric args instead.
+        if lower_query.chars().all(|c| c.is_ascii_digit()) {
+            return vec![];
+        }
+
         let mut matches: Vec<(u32, f64)> = Vec::new();
 
         for (node_id, node) in &self.state.nodes {
@@ -1338,6 +1344,26 @@ impl Braim {
 
         matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         matches.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Resolve a term to node IDs for perspective/proximity.
+    /// Numeric arg → exact ID lookup; error if ID missing (no silent fuzzy fallback).
+    /// Text arg → find_concepts_fuzzy; error if no match.
+    fn resolve_term(&self, term: &str) -> Result<Vec<u32>, String> {
+        if let Ok(id) = term.parse::<u32>() {
+            if self.state.nodes.contains_key(&id) {
+                Ok(vec![id])
+            } else {
+                Err(format!("Error: Node ID {} not found", id))
+            }
+        } else {
+            let ids = self.find_concepts_fuzzy(term);
+            if ids.is_empty() {
+                Err(format!("Error: Unknown concept '{}'", term))
+            } else {
+                Ok(ids)
+            }
+        }
     }
 
     fn validate_statement_concepts(&self, text: &str, depends_on: &HashMap<u32, f64>) -> Result<(), String> {
@@ -1857,14 +1883,14 @@ impl Braim {
     }
 
     pub fn proximity(&mut self, term_a: &str, term_b: &str) -> Result<Vec<PathInfo>, String> {
-        let ids_a = self.find_concepts_fuzzy(term_a);
-        if ids_a.is_empty() {
-            return Err(format!("Error: Unknown concept '{}'", term_a));
-        }
+        let ids_a = self.resolve_term(term_a)?;
+        let ids_b = self.resolve_term(term_b)?;
 
-        let ids_b = self.find_concepts_fuzzy(term_b);
-        if ids_b.is_empty() {
-            return Err(format!("Error: Unknown concept '{}'", term_b));
+        if let Some(&shared) = ids_a.iter().find(|id| ids_b.contains(id)) {
+            return Err(format!(
+                "Error: '{}' and '{}' both resolve to ID:{} — no path to compute",
+                term_a, term_b, shared
+            ));
         }
 
         let (paths, gap) = self.find_paths(&ids_a, &ids_b);
@@ -1885,14 +1911,14 @@ impl Braim {
     }
 
     pub fn perspective(&mut self, term_a: &str, term_b: &str) -> Result<HashMap<String, f64>, String> {
-        let ids_a = self.find_concepts_fuzzy(term_a);
-        if ids_a.is_empty() {
-            return Err(format!("Error: Unknown concept '{}'", term_a));
-        }
+        let ids_a = self.resolve_term(term_a)?;
+        let ids_b = self.resolve_term(term_b)?;
 
-        let ids_b = self.find_concepts_fuzzy(term_b);
-        if ids_b.is_empty() {
-            return Err(format!("Error: Unknown concept '{}'", term_b));
+        if let Some(&shared) = ids_a.iter().find(|id| ids_b.contains(id)) {
+            return Err(format!(
+                "Error: '{}' and '{}' both resolve to ID:{} — no path to compute",
+                term_a, term_b, shared
+            ));
         }
 
         let (paths, gap) = self.find_paths(&ids_a, &ids_b);
