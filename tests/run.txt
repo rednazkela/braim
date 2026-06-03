@@ -16,11 +16,13 @@ ONE-TIME SETUP
 From the parent session, prepare a dedicated working directory:
 
   mkdir ~/braim-test-run
-  cp ~/braim-tests/corpus.txt ~/braim-test-run/
+  cp <repo>/tests/corpus.txt ~/braim-test-run/
+  cp <repo>/tests/corpus_appendix.txt ~/braim-test-run/   # required by 24-26
+  cp -r <repo>/tests/policies ~/braim-test-run/   # required by scenarios 21-26
   cd ~/braim-test-run
   braim --help > /dev/null    # initializes ./.braim/current.json
 
-Record the working directory path. All 8 sub-agents will use it.
+Record the working directory path. All sub-agents will use it.
 
 ═══════════════════════════════════════════════════════════════
 PER-SCENARIO AGENT INVOCATION
@@ -44,14 +46,38 @@ Subagent type:    general-purpose
 Model:            sonnet (use opus only if scenario 06, 07, 13, or 14 stalls)
 Isolation:        none (agents share the working directory)
 Run order:        01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08
-                  -> 09 -> 10 -> 11 -> 12 -> 13 -> 14
-                  (09-14 build on the cumulative graph from 01-08)
+                  -> 09 -> 10 -> 11 -> 12 -> 13 -> 14 -> 15 -> 16
+                  -> 17 -> 18 -> 19 -> 20 -> 21 -> 22 -> 23
+                  -> 24 -> 25 -> 26
+                  (09-20 build on the cumulative graph from 01-08;
+                   21-23 validate the agent-integration policies;
+                   24-26 validate the evidence-discipline traits; 25 builds
+                   on 24's appendix nodes — keep the order)
 
 Do NOT pass:
   - the contents of oracle.txt
   - the contents of other scenario files
   - any hint about which braim feature is under test
   - any reference to a parent test framework, post-mortem, or audit harness
+
+POLICY SCENARIOS (21-23) — DIFFERENCE FROM 01-20
+  Scenarios 01-20 keep the agent blind to the feature under test. Scenarios
+  21-23 test agent-integration POLICIES, so the agent IS given its operating
+  policy — it reads policies/perturn_logging.json (21, 22) or
+  policies/compaction_rule.txt (23) as instructed in the scenario. The agent
+  is still blind to oracle.txt and to the PASS thresholds. In deployment these
+  policies arrive via Claude Code UserPromptSubmit / PreCompact hooks; in the
+  harness they are handed to the sub-agent via the policy file so a single
+  sub-agent (which does not inherit the parent session's hooks) can be tested.
+  Scenario 22 depends on the scratch markers scenario 21 leaves; run 21 -> 22
+  -> 23 in order without resetting the graph.
+
+TRAIT SCENARIOS (24-26)
+  Same model as 21-23: the agent reads policies/memory_braim_traits.md as its
+  operating contract; the oracle stays hidden. 24 and 25 are scored against
+  the graph. 26 is scored against the agent's REPLY — save it verbatim to
+  ~/braim-test-run/results_26.txt before applying the oracle block (the
+  banned-vocabulary scan and marker audit run on that file).
 
 ═══════════════════════════════════════════════════════════════
 BETWEEN AGENTS
