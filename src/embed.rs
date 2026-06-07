@@ -19,6 +19,13 @@ use std::collections::HashMap;
 pub const EMBED_MODEL_ID: &str = "AllMiniLML6V2";
 pub const EMBED_SIDECAR: &str = "embeddings.json";
 
+/// Cosine at/above which a candidate label is flagged as a possible duplicate at
+/// write time. Deliberately ADVISORY, not a hard block: validation on real graphs
+/// (braim ID:6628/6629) showed genuinely distinct concepts can score ~0.88
+/// (Word Overlap Bias vs Reverse Word Overlap Bias), so blocking would
+/// false-positive. The check warns; the human/agent decides.
+pub const DEDUP_WARN_THRESHOLD: f32 = 0.80;
+
 /// One stored vector plus the hash of the cleaned label it was computed from.
 /// label_hash drives lazy staleness: if a node's cleaned label changes, its
 /// entry is recomputed on the next `similar` run; everything else is cached.

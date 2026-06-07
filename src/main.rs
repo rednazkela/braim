@@ -297,6 +297,8 @@ enum ConceptCommands {
         depends: Option<String>,
         #[arg(long, help = "Reject concepts with duplicate sources or PRIMARY+TERTIARY mix")]
         strict_sources: bool,
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        check_dupes: bool,
     },
     #[command(about = "Delete a concept (requires --force unless unused)", long_about = "Concept Delete: Remove a concept from the graph.\n\nUsage:\n  braim concept delete 42         # Fails if concept is referenced\n  braim concept delete 42 --force # Force delete (dangerous, breaks statements)\n\nSafety: Deleting a concept breaks any statements/compounds that depend on it.\nUse --force only if you're certain no statements reference this ID.")]
     Delete {
@@ -341,6 +343,8 @@ enum StatementCommands {
         strict_sources: bool,
         #[arg(long, help = "Reject statements with duplicate domains")]
         strict_domains: bool,
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        check_dupes: bool,
     },
     #[command(about = "Add verification evidence for a statement", long_about = "Statement Verify: Record evidence that supports a statement.\n\n⚠ NOTE: Verification status is now AUTO-CALCULATED from typed sources at statement creation.\nThis command is maintained for backward compatibility but is rarely needed.\n\nModern approach (preferred):\n  braim statement add \"...\" --sources \"code:a.rs,doc:b.md\" ...\n  → Status auto-calculated to PROVEN (2 PRIMARY sources)\n\nLegacy approach (still supported):\n  braim statement verify 42 wikipedia --note \"https://en.wikipedia.org/wiki/Payment\"\n  braim statement verify 42 rfc --note \"RFC 3501 section 3.2\"\n\nOld Verification Levels (deprecated, kept for audit trail):\n  • 0-1 verified_by domains: Unproven\n  • 2 verified_by domains: Partial\n  • 3+ verified_by domains: Proven\n\nUse statement add with typed sources instead. Sources determine verification automatically.")]
     Verify {
@@ -514,7 +518,11 @@ fn main() {
             sources,
             depends,
             strict_sources,
+            check_dupes,
         }) => {
+            if check_dupes {
+                dedup_warn(&braim, &cli.data_dir, &term, cli.quiet);
+            }
             let domains_list = parse_list(&domains);
             let sources_list = parse_list(&sources);
 
@@ -711,7 +719,11 @@ fn main() {
             assume,
             strict_sources,
             strict_domains,
+            check_dupes,
         }) => {
+            if check_dupes {
+                dedup_warn(&braim, &cli.data_dir, &text, cli.quiet);
+            }
             // Validation: inferred flag is mutually exclusive with explicit sources
             if inferred && sources.is_some() {
                 eprintln!("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.");
@@ -1676,6 +1688,69 @@ fn run_similar(
     Err("`braim similar` requires the embeddings feature.\n\
          Rebuild with:  cargo build --release --features embeddings"
         .to_string())
+}
+
+/// Advisory pre-add dedup check (phase 2). Embeds the candidate label and warns
+/// — non-blocking — if any existing node is at/above DEDUP_WARN_THRESHOLD. Builds
+/// or refreshes the sidecar index on demand. Never blocks: embeddings are
+/// probabilistic and near-synonymous-but-distinct concepts can score high.
+#[cfg(feature = "embeddings")]
+fn dedup_warn(braim: &Braim, data_dir: &str, candidate: &str, quiet: bool) {
+    use embed::{
+        corpus, refresh_index, top_k, EmbedIndex, Embedder, FastEmbedder, DEDUP_WARN_THRESHOLD,
+    };
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return;
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = match FastEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            if !quiet {
+                eprintln!("(dedup check skipped: {e})");
+            }
+            return;
+        }
+    };
+    match refresh_index(&mut embedder, &mut index, &rows, false) {
+        Ok(n) if n > 0 => {
+            let _ = index.save(data_path);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            if !quiet {
+                eprintln!("(dedup check skipped: {e})");
+            }
+            return;
+        }
+    }
+    let qv = match embedder.embed(&[candidate.to_string()]) {
+        Ok(mut v) => v.drain(..).next(),
+        Err(_) => None,
+    };
+    let qv = match qv {
+        Some(v) => v,
+        None => return,
+    };
+    let hits = top_k(&qv, &index, &rows, 3, DEDUP_WARN_THRESHOLD, None);
+    if hits.is_empty() {
+        return;
+    }
+    eprintln!("⚠ possible duplicate(s) — lookup-first before adding:");
+    for h in hits {
+        let label: String = h.label.chars().take(90).collect();
+        eprintln!("    ID:{} {:.3} [{}] {}", h.id, h.score, h.node_type, label);
+    }
+    eprintln!("  (advisory only; the add proceeds. Reuse an existing node if it is the same concept.)");
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn dedup_warn(_braim: &Braim, _data_dir: &str, _candidate: &str, quiet: bool) {
+    if !quiet {
+        eprintln!("(--check-dupes requires the embeddings feature; rebuild with --features embeddings)");
+    }
 }
 
 fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
