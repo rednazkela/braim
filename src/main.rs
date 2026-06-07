@@ -213,6 +213,8 @@ enum Commands {
         include_invalid: bool,
         #[arg(long, help = "Include contested statements (hidden by default)")]
         include_contested: bool,
+        #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (requires --features embeddings)")]
+        semantic: bool,
     },
     #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.")]
     Proximity {
@@ -1028,7 +1030,7 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Query { terms, include_claims, only_claims, min_trust, primary_only, include_invalid, include_contested } => {
+        Commands::Query { terms, include_claims, only_claims, min_trust, primary_only, include_invalid, include_contested, semantic } => {
             let term_list: Vec<&str> = terms.split(',').map(|s| s.trim()).collect();
             match braim.query(&term_list) {
                 Ok(results) => {
@@ -1069,7 +1071,8 @@ fn main() {
 
                     filtered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-                    if filtered.is_empty() {
+                    let was_empty = filtered.is_empty();
+                    if was_empty {
                         tips::emit_tip_query_no_results(include_claims, cli.quiet);
                     }
 
@@ -1087,6 +1090,9 @@ fn main() {
                             "  {} {} ID:{}  domains: {:?}  {}  score={:.4}{}",
                             badge, symbol, node_id, node.domains, node.label, score, exact_marker
                         );
+                    }
+                    if was_empty && semantic {
+                        query_semantic_fallback(&braim, &cli.data_dir, &terms, cli.quiet);
                     }
                     Ok(())
                 }
@@ -1750,6 +1756,60 @@ fn dedup_warn(braim: &Braim, data_dir: &str, candidate: &str, quiet: bool) {
 fn dedup_warn(_braim: &Braim, _data_dir: &str, _candidate: &str, quiet: bool) {
     if !quiet {
         eprintln!("(--check-dupes requires the embeddings feature; rebuild with --features embeddings)");
+    }
+}
+
+/// `query --semantic` fallback (phase 3): when concept-graph traversal returns
+/// nothing, search by meaning instead. Embeds the raw query terms and prints
+/// embedding top-k above a noise floor. Reuses the sidecar index.
+#[cfg(feature = "embeddings")]
+fn query_semantic_fallback(braim: &Braim, data_dir: &str, terms: &str, quiet: bool) {
+    use embed::{corpus, refresh_index, top_k, EmbedIndex, Embedder, FastEmbedder};
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return;
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = match FastEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            if !quiet {
+                eprintln!("(semantic fallback skipped: {e})");
+            }
+            return;
+        }
+    };
+    if let Ok(n) = refresh_index(&mut embedder, &mut index, &rows, false) {
+        if n > 0 {
+            let _ = index.save(data_path);
+        }
+    }
+    let qv = match embedder.embed(&[terms.to_string()]) {
+        Ok(mut v) => v.drain(..).next(),
+        Err(_) => None,
+    };
+    let qv = match qv {
+        Some(v) => v,
+        None => return,
+    };
+    // 0.30 noise floor: real matches on clean corpora land 0.4-0.7; below ~0.35
+    // is drift. Better to show "nothing relevant" than a wall of noise.
+    let hits = top_k(&qv, &index, &rows, 8, 0.30, None);
+    if hits.is_empty() {
+        return;
+    }
+    println!("\nNo concept-graph match — semantic fallback (by meaning):");
+    for h in hits {
+        let label: String = h.label.chars().take(96).collect();
+        println!("  ID:{:<5} {:.3} [{}] {}", h.id, h.score, h.node_type, label);
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn query_semantic_fallback(_braim: &Braim, _data_dir: &str, _terms: &str, quiet: bool) {
+    if !quiet {
+        eprintln!("(--semantic requires the embeddings feature; rebuild with --features embeddings)");
     }
 }
 
