@@ -1,5 +1,6 @@
 mod graph;
 mod tips;
+mod embed;
 
 use clap::{Parser, Subcommand};
 use graph::{Braim, NodeType, AddSourceResult};
@@ -212,6 +213,8 @@ enum Commands {
         include_invalid: bool,
         #[arg(long, help = "Include contested statements (hidden by default)")]
         include_contested: bool,
+        #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (requires --features embeddings)")]
+        semantic: bool,
     },
     #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.")]
     Proximity {
@@ -261,6 +264,18 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
+    #[command(about = "Semantic similarity search over node labels (requires --features embeddings)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
+    Similar {
+        text: String,
+        #[arg(long, default_value = "8", help = "Number of results to return")]
+        top: usize,
+        #[arg(long, default_value = "0.0", help = "Minimum cosine score to include")]
+        min_score: f32,
+        #[arg(long, help = "Force a full re-embed of every node")]
+        rebuild: bool,
+        #[arg(long, help = "Dedup intent: raise the default score floor to 0.8 and flag likely duplicates")]
+        dedup: bool,
+    },
     #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
     Meta {
         id: u32,
@@ -284,6 +299,8 @@ enum ConceptCommands {
         depends: Option<String>,
         #[arg(long, help = "Reject concepts with duplicate sources or PRIMARY+TERTIARY mix")]
         strict_sources: bool,
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        check_dupes: bool,
     },
     #[command(about = "Delete a concept (requires --force unless unused)", long_about = "Concept Delete: Remove a concept from the graph.\n\nUsage:\n  braim concept delete 42         # Fails if concept is referenced\n  braim concept delete 42 --force # Force delete (dangerous, breaks statements)\n\nSafety: Deleting a concept breaks any statements/compounds that depend on it.\nUse --force only if you're certain no statements reference this ID.")]
     Delete {
@@ -328,6 +345,8 @@ enum StatementCommands {
         strict_sources: bool,
         #[arg(long, help = "Reject statements with duplicate domains")]
         strict_domains: bool,
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        check_dupes: bool,
     },
     #[command(about = "Add verification evidence for a statement", long_about = "Statement Verify: Record evidence that supports a statement.\n\n⚠ NOTE: Verification status is now AUTO-CALCULATED from typed sources at statement creation.\nThis command is maintained for backward compatibility but is rarely needed.\n\nModern approach (preferred):\n  braim statement add \"...\" --sources \"code:a.rs,doc:b.md\" ...\n  → Status auto-calculated to PROVEN (2 PRIMARY sources)\n\nLegacy approach (still supported):\n  braim statement verify 42 wikipedia --note \"https://en.wikipedia.org/wiki/Payment\"\n  braim statement verify 42 rfc --note \"RFC 3501 section 3.2\"\n\nOld Verification Levels (deprecated, kept for audit trail):\n  • 0-1 verified_by domains: Unproven\n  • 2 verified_by domains: Partial\n  • 3+ verified_by domains: Proven\n\nUse statement add with typed sources instead. Sources determine verification automatically.")]
     Verify {
@@ -501,7 +520,11 @@ fn main() {
             sources,
             depends,
             strict_sources,
+            check_dupes,
         }) => {
+            if check_dupes {
+                dedup_warn(&braim, &cli.data_dir, &term, cli.quiet);
+            }
             let domains_list = parse_list(&domains);
             let sources_list = parse_list(&sources);
 
@@ -698,7 +721,11 @@ fn main() {
             assume,
             strict_sources,
             strict_domains,
+            check_dupes,
         }) => {
+            if check_dupes {
+                dedup_warn(&braim, &cli.data_dir, &text, cli.quiet);
+            }
             // Validation: inferred flag is mutually exclusive with explicit sources
             if inferred && sources.is_some() {
                 eprintln!("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.");
@@ -1003,7 +1030,7 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Query { terms, include_claims, only_claims, min_trust, primary_only, include_invalid, include_contested } => {
+        Commands::Query { terms, include_claims, only_claims, min_trust, primary_only, include_invalid, include_contested, semantic } => {
             let term_list: Vec<&str> = terms.split(',').map(|s| s.trim()).collect();
             match braim.query(&term_list) {
                 Ok(results) => {
@@ -1044,7 +1071,8 @@ fn main() {
 
                     filtered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-                    if filtered.is_empty() {
+                    let was_empty = filtered.is_empty();
+                    if was_empty {
                         tips::emit_tip_query_no_results(include_claims, cli.quiet);
                     }
 
@@ -1062,6 +1090,9 @@ fn main() {
                             "  {} {} ID:{}  domains: {:?}  {}  score={:.4}{}",
                             badge, symbol, node_id, node.domains, node.label, score, exact_marker
                         );
+                    }
+                    if was_empty && semantic {
+                        query_semantic_fallback(&braim, &cli.data_dir, &terms, cli.quiet);
                     }
                     Ok(())
                 }
@@ -1586,11 +1617,199 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Similar { text, top, min_score, rebuild, dedup } => {
+            run_similar(&braim, &cli.data_dir, &text, top, min_score, rebuild, dedup)
+        }
     };
 
     if let Err(e) = result {
         eprintln!("{}", e);
         std::process::exit(1);
+    }
+}
+
+/// `braim similar` — embedding nearest-neighbour search over node labels.
+/// Builds/refreshes the sidecar index, embeds the query, prints cosine top-k.
+#[cfg(feature = "embeddings")]
+fn run_similar(
+    braim: &Braim,
+    data_dir: &str,
+    text: &str,
+    top: usize,
+    min_score: f32,
+    rebuild: bool,
+    dedup: bool,
+) -> Result<(), String> {
+    use embed::{corpus, refresh_index, top_k, Embedder, EmbedIndex, FastEmbedder, EMBED_SIDECAR};
+
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return Err("graph has no labelled nodes to search".to_string());
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = FastEmbedder::new()?;
+
+    let embedded = refresh_index(&mut embedder, &mut index, &rows, rebuild)?;
+    if embedded > 0 {
+        index.save(data_path)?;
+        eprintln!(
+            "(refreshed index: embedded {} node(s) -> {}/{})",
+            embedded, data_dir, EMBED_SIDECAR
+        );
+    }
+
+    let floor = if dedup { min_score.max(0.8) } else { min_score };
+    let qv = embedder.embed(&[text.to_string()])?;
+    let qv = qv.into_iter().next().ok_or("embedder returned no query vector")?;
+    let hits = top_k(&qv, &index, &rows, top, floor, None);
+
+    if hits.is_empty() {
+        println!("No nodes above score {:.2}.", floor);
+        return Ok(());
+    }
+    println!(
+        "{} for: {:?}",
+        if dedup { "Possible duplicates" } else { "Semantic matches" },
+        text
+    );
+    for h in hits {
+        let dup = if h.score >= 0.8 { "  ⚠ likely duplicate" } else { "" };
+        let label: String = h.label.chars().take(96).collect();
+        println!("  ID:{:<5} {:.3} [{}] {}{}", h.id, h.score, h.node_type, label, dup);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn run_similar(
+    _braim: &Braim,
+    _data_dir: &str,
+    _text: &str,
+    _top: usize,
+    _min_score: f32,
+    _rebuild: bool,
+    _dedup: bool,
+) -> Result<(), String> {
+    Err("`braim similar` requires the embeddings feature.\n\
+         Rebuild with:  cargo build --release --features embeddings"
+        .to_string())
+}
+
+/// Advisory pre-add dedup check (phase 2). Embeds the candidate label and warns
+/// — non-blocking — if any existing node is at/above DEDUP_WARN_THRESHOLD. Builds
+/// or refreshes the sidecar index on demand. Never blocks: embeddings are
+/// probabilistic and near-synonymous-but-distinct concepts can score high.
+#[cfg(feature = "embeddings")]
+fn dedup_warn(braim: &Braim, data_dir: &str, candidate: &str, quiet: bool) {
+    use embed::{
+        corpus, refresh_index, top_k, EmbedIndex, Embedder, FastEmbedder, DEDUP_WARN_THRESHOLD,
+    };
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return;
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = match FastEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            if !quiet {
+                eprintln!("(dedup check skipped: {e})");
+            }
+            return;
+        }
+    };
+    match refresh_index(&mut embedder, &mut index, &rows, false) {
+        Ok(n) if n > 0 => {
+            let _ = index.save(data_path);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            if !quiet {
+                eprintln!("(dedup check skipped: {e})");
+            }
+            return;
+        }
+    }
+    let qv = match embedder.embed(&[candidate.to_string()]) {
+        Ok(mut v) => v.drain(..).next(),
+        Err(_) => None,
+    };
+    let qv = match qv {
+        Some(v) => v,
+        None => return,
+    };
+    let hits = top_k(&qv, &index, &rows, 3, DEDUP_WARN_THRESHOLD, None);
+    if hits.is_empty() {
+        return;
+    }
+    eprintln!("⚠ possible duplicate(s) — lookup-first before adding:");
+    for h in hits {
+        let label: String = h.label.chars().take(90).collect();
+        eprintln!("    ID:{} {:.3} [{}] {}", h.id, h.score, h.node_type, label);
+    }
+    eprintln!("  (advisory only; the add proceeds. Reuse an existing node if it is the same concept.)");
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn dedup_warn(_braim: &Braim, _data_dir: &str, _candidate: &str, quiet: bool) {
+    if !quiet {
+        eprintln!("(--check-dupes requires the embeddings feature; rebuild with --features embeddings)");
+    }
+}
+
+/// `query --semantic` fallback (phase 3): when concept-graph traversal returns
+/// nothing, search by meaning instead. Embeds the raw query terms and prints
+/// embedding top-k above a noise floor. Reuses the sidecar index.
+#[cfg(feature = "embeddings")]
+fn query_semantic_fallback(braim: &Braim, data_dir: &str, terms: &str, quiet: bool) {
+    use embed::{corpus, refresh_index, top_k, EmbedIndex, Embedder, FastEmbedder};
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return;
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = match FastEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            if !quiet {
+                eprintln!("(semantic fallback skipped: {e})");
+            }
+            return;
+        }
+    };
+    if let Ok(n) = refresh_index(&mut embedder, &mut index, &rows, false) {
+        if n > 0 {
+            let _ = index.save(data_path);
+        }
+    }
+    let qv = match embedder.embed(&[terms.to_string()]) {
+        Ok(mut v) => v.drain(..).next(),
+        Err(_) => None,
+    };
+    let qv = match qv {
+        Some(v) => v,
+        None => return,
+    };
+    // 0.30 noise floor: real matches on clean corpora land 0.4-0.7; below ~0.35
+    // is drift. Better to show "nothing relevant" than a wall of noise.
+    let hits = top_k(&qv, &index, &rows, 8, 0.30, None);
+    if hits.is_empty() {
+        return;
+    }
+    println!("\nNo concept-graph match — semantic fallback (by meaning):");
+    for h in hits {
+        let label: String = h.label.chars().take(96).collect();
+        println!("  ID:{:<5} {:.3} [{}] {}", h.id, h.score, h.node_type, label);
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn query_semantic_fallback(_braim: &Braim, _data_dir: &str, _terms: &str, quiet: bool) {
+    if !quiet {
+        eprintln!("(--semantic requires the embeddings feature; rebuild with --features embeddings)");
     }
 }
 
