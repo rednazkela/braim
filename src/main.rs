@@ -1,5 +1,6 @@
 mod graph;
 mod tips;
+mod embed;
 
 use clap::{Parser, Subcommand};
 use graph::{Braim, NodeType, AddSourceResult};
@@ -261,6 +262,18 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
+    #[command(about = "Semantic similarity search over node labels (requires --features embeddings)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
+    Similar {
+        text: String,
+        #[arg(long, default_value = "8", help = "Number of results to return")]
+        top: usize,
+        #[arg(long, default_value = "0.0", help = "Minimum cosine score to include")]
+        min_score: f32,
+        #[arg(long, help = "Force a full re-embed of every node")]
+        rebuild: bool,
+        #[arg(long, help = "Dedup intent: raise the default score floor to 0.8 and flag likely duplicates")]
+        dedup: bool,
+    },
     #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
     Meta {
         id: u32,
@@ -1586,12 +1599,83 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Similar { text, top, min_score, rebuild, dedup } => {
+            run_similar(&braim, &cli.data_dir, &text, top, min_score, rebuild, dedup)
+        }
     };
 
     if let Err(e) = result {
         eprintln!("{}", e);
         std::process::exit(1);
     }
+}
+
+/// `braim similar` — embedding nearest-neighbour search over node labels.
+/// Builds/refreshes the sidecar index, embeds the query, prints cosine top-k.
+#[cfg(feature = "embeddings")]
+fn run_similar(
+    braim: &Braim,
+    data_dir: &str,
+    text: &str,
+    top: usize,
+    min_score: f32,
+    rebuild: bool,
+    dedup: bool,
+) -> Result<(), String> {
+    use embed::{corpus, refresh_index, top_k, Embedder, EmbedIndex, FastEmbedder, EMBED_SIDECAR};
+
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return Err("graph has no labelled nodes to search".to_string());
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = FastEmbedder::new()?;
+
+    let embedded = refresh_index(&mut embedder, &mut index, &rows, rebuild)?;
+    if embedded > 0 {
+        index.save(data_path)?;
+        eprintln!(
+            "(refreshed index: embedded {} node(s) -> {}/{})",
+            embedded, data_dir, EMBED_SIDECAR
+        );
+    }
+
+    let floor = if dedup { min_score.max(0.8) } else { min_score };
+    let qv = embedder.embed(&[text.to_string()])?;
+    let qv = qv.into_iter().next().ok_or("embedder returned no query vector")?;
+    let hits = top_k(&qv, &index, &rows, top, floor, None);
+
+    if hits.is_empty() {
+        println!("No nodes above score {:.2}.", floor);
+        return Ok(());
+    }
+    println!(
+        "{} for: {:?}",
+        if dedup { "Possible duplicates" } else { "Semantic matches" },
+        text
+    );
+    for h in hits {
+        let dup = if h.score >= 0.8 { "  ⚠ likely duplicate" } else { "" };
+        let label: String = h.label.chars().take(96).collect();
+        println!("  ID:{:<5} {:.3} [{}] {}{}", h.id, h.score, h.node_type, label, dup);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn run_similar(
+    _braim: &Braim,
+    _data_dir: &str,
+    _text: &str,
+    _top: usize,
+    _min_score: f32,
+    _rebuild: bool,
+    _dedup: bool,
+) -> Result<(), String> {
+    Err("`braim similar` requires the embeddings feature.\n\
+         Rebuild with:  cargo build --release --features embeddings"
+        .to_string())
 }
 
 fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
