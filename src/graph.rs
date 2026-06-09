@@ -128,17 +128,6 @@ impl VerificationStatus {
         }
     }
 
-    pub fn description(&self) -> &'static str {
-        match self {
-            VerificationStatus::ProvenStrong => "proven_strong (3+ PRIMARY sources)",
-            VerificationStatus::Proven => "proven (2+ PRIMARY sources)",
-            VerificationStatus::Partial => "partial (1 PRIMARY source)",
-            VerificationStatus::Contested => "contested (unresolved contradiction)",
-            VerificationStatus::Unproven => "unproven (0 PRIMARY sources)",
-            VerificationStatus::Invalid => "invalid (contradicted/superseded)",
-        }
-    }
-
     /// Canonical rank for inheritance capping per
     /// BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.1.
     pub fn rank(&self) -> u8 {
@@ -358,7 +347,6 @@ pub struct VerifySuggestion {
 #[derive(Clone, Debug)]
 pub struct DuplicateRecord {
     pub source_id: u32,
-    pub source_label: String,
     pub target_id: u32,
     pub target_label: String,
     pub reason: String,
@@ -366,7 +354,6 @@ pub struct DuplicateRecord {
 
 #[derive(Clone, Debug)]
 pub struct AddSourceResult {
-    pub source_id: u32,
     pub auto_resolved: bool,
     pub winner_id: Option<u32>,
     pub loser_id: Option<u32>,
@@ -374,7 +361,6 @@ pub struct AddSourceResult {
 }
 
 pub struct ImportManifest {
-    pub source_path: String,
     pub imported_count: usize,
     pub deduplicated_count: usize,
     pub skipped_count: usize,
@@ -960,7 +946,6 @@ impl Braim {
                     }
                     self.flush()?;
                     return Ok(AddSourceResult {
-                        source_id,
                         auto_resolved: true,
                         winner_id: Some(statement_id),
                         loser_id: Some(other_id),
@@ -984,7 +969,6 @@ impl Braim {
 
         self.flush()?;
         Ok(AddSourceResult {
-            source_id,
             auto_resolved: false,
             winner_id: None,
             loser_id: None,
@@ -1235,29 +1219,6 @@ impl Braim {
         let pos = label.find(": ")?;
         let name = label[..pos].trim();
         if name.is_empty() { None } else { Some(name.to_lowercase()) }
-    }
-
-    fn count_content_words(text: &str) -> usize {
-        let stopwords = [
-            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-            "to", "in", "on", "at", "by", "of", "and", "or", "but", "for", "with"
-        ];
-        text.to_lowercase()
-            .split_whitespace()
-            .filter(|word| {
-                word.len() >= 3 && !stopwords.contains(&word)
-            })
-            .count()
-    }
-
-    fn has_compound_dependency(&self, depends_on: &HashMap<u32, f64>) -> bool {
-        depends_on.keys().any(|&id| {
-            if let Some(node) = self.state.nodes.get(&id) {
-                node.node_type == NodeType::Compound
-            } else {
-                false
-            }
-        })
     }
 
     pub fn get_node(&self, id: u32) -> Option<&Node> {
@@ -2457,7 +2418,6 @@ impl Braim {
                     id_mappings.insert(node.id, *target_id);
                     duplicates.push(DuplicateRecord {
                         source_id: node.id,
-                        source_label: node.label.clone(),
                         target_id: *target_id,
                         target_label: target_node.label.clone(),
                         reason: "same name and domain".to_string(),
@@ -2531,7 +2491,6 @@ impl Braim {
                     id_mappings.insert(node.id, *target_id);
                     duplicates.push(DuplicateRecord {
                         source_id: node.id,
-                        source_label: node.label.clone(),
                         target_id: *target_id,
                         target_label: target_node.label.clone(),
                         reason: "same name and domain".to_string(),
@@ -2622,7 +2581,6 @@ impl Braim {
                         id_mappings.insert(node.id, *target_id);
                         duplicates.push(DuplicateRecord {
                             source_id: node.id,
-                            source_label: node.label.clone(),
                             target_id: *target_id,
                             target_label: target_node.label.clone(),
                             reason: "same text and dependencies".to_string(),
@@ -2663,7 +2621,6 @@ impl Braim {
         self.flush()?;
 
         Ok(ImportManifest {
-            source_path: source_path.to_string(),
             imported_count,
             deduplicated_count,
             skipped_count,

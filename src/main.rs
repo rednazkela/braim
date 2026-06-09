@@ -595,8 +595,7 @@ fn main() {
                         if decomposable.len() >= 2 {
                             let dep_spec = decomposable
                                 .iter()
-                                .enumerate()
-                                .map(|(idx, (id, _))| {
+                                .map(|(id, _)| {
                                     let weight = 1.0 / decomposable.len() as f64;
                                     format!("{}:{:.1}", id, weight)
                                 })
@@ -612,13 +611,10 @@ fn main() {
             }
         }
         Commands::Concept(ConceptCommands::Delete { id, force }) => {
-            let node = match braim.state.nodes.get(&id) {
-                Some(n) => n.clone(),
-                None => {
-                    eprintln!("Error: Concept ID {} not found", id);
-                    std::process::exit(1);
-                }
-            };
+            if !braim.state.nodes.contains_key(&id) {
+                eprintln!("Error: Concept ID {} not found", id);
+                std::process::exit(1);
+            }
 
             // Find dependents
             let mut dependents = Vec::new();
@@ -847,13 +843,10 @@ fn main() {
             }
         }
         Commands::Statement(StatementCommands::Delete { id, force }) => {
-            let node = match braim.state.nodes.get(&id) {
-                Some(n) => n.clone(),
-                None => {
-                    eprintln!("Error: Statement ID {} not found", id);
-                    std::process::exit(1);
-                }
-            };
+            if !braim.state.nodes.contains_key(&id) {
+                eprintln!("Error: Statement ID {} not found", id);
+                std::process::exit(1);
+            }
 
             // Find dependents
             let mut dependents = Vec::new();
@@ -1248,7 +1241,7 @@ fn main() {
                     }
 
                     if related {
-                        let (depends_on_nodes, depended_by_nodes) = braim.get_related_nodes(id);
+                        let (_, depended_by_nodes) = braim.get_related_nodes(id);
 
                         if !depended_by_nodes.is_empty() {
                             println!("\n  Referenced by:");
@@ -1406,7 +1399,10 @@ fn main() {
 
             if let Some(kv) = &meta {
                 match kv.split_once('=') {
-                    Some((k, v)) => nodes.retain(|n| n.metadata.get(k).map(|x| x == v).unwrap_or(false)),
+                    Some((k, v)) => {
+                        let ids = braim.nodes_by_meta(k, v);
+                        nodes.retain(|n| ids.contains(&n.id));
+                    }
                     None => {
                         eprintln!("--meta must be key=value (e.g. scope=cognitivex_flow)");
                         std::process::exit(1);
