@@ -233,6 +233,106 @@ pub fn refresh_index(
     Ok(stale_texts.len())
 }
 
+/// Cosine at/above which a statement is flagged for restating the label of one
+/// of its own dependencies — a single-concept elaboration that adds no
+/// relationship ('Concept: description' labels are already self-documenting).
+pub const ECHO_WARN_THRESHOLD: f32 = 0.75;
+
+pub struct DupPair {
+    pub id_a: u32,
+    pub id_b: u32,
+    pub score: f32,
+}
+
+pub struct EchoWarning {
+    pub statement_id: u32,
+    pub dep_id: u32,
+    pub score: f32,
+}
+
+/// All-pairs near-duplicate scan over the index. Skips source entities (their
+/// identity is a location, not a label), invalid statements, and directly
+/// connected pairs — a statement scoring high against its own dependency is the
+/// echo check's territory, not a duplicate.
+pub fn semantic_duplicates(braim: &Braim, index: &EmbedIndex, threshold: f32) -> Vec<DupPair> {
+    let mut ids: Vec<u32> = index
+        .vectors
+        .keys()
+        .copied()
+        .filter(|id| {
+            braim
+                .state
+                .nodes
+                .get(id)
+                .map(|n| n.node_type != NodeType::Source && n.node_type != NodeType::InvalidStatement)
+                .unwrap_or(false)
+        })
+        .collect();
+    ids.sort_unstable();
+
+    let connected = |a: u32, b: u32| -> bool {
+        let dep = |x: u32, y: u32| {
+            braim
+                .state
+                .nodes
+                .get(&x)
+                .map(|n| n.depends_on.contains_key(&y))
+                .unwrap_or(false)
+        };
+        dep(a, b) || dep(b, a)
+    };
+
+    let mut pairs = Vec::new();
+    for (i, &a) in ids.iter().enumerate() {
+        for &b in &ids[i + 1..] {
+            if connected(a, b) {
+                continue;
+            }
+            let s = cosine(&index.vectors[&a].vec, &index.vectors[&b].vec);
+            if s >= threshold {
+                pairs.push(DupPair { id_a: a, id_b: b, score: s });
+            }
+        }
+    }
+    pairs.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    pairs
+}
+
+/// Label-echo scan: active statement-family nodes whose label scores >= threshold
+/// against the label of one of their own concept dependencies.
+pub fn label_echoes(braim: &Braim, index: &EmbedIndex, threshold: f32) -> Vec<EchoWarning> {
+    let mut warnings = Vec::new();
+    let mut ids: Vec<u32> = braim.state.nodes.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let node = &braim.state.nodes[&id];
+        if !node.node_type.is_statement_family() || node.node_type == NodeType::InvalidStatement {
+            continue;
+        }
+        let Some(stmt_vec) = index.vectors.get(&id) else { continue };
+        let mut dep_ids: Vec<u32> = node.depends_on.keys().copied().collect();
+        dep_ids.sort_unstable();
+        for dep_id in dep_ids {
+            let is_concept = braim
+                .state
+                .nodes
+                .get(&dep_id)
+                .map(|d| matches!(d.node_type, NodeType::Atomic | NodeType::Compound))
+                .unwrap_or(false);
+            if !is_concept {
+                continue;
+            }
+            let Some(dep_vec) = index.vectors.get(&dep_id) else { continue };
+            let s = cosine(&stmt_vec.vec, &dep_vec.vec);
+            if s >= threshold {
+                warnings.push(EchoWarning { statement_id: id, dep_id, score: s });
+            }
+        }
+    }
+    warnings.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    warnings
+}
+
 pub struct Hit {
     pub id: u32,
     pub score: f32,
@@ -275,4 +375,75 @@ pub fn top_k(
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
     scored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn temp_braim(name: &str) -> Braim {
+        let dir = std::env::temp_dir().join(format!("braim_embed_test_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Braim::new(dir.to_str().unwrap()).unwrap()
+    }
+
+    fn entry(v: Vec<f32>) -> EmbedEntry {
+        EmbedEntry { label_hash: 0, vec: v }
+    }
+
+    #[test]
+    fn duplicates_flagged_connected_pairs_skipped() {
+        let mut b = temp_braim("dups");
+        let a = b.add_concept("Alpha: first concept", vec!["t".into()], vec!["code:x.rs".into()], None).unwrap();
+        let c = b.add_concept("Beta: second concept", vec!["t".into()], vec!["code:x.rs".into()], None).unwrap();
+        let mut deps = HashMap::new();
+        deps.insert(a, 0.6);
+        deps.insert(c, 0.4);
+        let s = b.add_statement("alpha relates to beta", vec!["t".into()], vec!["code:x.rs".into()], deps, true).unwrap();
+
+        let mut index = EmbedIndex::default();
+        // a and c identical vectors -> duplicate pair; s connected to both -> skipped
+        index.vectors.insert(a, entry(vec![1.0, 0.0]));
+        index.vectors.insert(c, entry(vec![1.0, 0.0]));
+        index.vectors.insert(s, entry(vec![1.0, 0.0]));
+
+        let dups = semantic_duplicates(&b, &index, 0.8);
+        assert_eq!(dups.len(), 1, "only the unconnected a-c pair should be flagged");
+        assert_eq!((dups[0].id_a, dups[0].id_b), (a.min(c), a.max(c)));
+        assert!(dups[0].score > 0.99);
+    }
+
+    #[test]
+    fn orthogonal_vectors_not_duplicates() {
+        let mut b = temp_braim("ortho");
+        let a = b.add_concept("Alpha: first concept", vec!["t".into()], vec!["code:x.rs".into()], None).unwrap();
+        let c = b.add_concept("Beta: second concept", vec!["t".into()], vec!["code:x.rs".into()], None).unwrap();
+        let mut index = EmbedIndex::default();
+        index.vectors.insert(a, entry(vec![1.0, 0.0]));
+        index.vectors.insert(c, entry(vec![0.0, 1.0]));
+        assert!(semantic_duplicates(&b, &index, 0.8).is_empty());
+    }
+
+    #[test]
+    fn echo_detected_on_own_dependency_only() {
+        let mut b = temp_braim("echo");
+        let a = b.add_concept("Alpha: first concept", vec!["t".into()], vec!["code:x.rs".into()], None).unwrap();
+        let c = b.add_concept("Beta: second concept", vec!["t".into()], vec!["code:x.rs".into()], None).unwrap();
+        let mut deps = HashMap::new();
+        deps.insert(a, 0.7);
+        deps.insert(c, 0.3);
+        let s = b.add_statement("alpha restated", vec!["t".into()], vec!["code:x.rs".into()], deps, true).unwrap();
+
+        let mut index = EmbedIndex::default();
+        index.vectors.insert(a, entry(vec![1.0, 0.0]));      // echoed by s
+        index.vectors.insert(c, entry(vec![0.0, 1.0]));      // orthogonal to s
+        index.vectors.insert(s, entry(vec![1.0, 0.0]));
+
+        let echoes = label_echoes(&b, &index, ECHO_WARN_THRESHOLD);
+        assert_eq!(echoes.len(), 1);
+        assert_eq!(echoes[0].statement_id, s);
+        assert_eq!(echoes[0].dep_id, a);
+    }
 }

@@ -1,5 +1,8 @@
 mod graph;
 mod tips;
+// Without the embeddings feature the module compiles but only its pure helpers
+// are reachable from tests; suppress dead-code noise in that configuration.
+#[cfg_attr(not(feature = "embeddings"), allow(dead_code))]
 mod embed;
 
 use clap::{Parser, Subcommand};
@@ -236,8 +239,11 @@ enum Commands {
     Version(VersionCommands),
     #[command(about = "List all domains in the graph with concept counts", long_about = "Domains: Discover all existing domains to avoid creating duplicates.\n\nUsage:\n  braim domains\n\nOutput: Alphabetical list of domains with count of concepts in each.\n\nWhy: LLMs and users should check existing domains before creating new ones.\nSlightly different domain names (e.g., 'payment' vs 'payments', 'Payment Domain')\nfragment the graph and reduce discoverability. Always reuse existing domains.")]
     Domains,
-    #[command(about = "Audit the graph for consistency, gaps, and verification issues", long_about = "Audit: Scan the entire graph for problems and verification status.\n\nChecks:\n  • Orphan nodes (active, unreferenced, no dependencies)\n  • Pending nodes (declared but unintegrated)\n  • Statements grouped by verification status:\n      ✓✓✓ ProvenStrong (3+ PRIMARY sources)\n      ✓✓ Proven (2+ PRIMARY sources)\n      ✓ Partial (1 PRIMARY source)\n      ✗ Unproven (0 PRIMARY sources)\n  • Invalid statements (refuted claims)\n  • Deprecated nodes still referenced\n  • Gap register: zero-path relationships\n  • Weight constraint violations (must sum to 1.0)\n\nOutput organization:\n  1. Orphan nodes needing integration\n  2. Pending nodes (incomplete)\n  3. Gap register (missing connections)\n  4. Deprecated nodes still in use\n  5. Statement verification status breakdown\n  6. Invalid statements with reasons\n\nUse audit regularly to track:\n  • Verification coverage (% proven vs unproven)\n  • Integration status (orphans, pending)\n  • Consistency issues (gaps, weight violations)\n  • Deprecation problems (deprecated referenced)")]
-    Audit,
+    #[command(about = "Audit the graph for consistency, gaps, and verification issues", long_about = "Audit: Scan the entire graph for problems and verification status.\n\nChecks:\n  • Orphan nodes (active, unreferenced, no dependencies)\n  • Pending nodes (declared but unintegrated)\n  • Statements grouped by verification status:\n      ✓✓✓ ProvenStrong (3+ PRIMARY sources)\n      ✓✓ Proven (2+ PRIMARY sources)\n      ✓ Partial (1 PRIMARY source)\n      ✗ Unproven (0 PRIMARY sources)\n  • Invalid statements (refuted claims)\n  • Deprecated nodes still referenced\n  • Gap register: zero-path relationships\n  • Weight constraint violations (must sum to 1.0)\n\nOutput organization:\n  1. Orphan nodes needing integration\n  2. Pending nodes (incomplete)\n  3. Gap register (missing connections)\n  4. Deprecated nodes still in use\n  5. Statement verification status breakdown\n  6. Invalid statements with reasons\n\nUse audit regularly to track:\n  • Verification coverage (% proven vs unproven)\n  • Integration status (orphans, pending)\n  • Consistency issues (gaps, weight violations)\n  • Deprecation problems (deprecated referenced)\n\nSemantic checks (--semantic, requires --features embeddings):\n  • Near-duplicates: unconnected node pairs with label cosine >= 0.80\n  • Label echoes: statements restating a dependency's label (cosine >= 0.75)\n    — single-concept elaborations that add no relationship\nBoth reuse the .braim/embeddings.json sidecar index and are ADVISORY.")]
+    Audit {
+        #[arg(long, help = "Embedding-based checks: near-duplicate pairs and label echoes (requires --features embeddings)")]
+        semantic: bool,
+    },
     #[command(about = "List all nodes (optionally filtered by domain or type)", long_about = "List: Display all nodes in the graph.\n\nExamples:\n  braim list                        # All nodes\n  braim list --domain payment       # Only 'payment' domain\n  braim list --type statement       # Only statements\n  braim list --domain acme --type atomic  # Combine filters\n\nOutput: ID, label, type, domains, source count, verification status.")]
     List {
         #[arg(long, help = "Filter by domain")]
@@ -1265,7 +1271,7 @@ fn main() {
                 None => Err(format!("Error: Node ID {} not found", id)),
             }
         }
-        Commands::Audit => {
+        Commands::Audit { semantic } => {
             let report = braim.audit();
 
             println!("── Orphan nodes (active, unreferenced, no dependencies) ──");
@@ -1368,7 +1374,11 @@ fn main() {
                 }
             }
 
-            Ok(())
+            if semantic {
+                run_semantic_audit(&braim, &cli.data_dir)
+            } else {
+                Ok(())
+            }
         }
         Commands::Domains => {
             let domain_counts = braim.get_domain_stats();
@@ -1688,6 +1698,82 @@ fn run_similar(
     _dedup: bool,
 ) -> Result<(), String> {
     Err("`braim similar` requires the embeddings feature.\n\
+         Rebuild with:  cargo build --release --features embeddings"
+        .to_string())
+}
+
+#[cfg(feature = "embeddings")]
+fn run_semantic_audit(braim: &Braim, data_dir: &str) -> Result<(), String> {
+    use embed::{
+        corpus, label_echoes, refresh_index, semantic_duplicates, EmbedIndex, FastEmbedder,
+        DEDUP_WARN_THRESHOLD, ECHO_WARN_THRESHOLD, EMBED_SIDECAR,
+    };
+
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        println!("\n── Semantic checks ──\n  graph has no labelled nodes");
+        return Ok(());
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = FastEmbedder::new()?;
+    let embedded = refresh_index(&mut embedder, &mut index, &rows, false)?;
+    if embedded > 0 {
+        index.save(data_path)?;
+        eprintln!(
+            "(refreshed index: embedded {} node(s) -> {}/{})",
+            embedded, data_dir, EMBED_SIDECAR
+        );
+    }
+
+    let label_of = |id: u32| -> String {
+        braim
+            .state
+            .nodes
+            .get(&id)
+            .map(|n| n.label.chars().take(60).collect())
+            .unwrap_or_default()
+    };
+
+    let dups = semantic_duplicates(braim, &index, DEDUP_WARN_THRESHOLD);
+    println!(
+        "\n── Semantic near-duplicates (cosine >= {:.2}, advisory) ──",
+        DEDUP_WARN_THRESHOLD
+    );
+    if dups.is_empty() {
+        println!("  none");
+    } else {
+        for d in &dups {
+            println!("  ⚠ {:.3}  ID:{}  '{}'", d.score, d.id_a, label_of(d.id_a));
+            println!("           ID:{}  '{}'", d.id_b, label_of(d.id_b));
+        }
+    }
+
+    let echoes = label_echoes(braim, &index, ECHO_WARN_THRESHOLD);
+    println!(
+        "\n── Label echoes (statement restates own dependency, cosine >= {:.2}, advisory) ──",
+        ECHO_WARN_THRESHOLD
+    );
+    if echoes.is_empty() {
+        println!("  none");
+    } else {
+        for e in &echoes {
+            println!(
+                "  ⚠ {:.3}  ID:{} '{}'  echoes dep ID:{} '{}'",
+                e.score,
+                e.statement_id,
+                label_of(e.statement_id),
+                e.dep_id,
+                label_of(e.dep_id)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn run_semantic_audit(_braim: &Braim, _data_dir: &str) -> Result<(), String> {
+    Err("`braim audit --semantic` requires the embeddings feature.\n\
          Rebuild with:  cargo build --release --features embeddings"
         .to_string())
 }
