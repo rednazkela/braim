@@ -393,6 +393,16 @@ enum StatementCommands {
         #[arg(long, help = "New weights: \"ID:weight,ID:weight\" (must sum to 1.0)")]
         weights: String,
     },
+    #[command(about = "Add, remove, or replace dependency edges on a statement", long_about = "Statement UpdateDeps: Modify which concepts a statement depends on without deleting it.\n\nPreserves the statement ID, its attached source entities, and everything referencing it —\nthe alternative (delete + recreate) loses all three.\n\nUsage:\n  braim statement update-deps 42 --add \"5:0.3\" --remove \"3\"\n  braim statement update-deps 42 --set \"1:0.6,5:0.4\"\n\nRules:\n  • --set is exclusive: --add and --remove are ignored when --set is provided\n  • Weights must sum to 1.0 after the operation\n  • Invalid statements cannot be rewired; invalid dependencies are rejected\n  • Verification is recomputed afterward (dependency inheritance may cap it)\n  • Gap-register entries covered by the new dependency pairs auto-clear")]
+    UpdateDeps {
+        id: u32,
+        #[arg(long, help = "Add dependency edges: \"ID:weight[,ID:weight]\"")]
+        add: Option<String>,
+        #[arg(long, help = "Remove dependency edges by ID: \"ID[,ID]\"")]
+        remove: Option<String>,
+        #[arg(long, help = "Replace all dependencies: \"ID:weight[,ID:weight]\" (exclusive with --add/--remove)")]
+        set: Option<String>,
+    },
     #[command(about = "Attach a source entity to an existing statement", long_about = "Statement AddSource: Link a first-class source entity to a statement after creation.\n\nUsage:\n  braim statement add-source 42 --source-id 5001\n\nEffect on non-contested statements:\n  • Appends source entity to the statement's source_ids list\n  • Recomputes verification_status from all string sources + source entities\n  • A new PRIMARY-typed source can raise the verification level\n\nEffect on contested statements (Mechanism A auto-resolution):\n  • If the source is PRIMARY-typed AND the other contested statement does NOT\n    have this source, auto-resolution fires:\n      Winner (this statement) → status recomputed (likely partial/proven/proven_strong)\n      Loser  (other statement) → invalid; cascades to its dependents\n      Contradicts edge → marked resolved\n  • If the new source is on both sides (corroborates both), no auto-resolution;\n    use 'statement resolve-contradiction' instead.\n\nWorkflow:\n  braim source add \"Audit log entry\" --type transcript --location \"transcript:audit.txt:88\"\n  # → ID:5001\n  braim statement add-source 42 --source-id 5001\n  # If 42 is contested and the other side lacks source 5001 → auto-resolved")]
     AddSource {
         id: u32,
@@ -966,6 +976,45 @@ fn main() {
                 Ok(_) => {
                     println!("✓ Statement ID:{} weights updated", id);
                     println!("  depends_on: {:?}", new_weights);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Statement(StatementCommands::UpdateDeps { id, add, remove, set }) => {
+            let add_map = match add.as_deref().map(parse_depends) {
+                Some(Ok(m)) => Some(m),
+                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                None => None,
+            };
+            let remove_ids: Option<Vec<u32>> = match remove.as_deref() {
+                Some(s) => {
+                    let parsed: Result<Vec<u32>, _> = s.split(',').map(|x| x.trim().parse::<u32>()).collect();
+                    match parsed {
+                        Ok(v) => Some(v),
+                        Err(_) => { eprintln!("Error: --remove must be comma-separated IDs (e.g. \"3,7\")"); std::process::exit(1); }
+                    }
+                }
+                None => None,
+            };
+            let set_map = match set.as_deref().map(parse_depends) {
+                Some(Ok(m)) => Some(m),
+                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                None => None,
+            };
+            if add_map.is_none() && remove_ids.is_none() && set_map.is_none() {
+                eprintln!("Error: provide at least one of --add, --remove, or --set");
+                std::process::exit(1);
+            }
+            match braim.update_statement_deps(id, add_map, remove_ids, set_map) {
+                Ok(new_deps) => {
+                    let node = &braim.state.nodes[&id];
+                    println!("✓ Statement ID:{} dependencies updated", id);
+                    println!("  depends_on: {:?}", new_deps);
+                    println!("  Verification: {} {}", node.verification_status.badge(), node.verification_status.label());
                     Ok(())
                 }
                 Err(e) => {
