@@ -46,11 +46,17 @@ too high.
 
 - FACT GATE: before asserting `@[fact]`, `braim lookup` it — reuse if it
   exists, else add it with typed sources. >=2 PRIMARY types from different
-  categories auto-promote to proven; never promote by fiat.
+  categories auto-promote to proven; never promote by fiat. Lookup misses →
+  `braim similar "<claim>"` (embedding search; finds matches with zero shared
+  words) before concluding the fact is new.
 - CATALOG BOOTSTRAP: before ingesting new material at scale, dump existing
   concepts (`braim list --type atomic`, `braim list --type compound`) and
-  lookup-first every concept. Reuse beats re-creation; duplicates are the
-  documented failure mode (13 silent duplicates in one production run).
+  lookup-first every concept. Then semantic dedup: `braim similar "<label>"
+  --dedup` (or `--check-dupes` on the add itself); a hit >=0.8 means reuse or
+  refine the existing node, not add. similar is ADVISORY — it never overrides
+  the verification lifecycle. Reuse beats re-creation; duplicates are the
+  documented failure mode (13 silent duplicates in one production run, caught
+  only by lexical review that semantic dedup now automates).
 - COMPLETENESS: extract every concept the material references or implies,
   not just the ones central to the task.
 - INFERENCE VALIDATION: `#[inference]` written to the graph needs >=2
