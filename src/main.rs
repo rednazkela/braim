@@ -118,6 +118,15 @@ QUERY DEFAULTS (filter flags compose orthogonally):\n\
   --min-trust partial|proven                 → filter by verification level\n\
   --primary-only                             → only statements with ≥1 PRIMARY source\n\n\
   Concepts (atomic/compound) are always returned regardless of these flags.\n\n\
+SEMANTIC SIMILARITY (optional; build with --features embeddings):\n\
+  braim similar \"<text>\"            → nearest labels by MEANING (zero shared words ok)\n\
+  braim similar \"<label>\" --dedup   → write-time duplicate check (floor 0.8)\n\
+  --check-dupes on concept/statement add → same check inline, advisory warn\n\
+  braim query ... (no hits)          → automatic semantic fallback suggestions\n\
+  braim audit --semantic             → near-duplicate pairs (>=0.80) + label echoes:\n\
+                                       statements restating their own dependency (>=0.75)\n\
+  All ADVISORY — augments, never overrides, the verification lifecycle.\n\
+  Index is a sidecar (.braim/embeddings.json); only changed labels re-embed.\n\n\
 WORKFLOW:\n\
   # Discover existing graph\n\
   braim domains\n\

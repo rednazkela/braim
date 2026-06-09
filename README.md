@@ -62,6 +62,7 @@ statement  add | verify | verify-suggest |      claims/facts lifecycle
            invalidate | update-weights | delete
 source     add                                  first-class source entities
 lookup | query | proximity | perspective        discovery and navigation
+similar                                         semantic search + dedup (embeddings builds)
 node | list | domains | audit | meta            inspection and metadata
 version    save | list | restore                checkpoints
 serve | import | migrate-node-types             viewer, cross-project, migration
@@ -129,6 +130,27 @@ braim proximity "Member" "Late Fee"                            # shortest connec
 
 @[perspective registers zero-path pairs in the gap register for investigation] source: braim perspective output
 
+### Semantic similarity (optional)
+
+Requires an embeddings build: `cargo build --release --features embeddings` (pulls fastembed/ONNX; needs rustc >= 1.88).
+
+```bash
+braim similar "measuring how similar two texts are"   # nearest labels by MEANING
+braim similar "Cosine: vector angle measure" --dedup  # write-time duplicate check, floor 0.8
+braim concept add "..." --check-dupes                 # same check inline on add
+braim audit --semantic                                # near-duplicates + label echoes
+```
+
+@[similar finds nodes by meaning even with zero shared words, where lexical query returns nothing] source: braim similar --help
+
+@[query falls back to semantic suggestions automatically when concept traversal finds nothing] source: code:src/main.rs query_semantic_fallback
+
+@[audit --semantic flags unconnected near-duplicate pairs (cosine >= 0.80) and label echoes — statements restating the label of one of their own dependencies (>= 0.75)] source: braim audit --help
+
+@[Everything semantic is ADVISORY: it augments, never overrides, the verification lifecycle; the index is a sidecar at .braim/embeddings.json and only changed labels re-embed] source: braim similar --help
+
+@[Non-feature builds keep every other command; similar and audit --semantic explain the rebuild needed] source: code:src/main.rs run_similar (not(feature)) stub
+
 ### Metadata
 
 ```bash
@@ -142,6 +164,7 @@ braim list --meta scope=agent_scratch       # filter by metadata
 
 ```bash
 braim audit                      # orphans, pending nodes, gap register, dangling refs
+braim audit --semantic           # + near-duplicate pairs and label echoes (embeddings builds)
 braim domains                    # domain inventory — check before adding (rule 4)
 braim version save "checkpoint"  # rule 3: checkpoint after each batch
 braim version restore 12         # overwrites current.json; save first
@@ -159,7 +182,7 @@ braim import /other/.braim --domain-map "Finance:Billing" --only-proven
 
 Core disciplines the policies encode:
 
-- **Lookup-first**: `braim lookup --exact` / `query --include-claims` before every add — duplicates are the documented failure mode.
+- **Lookup-first**: `braim lookup --exact` / `query --include-claims` before every add — duplicates are the documented failure mode. On embeddings builds, follow with semantic dedup: `braim similar "<label>" --dedup` or `--check-dupes` on the add; a hit >= 0.8 means reuse, not add.
 - **Markers**: `@[verbatim fact]` with typed citation, `#[inference]` with 2+ asymmetric deps, `?[unknown]` with evidence_needed; exactly one marker per claim.
 - **Re-grounding**: a braim node label is a pointer, not evidence. Figures and quotes are verified against the cited source document; label-vs-document disagreement means the document wins and the node gets contradicted or invalidated — at promotion time especially.
 - **Promotion never by fiat**: claims become facts only through `add-source` with genuinely diverse PRIMARY types.
