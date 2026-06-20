@@ -55,11 +55,12 @@ Serves high-quality context to an LLM with an agent-agnostic, multi-source, cros
 ## Commands
 
 ```text
-concept    add | delete | update-weights        atomics + compounds
+concept    add | delete | update-weights |      atomics + compounds
+           update-deps
 statement  add | verify | verify-suggest |      claims/facts lifecycle
            add-source | contradict |
-           resolve-contradiction |
-           invalidate | update-weights | delete
+           resolve-contradiction | invalidate |
+           update-weights | update-deps | delete
 source     add                                  first-class source entities
 lookup | query | proximity | perspective        discovery and navigation
 why-add | why | why-test | why-remove           causal chains (because_of, Five Whys)

@@ -672,11 +672,9 @@ impl Braim {
         remove: Option<Vec<u32>>,
         set: Option<HashMap<u32, f64>>,
     ) -> Result<HashMap<u32, f64>, String> {
-        if !self.state.nodes.contains_key(&node_id) {
-            return Err(format!("Error: Node ID {} does not exist", node_id));
-        }
         {
-            let node = self.state.nodes.get(&node_id).unwrap();
+            let node = self.state.nodes.get(&node_id)
+                .ok_or(format!("Error: Node ID {} does not exist", node_id))?;
             if node.node_type != NodeType::Compound {
                 return Err(format!(
                     "Error: Node ID {} is not a compound (node_type: {:?})",
@@ -684,6 +682,91 @@ impl Braim {
                 ));
             }
         }
+        self.update_deps_core(node_id, add, remove, set)
+    }
+
+    /// Statement counterpart of update_deps: preserves the statement ID and its
+    /// attached sources instead of forcing delete+recreate. Recomputes inherited
+    /// verification and clears gaps covered by the new dependency pairs.
+    pub fn update_statement_deps(
+        &mut self,
+        node_id: u32,
+        add: Option<HashMap<u32, f64>>,
+        remove: Option<Vec<u32>>,
+        set: Option<HashMap<u32, f64>>,
+    ) -> Result<HashMap<u32, f64>, String> {
+        {
+            let node = self.state.nodes.get(&node_id)
+                .ok_or(format!("Error: Node ID {} does not exist", node_id))?;
+            if !node.node_type.is_statement_family() {
+                return Err(format!(
+                    "Error: Node ID {} is not a statement (node_type: {:?})",
+                    node_id, node.node_type
+                ));
+            }
+            if node.invalid || node.verification_status == VerificationStatus::Invalid {
+                return Err(format!("Error: Cannot update deps of invalid statement ID {}", node_id));
+            }
+        }
+        for ids in [add.as_ref().map(|m| m.keys().copied().collect::<Vec<_>>()),
+                    set.as_ref().map(|m| m.keys().copied().collect::<Vec<_>>())]
+            .into_iter()
+            .flatten()
+        {
+            for dep_id in ids {
+                if let Some(dep) = self.state.nodes.get(&dep_id) {
+                    if dep.invalid || dep.verification_status == VerificationStatus::Invalid {
+                        return Err(format!(
+                            "Error: Dependency ID {} is invalid — cannot wire a statement to a refuted node",
+                            dep_id
+                        ));
+                    }
+                }
+            }
+        }
+        let new_deps = self.update_deps_core(node_id, add, remove, set)?;
+
+        // Dependency inheritance changed — recompute status unless contested
+        // (contested resolves only through the contradiction lifecycle).
+        if self.state.nodes[&node_id].verification_status != VerificationStatus::Contested {
+            let new_status = {
+                let stmt = self.state.nodes.get(&node_id).unwrap();
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                let source_derived =
+                    Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types);
+                let mut cap: Option<u8> = None;
+                for dep_id in new_deps.keys() {
+                    if let Some(dep) = self.state.nodes.get(dep_id) {
+                        if !dep.node_type.is_statement_family() {
+                            continue;
+                        }
+                        let r = dep.verification_status.rank();
+                        cap = Some(cap.map_or(r, |p: u8| p.min(r)));
+                    }
+                }
+                match cap {
+                    Some(c) if source_derived.rank() > c => VerificationStatus::from_rank(c),
+                    _ => source_derived,
+                }
+            };
+            let stmt = self.state.nodes.get_mut(&node_id).unwrap();
+            stmt.verification_status = new_status;
+            stmt.node_type = NodeType::from_verification_status(new_status);
+        }
+
+        let dep_ids: Vec<u32> = new_deps.keys().copied().collect();
+        self.clear_gaps_for_deps(&dep_ids);
+        self.flush()?;
+        Ok(new_deps)
+    }
+
+    fn update_deps_core(
+        &mut self,
+        node_id: u32,
+        add: Option<HashMap<u32, f64>>,
+        remove: Option<Vec<u32>>,
+        set: Option<HashMap<u32, f64>>,
+    ) -> Result<HashMap<u32, f64>, String> {
 
         let new_deps: HashMap<u32, f64> = if let Some(set_deps) = set {
             for &dep_id in set_deps.keys() {
@@ -723,7 +806,7 @@ impl Braim {
         };
 
         if new_deps.is_empty() {
-            return Err("Error: Compound must retain at least 1 dependency".to_string());
+            return Err("Error: Node must retain at least 1 dependency".to_string());
         }
         let sum: f64 = new_deps.values().sum();
         if (sum - 1.0).abs() > 0.001 {
@@ -963,6 +1046,12 @@ impl Braim {
             let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
             stmt.source_ids.push(source_id);
         }
+
+        // The statement's dependency pairs are connected regardless of which
+        // branch below fires; gaps registered after the statement was created
+        // would otherwise survive promotion (only `statement add` cleared them).
+        let dep_ids: Vec<u32> = self.state.nodes[&statement_id].depends_on.keys().copied().collect();
+        self.clear_gaps_for_deps(&dep_ids);
 
         let is_contested = self.state.nodes[&statement_id].verification_status
             == VerificationStatus::Contested;
@@ -1972,22 +2061,27 @@ impl Braim {
 
         // Auto-clear gap register for newly connected pairs.
         let new_statement_deps: Vec<u32> = depends_on.keys().cloned().collect();
-        self.state.gaps.retain(|gap| {
-            for i in 0..new_statement_deps.len() {
-                for j in (i + 1)..new_statement_deps.len() {
-                    let id_a = new_statement_deps[i];
-                    let id_b = new_statement_deps[j];
-                    if (gap.concept_a == id_a && gap.concept_b == id_b) ||
-                       (gap.concept_a == id_b && gap.concept_b == id_a) {
-                        return false;  // remove this gap
-                    }
-                }
-            }
-            true  // keep this gap
-        });
+        self.clear_gaps_for_deps(&new_statement_deps);
 
         self.flush()?;
         Ok(id)
+    }
+
+    /// Drop gap-register entries covered by any pair of the given concept ids.
+    fn clear_gaps_for_deps(&mut self, dep_ids: &[u32]) {
+        self.state.gaps.retain(|gap| {
+            for i in 0..dep_ids.len() {
+                for j in (i + 1)..dep_ids.len() {
+                    let (id_a, id_b) = (dep_ids[i], dep_ids[j]);
+                    if (gap.concept_a == id_a && gap.concept_b == id_b)
+                        || (gap.concept_a == id_b && gap.concept_b == id_a)
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
     }
 
     pub fn update_weights(
@@ -2345,6 +2439,10 @@ impl Braim {
         for node in self.state.nodes.values() {
             for &dep_id in node.depends_on.keys() {
                 referenced.insert(dep_id);
+            }
+            // Source entities are referenced via attachment, not depends_on.
+            for &src_id in &node.source_ids {
+                referenced.insert(src_id);
             }
         }
 
@@ -3297,5 +3395,95 @@ mod because_of_tests {
         assert!(outcome.was_invalid);
         // no outgoing edge remains
         assert!(b.why_remove(ids[0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod defect_tests {
+    use super::*;
+
+    fn temp_braim(name: &str) -> Braim {
+        let dir = std::env::temp_dir().join(format!("braim_defect_test_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Braim::new(dir.to_str().unwrap()).unwrap()
+    }
+
+    fn two_concepts_and_claim(b: &mut Braim) -> (u32, u32, u32) {
+        let a = b.add_concept("Alpha: first concept", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second concept", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let mut deps = HashMap::new();
+        deps.insert(a, 0.6);
+        deps.insert(c, 0.4);
+        let s = b.add_statement("alpha relates to beta", vec!["t".into()], vec!["narrative:claim".into()], deps, true).unwrap();
+        (a, c, s)
+    }
+
+    #[test]
+    fn attached_source_entity_is_not_an_orphan() {
+        let mut b = temp_braim("orphan_source");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        let report = b.audit();
+        assert!(
+            !report.orphans.iter().any(|n| n.id == src),
+            "attached source entity must not be reported as orphan"
+        );
+    }
+
+    #[test]
+    fn unattached_source_entity_still_orphan() {
+        let mut b = temp_braim("orphan_source_neg");
+        let src = b.add_source("dangling file", "code", Some("code:y.rs:1".into()), None).unwrap();
+        let report = b.audit();
+        assert!(report.orphans.iter().any(|n| n.id == src));
+    }
+
+    #[test]
+    fn gap_clears_on_add_source_promotion() {
+        let mut b = temp_braim("gap_promotion");
+        let (a, c, s) = two_concepts_and_claim(&mut b);
+        // Gap registered AFTER the statement exists (claims don't carry paths).
+        let _ = b.perspective("Alpha", "Beta");
+        assert!(
+            b.state.gaps.iter().any(|g| (g.concept_a == a && g.concept_b == c) || (g.concept_a == c && g.concept_b == a)),
+            "precondition: gap must be registered"
+        );
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        assert!(
+            !b.state.gaps.iter().any(|g| (g.concept_a == a && g.concept_b == c) || (g.concept_a == c && g.concept_b == a)),
+            "gap must auto-clear when the connecting statement gains a source"
+        );
+    }
+
+    #[test]
+    fn statement_update_deps_set_and_recompute() {
+        let mut b = temp_braim("stmt_update_deps");
+        let (a, _, s) = two_concepts_and_claim(&mut b);
+        let d = b.add_concept("Gamma: third concept", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let mut set = HashMap::new();
+        set.insert(a, 0.7);
+        set.insert(d, 0.3);
+        let new_deps = b.update_statement_deps(s, None, None, Some(set)).unwrap();
+        assert_eq!(new_deps.len(), 2);
+        assert!(new_deps.contains_key(&d));
+        let node = b.get_node(s).unwrap();
+        assert_eq!(node.depends_on.len(), 2);
+        // narrative-only sources → still unproven after recompute
+        assert_eq!(node.verification_status, VerificationStatus::Unproven);
+    }
+
+    #[test]
+    fn statement_update_deps_rejects_concept_target_and_bad_weights() {
+        let mut b = temp_braim("stmt_update_deps_neg");
+        let (a, c, s) = two_concepts_and_claim(&mut b);
+        // concept target rejected
+        assert!(b.update_statement_deps(a, None, None, Some(HashMap::from([(c, 1.0)]))).is_err());
+        // weights must sum to 1.0
+        assert!(b.update_statement_deps(s, None, None, Some(HashMap::from([(a, 0.4), (c, 0.4)]))).is_err());
+        // concept update-deps still rejects statements
+        assert!(b.update_deps(s, None, None, Some(HashMap::from([(a, 1.0)]))).is_err());
     }
 }
