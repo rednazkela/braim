@@ -1,0 +1,33 @@
+SCENARIO 29
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+This continues the borrowing-block investigation already in the graph. Three
+separate audit findings arrived; handle each and report what the tool does.
+
+  1. An auditor concluded that the bottom entry at the very end of the
+     explanation trace — the underlying-rule entry — was recorded in error and
+     should be marked refuted outright. Mark it refuted. Then look at the
+     entries ABOVE it in the trace and report whether the tool deleted them,
+     changed their verification status, or merely flagged them for a fresh
+     look — and how you can see that flag.
+
+  2. A separate check on one of the middle links failed: the audited members
+     kept running up the balance even in months when the lower reason for that
+     link was absent. Record this as a failed check on that link using the
+     tool's validation step. Then report whether the two entries that link
+     connected were deleted, had their status changed, or were left intact.
+
+  3. Pick the two library concepts that the top entry and the bottom entry of
+     the trace are each built from, and ask the tool for the directed and the
+     shortest connections between those two concepts. Report whether the
+     explanation trace you built earlier appears in those connection results.
+
+Reply with: the command you used for each finding and its output, your
+observations for (1), (2), and (3), and one sentence on what (3) tells you
+about how this kind of explanation link relates to the graph's other
+connections.

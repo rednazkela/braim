@@ -1,0 +1,27 @@
+SCENARIO 28
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+This continues the borrowing-block investigation already recorded in the
+graph. Two new developments:
+
+  1. A colleague proposes a different explanation for the very same borrowing
+     block recorded earlier: they think the member's card had simply expired,
+     not that an unpaid balance triggered the block. Both explanations cannot
+     both be the single reason for the same surface complaint. Record this
+     situation the way the tool dictates rather than attaching a second reason
+     to the same entry — if you try to attach a competing reason directly, note
+     exactly what the tool does and choose the path it points you to.
+
+  2. To settle the original explanation, the front desk ran a check: they
+     cleared a test member's unpaid balance and confirmed the borrowing block
+     went away. Record this confirmation against the original link between the
+     block and the unpaid balance using the tool's own validation step.
+
+Reply with: the command you used for each development, what the tool returned
+when you handled the competing explanation, and the state of the original
+link after the confirmation.

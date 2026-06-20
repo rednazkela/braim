@@ -62,6 +62,7 @@ statement  add | verify | verify-suggest |      claims/facts lifecycle
            invalidate | update-weights | delete
 source     add                                  first-class source entities
 lookup | query | proximity | perspective        discovery and navigation
+why-add | why | why-test | why-remove           causal chains (because_of, Five Whys)
 similar                                         semantic search + dedup (embeddings builds)
 node | list | domains | audit | meta            inspection and metadata
 version    save | list | restore                checkpoints
@@ -129,6 +130,29 @@ braim proximity "Member" "Late Fee"                            # shortest connec
 @[Default queries return facts only; claims (0 PRIMARY), contested, and invalid nodes need their explicit flags] source: braim lookup --help
 
 @[perspective registers zero-path pairs in the gap register for investigation] source: braim perspective output
+
+### Causal chains (Five Whys)
+
+A `because_of` edge links one statement to its cause (consequent → cause). It is directional and unweighted — distinct from compositional `depends_on` and from `contradicts`. `perspective` and `proximity` traverse it (cause → consequent, full weight) alongside `depends_on`; because endpoints are always statements, a concept-to-concept query is unaffected. `query` still follows `depends_on` only.
+
+```bash
+braim why-add 42 --because 17 --source "narrative:investigation"  # record consequent → cause
+braim why 42                          # walk the chain to the root cause
+braim why-test 42                     # inverse test PASSED (cause confirmed)
+braim why-test 42 --fail              # inverse test FAILED (refutes the link, not the statements)
+braim why-remove 42                   # detach 42's cause so it can be reassigned
+braim why-add 42 --because 73         # re-point 42 at a new cause
+```
+
+@[because_of accepts only statement endpoints; one outgoing edge per statement (competing causes go through contradicts); cycles are rejected; chain depth >= 7 warns and > 10 rejects] source: braim why-add --help
+
+@[Reassigning a cause means why-remove then why-add — why-remove drops the active edge, or a refuted edge if no active one remains] source: braim why-remove --help
+
+@[perspective and proximity traverse because_of cause-to-consequent at weight 1.0; refuted edges are skipped; query stays depends_on-only] source: code:src/graph.rs dfs because_of branch
+
+@[A causal edge inherits the weakest endpoint's status; when both endpoints are proven the claim is partial until a passing inverse test promotes it to proven] source: code:src/graph.rs edge_causal_status
+
+@[Invalidating a cause flags every consequent above it (metadata because_of_reinvestigate) for re-investigation but does not auto-invalidate them] source: code:src/graph.rs flag_because_of_reinvestigation
 
 ### Semantic similarity (optional)
 

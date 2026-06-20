@@ -1,0 +1,22 @@
+SCENARIO 30
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+This continues the borrowing-block investigation already in the graph.
+
+A teammate is reviewing the explanation trace and does not want to use the
+trace-replay command. They want to confirm, using the graph's ordinary
+directed-connection and shortest-connection views, that a deeper entry in the
+explanation actually leads up to the surface complaint entry.
+
+Identify the surface complaint entry and an entry two steps deeper in its
+explanation. Then ask the tool for the directed connection AND the shortest
+connection FROM the deeper entry TO the surface entry, using their IDs.
+
+Reply with: the IDs you picked and how you identified them, the two commands
+you ran, their output, and whether the connection the tool returns tracks the
+explanation steps you recorded earlier.
