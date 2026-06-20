@@ -15,13 +15,16 @@ FOLDER STRUCTURE
 
   README.txt              this file
   corpus.txt              the source document (one page of prose)
-  scenario_01.txt..26.txt twenty-six scenario prompts handed to the test LLM
+  scenario_01.txt..30.txt thirty scenario prompts handed to the test LLM
                           (01-08 cover basic feature coverage; 09-14 cover
                           usage violations observed in real-world graphs;
                           15-20 cover cross-source verification primitives;
                           21-23 cover the agent-integration policies;
                           24-26 cover the memory evidence-discipline traits,
-                          26 scored on the saved reply text)
+                          26 scored on the saved reply text;
+                          27-30 cover the because_of causal edge / Five Whys
+                          commands and its perspective/proximity
+                          traversal, scored on the graph)
   corpus_appendix.txt     second source document (digital services), the
                           ingestion target for scenarios 24-26
   ../policies/            (repo root) the agent-integration policies and traits validated
@@ -40,7 +43,7 @@ HOW TO USE
        (braim auto-creates ./.braim/current.json on first command)
 
   2. From a parent Claude Code session, invoke ONE sub-agent per scenario via
-     the Agent tool, in order from scenario_01 through scenario_26. Each
+     the Agent tool, in order from scenario_01 through scenario_30. Each
      agent's prompt is the verbatim contents of the corresponding
      scenario_NN.txt file plus the working directory path. Do not include
      oracle.txt, the other scenarios, or any framing about what feature is
@@ -52,13 +55,13 @@ HOW TO USE
      assumptions about how the tool works.
 
   3. Run agents sequentially against the same working directory; scenarios
-     02 through 07 build on the nodes earlier scenarios created. Do not
-     parallelize.
+     02 through 07 build on the nodes earlier scenarios created, and 28-30
+     build on the causal chain scenario 27 records. Do not parallelize.
 
   4. After each agent reports back, apply the oracle.txt checks for that
      scenario against the current braim graph and record the verdict.
 
-  5. Tally PASS / FAIL across the twenty-six scenarios. See oracle.txt SCORING.
+  5. Tally PASS / FAIL across the thirty scenarios. See oracle.txt SCORING.
 
 DESIGN NOTE
 

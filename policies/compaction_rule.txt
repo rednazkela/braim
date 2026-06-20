@@ -15,6 +15,6 @@ Rules:
 - Orphan facts surfaced this session but not yet in braim → add to braim FIRST, then retain only the new ID and its edges. Two separate fields:
     * --sources: cite a PRIMARY type (transcript:, code:) so it lands as a fact; agent:claude_code alone is SECONDARY (0 PRIMARY) and stays an unproven claim.
     * meta tag: `braim meta <id> --set scope=agent_scratch` ONLY for scratch markers (the per-turn-policy mechanism), NOT for facts meant to persist.
-- Preserve the relationship type on every edge (depends_on, contradicts, resolved_by, enables, invalidated_by). An ID with no stated edge is not worth keeping.
+- Preserve the relationship type on every edge (depends_on, contradicts, because_of, resolved_by, enables, invalidated_by). An ID with no stated edge is not worth keeping.
 
 Goal: the compacted memory is a braim subgraph reference (IDs + edges), not a re-narration of what braim already holds.

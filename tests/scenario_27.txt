@@ -1,0 +1,26 @@
+SCENARIO 27
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+A resident filed a complaint: they can no longer check out books from the
+library. You have been asked to work backwards through the reason this
+happened and leave a record that a later reader can replay from the
+complaint down to the underlying rule that ultimately explains it.
+
+Capture each step of the explanation as its own entry, grounded in the
+library's documented policies, and connect each step to the one that
+explains it, so the entries form a single trace from the surface complaint
+to the bottom rule. The chain the corpus supports is roughly: the borrowing
+block, the unpaid balance that triggers a block, the overdue returns that
+ran up that balance, and the loan-period rule underneath it all.
+
+When you are done, have the tool replay the whole trace starting from the
+complaint entry.
+
+Reply with: the entries you created (IDs and text), each connection you
+recorded and the command you used, and the tool's replayed trace including
+which entry it reports as the bottom of the chain.

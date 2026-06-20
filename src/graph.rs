@@ -282,6 +282,33 @@ pub struct ContradictEdge {
     pub resolution_winner: Option<u32>,
 }
 
+/// Directional causal edge: `from occurs because_of to` (consequent → cause).
+/// Supports the Five Whys methodology (braim-because-of-edge.md). Unlike
+/// `depends_on` (compositional, weighted) it is unweighted — each link asserts
+/// a single principal cause. Unlike `contradicts` it is directional. Kept as a
+/// separate GraphState collection so it never pollutes `depends_on` traversal
+/// (perspective / proximity stay compositional-only).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BecauseOfEdge {
+    /// Consequent statement: the effect / symptom.
+    pub from: u32,
+    /// Cause statement: why `from` occurs.
+    pub to: u32,
+    /// Optional typed source string justifying the causal hypothesis.
+    pub source: Option<String>,
+    pub created_at: String,
+    /// `test:`-typed source recorded by a passing inverse test (`why-test`).
+    /// Presence upgrades a both-endpoints-proven edge from partial → proven.
+    #[serde(default)]
+    pub test_source: Option<String>,
+    /// Set when an inverse test failed: the causal link is refuted while the
+    /// endpoint statements themselves stay valid.
+    #[serde(default)]
+    pub invalid: bool,
+    #[serde(default)]
+    pub invalid_reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GraphState {
     pub nodes: HashMap<u32, Node>,
@@ -292,6 +319,8 @@ pub struct GraphState {
     pub version: u32,
     #[serde(default)]
     pub contradicts: Vec<ContradictEdge>,
+    #[serde(default)]
+    pub because_of: Vec<BecauseOfEdge>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -458,6 +487,59 @@ fn extract_label_paths(label: &str) -> Vec<(String, &'static str)> {
     }
     out
 }
+
+/// One node in a `why` causal walk, plus the status of the edge leaving it
+/// toward the next node (None for the root cause).
+#[derive(Clone, Debug)]
+pub struct WhyStep {
+    pub id: u32,
+    pub label: String,
+    pub verification_status: VerificationStatus,
+    /// Inherited verification status of the outgoing `because_of` edge (the
+    /// causal claim). None for the terminal root cause (no outgoing edge).
+    pub causal_status: Option<VerificationStatus>,
+    /// True when the outgoing edge carries a passing inverse-test source.
+    pub edge_tested: bool,
+    /// True when the outgoing edge was refuted by a failing inverse test.
+    pub edge_invalid: bool,
+    /// IDs this node is currently contested with (unresolved contradicts edge).
+    pub contested_with: Vec<u32>,
+}
+
+/// Result of walking a `because_of` chain from a consequent to its root cause.
+#[derive(Clone, Debug)]
+pub struct WhyChain {
+    pub steps: Vec<WhyStep>,
+    pub root_id: u32,
+    /// True when the terminal root cause has a source-derived proven status.
+    pub root_verified: bool,
+}
+
+/// Outcome of `why_test`.
+#[derive(Clone, Debug)]
+pub struct WhyTestOutcome {
+    pub consequent: u32,
+    pub cause: u32,
+    pub passed: bool,
+    /// Resulting causal-claim status after the test (for a pass).
+    pub causal_status: VerificationStatus,
+}
+
+/// Outcome of `why_remove`.
+#[derive(Clone, Debug)]
+pub struct WhyRemoveOutcome {
+    pub consequent: u32,
+    /// Cause the removed edge pointed at.
+    pub cause: u32,
+    /// True when the removed edge had been refuted by a failing inverse test.
+    pub was_invalid: bool,
+}
+
+/// Soft-warn threshold (inclusive): resulting chain depth ≥ this emits a
+/// stderr warning. Hard-reject threshold (exclusive upper bound): resulting
+/// depth > MAX rejects. Per braim-because-of-edge.md Open Questions.
+const WHY_DEPTH_WARN: usize = 7;
+const WHY_DEPTH_MAX: usize = 10;
 
 impl Braim {
     pub fn parse_source(source: &str) -> (SourceType, String) {
@@ -755,6 +837,7 @@ impl Braim {
                 next_id: 1,
                 version: 0,
                 contradicts: Vec::new(),
+                because_of: Vec::new(),
             }
         };
 
@@ -1185,6 +1268,322 @@ impl Braim {
 
         self.flush()?;
         Ok(())
+    }
+
+    // ---- because_of (Five Whys) edges -------------------------------------
+
+    /// The single active (non-invalidated) outgoing causal edge for `id`, if any.
+    /// Cardinality is enforced at write time so there is at most one.
+    fn because_of_active_outgoing(&self, id: u32) -> Option<&BecauseOfEdge> {
+        self.state.because_of.iter().find(|e| e.from == id && !e.invalid)
+    }
+
+    /// Any outgoing causal edge for `id` (prefers an active one; falls back to
+    /// a refuted edge so `why` can still surface a failed link).
+    fn because_of_any_outgoing(&self, id: u32) -> Option<&BecauseOfEdge> {
+        self.because_of_active_outgoing(id)
+            .or_else(|| self.state.because_of.iter().find(|e| e.from == id))
+    }
+
+    /// Statements `id` is currently contested with (unresolved contradicts edge).
+    fn contested_partners(&self, id: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = self.state.contradicts.iter()
+            .filter(|e| !e.resolved && (e.from == id || e.to == id))
+            .map(|e| if e.from == id { e.to } else { e.from })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Inherited verification status of a causal edge (the causal claim).
+    /// Weakest endpoint caps the status below `proven`; when both endpoints are
+    /// proven the claim is `partial` until an inverse test promotes it to `proven`.
+    fn edge_causal_status(&self, edge: &BecauseOfEdge) -> VerificationStatus {
+        if edge.invalid {
+            return VerificationStatus::Invalid;
+        }
+        let s = |id: u32| self.state.nodes.get(&id)
+            .map(|n| n.verification_status)
+            .unwrap_or(VerificationStatus::Unproven);
+        let from_s = s(edge.from);
+        let to_s = s(edge.to);
+        let floor = if from_s.rank() <= to_s.rank() { from_s } else { to_s };
+        if floor.rank() < VerificationStatus::Proven.rank() {
+            floor
+        } else if edge.test_source.is_some() {
+            VerificationStatus::Proven
+        } else {
+            VerificationStatus::Partial
+        }
+    }
+
+    /// Longest active causal chain *below* `id` (edge count). Linear under the
+    /// single-cardinality rule; the visited set is a defensive cycle guard.
+    fn because_of_downstream_depth(&self, id: u32) -> usize {
+        let mut depth = 0;
+        let mut cur = id;
+        let mut visited = HashSet::new();
+        visited.insert(cur);
+        while let Some(e) = self.because_of_active_outgoing(cur) {
+            if !visited.insert(e.to) {
+                break;
+            }
+            depth += 1;
+            cur = e.to;
+        }
+        depth
+    }
+
+    /// Longest active causal chain *above* `id` (edge count). May branch, since
+    /// many consequents can share one cause.
+    fn because_of_upstream_depth(&self, id: u32, visited: &mut HashSet<u32>) -> usize {
+        if !visited.insert(id) {
+            return 0;
+        }
+        let mut best = 0;
+        for e in &self.state.because_of {
+            if e.invalid || e.to != id {
+                continue;
+            }
+            best = best.max(1 + self.because_of_upstream_depth(e.from, visited));
+        }
+        visited.remove(&id);
+        best
+    }
+
+    /// Active causal path from `start` down to `target` (inclusive), if one
+    /// exists. Used to render the offending loop for cycle detection.
+    fn because_of_path(&self, start: u32, target: u32) -> Option<Vec<u32>> {
+        let mut path = vec![start];
+        let mut cur = start;
+        let mut visited = HashSet::new();
+        visited.insert(cur);
+        loop {
+            if cur == target {
+                return Some(path);
+            }
+            match self.because_of_active_outgoing(cur) {
+                Some(e) if visited.insert(e.to) => {
+                    path.push(e.to);
+                    cur = e.to;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Add a `because_of` edge `consequent → cause`. Returns an optional
+    /// soft-warn message (non-fatal) when the resulting chain is deep.
+    pub fn why_add(
+        &mut self,
+        consequent: u32,
+        cause: u32,
+        source: Option<String>,
+    ) -> Result<Option<String>, String> {
+        if consequent == cause {
+            return Err("Error: a statement cannot be its own cause".to_string());
+        }
+        for &id in &[consequent, cause] {
+            let node = self.state.nodes.get(&id)
+                .ok_or(format!("Error: Statement ID {} not found", id))?;
+            if !node.node_type.is_statement_family() {
+                return Err(format!(
+                    "Error: because_of accepts only statement endpoints — node ID {} is a concept",
+                    id
+                ));
+            }
+        }
+        if let Some(src) = &source {
+            Self::validate_source_prefix(src)?;
+        }
+        if let Some(existing) = self.because_of_active_outgoing(consequent) {
+            let other = existing.to;
+            return Err(format!(
+                "Error: statement ID:{} already has a cause (ID:{}). \
+                 Use 'braim statement contradict {} <other_cause>' if causes compete, \
+                 or 'braim why-remove {}' to reassign it to a different cause.",
+                consequent, other, other, consequent
+            ));
+        }
+        // Cycle: adding consequent → cause closes a loop iff `cause` already
+        // reaches `consequent` via existing causal edges.
+        if let Some(path) = self.because_of_path(cause, consequent) {
+            let mut loop_ids = path;
+            loop_ids.push(cause);
+            let rendered = loop_ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            return Err(format!("Error: cycle detected: {}", rendered));
+        }
+        let mut up_visited = HashSet::new();
+        let depth = self.because_of_upstream_depth(consequent, &mut up_visited)
+            + 1
+            + self.because_of_downstream_depth(cause);
+        if depth > WHY_DEPTH_MAX {
+            return Err(format!(
+                "Error: chain depth limit reached ({} links, max {}). \
+                 Review the chain for stalling.",
+                depth, WHY_DEPTH_MAX
+            ));
+        }
+        let warning = if depth >= WHY_DEPTH_WARN {
+            Some(format!(
+                "chain depth >= {}, consider whether this is converging on a root cause",
+                WHY_DEPTH_WARN
+            ))
+        } else {
+            None
+        };
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.state.because_of.push(BecauseOfEdge {
+            from: consequent,
+            to: cause,
+            source,
+            created_at: now,
+            test_source: None,
+            invalid: false,
+            invalid_reason: None,
+        });
+        self.flush()?;
+        Ok(warning)
+    }
+
+    /// Walk the `because_of` chain from `start` to its root cause.
+    pub fn why_chain(&self, start: u32) -> Result<WhyChain, String> {
+        {
+            let node = self.state.nodes.get(&start)
+                .ok_or(format!("Error: Statement ID {} not found", start))?;
+            if !node.node_type.is_statement_family() {
+                return Err(format!(
+                    "Error: because_of accepts only statement endpoints — node ID {} is a concept",
+                    start
+                ));
+            }
+        }
+        let mut steps = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = start;
+        loop {
+            if !visited.insert(current) {
+                break; // defensive cycle guard
+            }
+            let node = match self.state.nodes.get(&current) {
+                Some(n) => n,
+                None => break,
+            };
+            let outgoing = self.because_of_any_outgoing(current).cloned();
+            let (causal_status, edge_tested, edge_invalid, next) = match &outgoing {
+                Some(edge) => (
+                    Some(self.edge_causal_status(edge)),
+                    edge.test_source.is_some(),
+                    edge.invalid,
+                    if edge.invalid { None } else { Some(edge.to) },
+                ),
+                None => (None, false, false, None),
+            };
+            steps.push(WhyStep {
+                id: current,
+                label: node.label.clone(),
+                verification_status: node.verification_status,
+                causal_status,
+                edge_tested,
+                edge_invalid,
+                contested_with: self.contested_partners(current),
+            });
+            match next {
+                Some(n) => current = n,
+                None => break,
+            }
+        }
+        let root_id = steps.last().map(|s| s.id).unwrap_or(start);
+        let root_verified = self.state.nodes.get(&root_id)
+            .map(|n| n.verification_status.rank() >= VerificationStatus::Proven.rank())
+            .unwrap_or(false);
+        Ok(WhyChain { steps, root_id, root_verified })
+    }
+
+    /// Record an inverse-test result on the active outgoing causal edge of
+    /// `consequent`. A pass logs a `test:` source (promoting a proven/proven
+    /// edge from partial → proven); a fail refutes the link without touching
+    /// the endpoint statements.
+    pub fn why_test(
+        &mut self,
+        consequent: u32,
+        passed: bool,
+        source: Option<String>,
+    ) -> Result<WhyTestOutcome, String> {
+        if let Some(src) = &source {
+            Self::validate_source_prefix(src)?;
+        }
+        let idx = self.state.because_of.iter()
+            .position(|e| e.from == consequent && !e.invalid)
+            .ok_or(format!(
+                "Error: statement ID:{} has no active because_of edge to test",
+                consequent
+            ))?;
+        let cause = self.state.because_of[idx].to;
+        if passed {
+            let src = source.unwrap_or_else(|| "test:inverse_test_passed".to_string());
+            self.state.because_of[idx].test_source = Some(src);
+        } else {
+            self.state.because_of[idx].invalid = true;
+            self.state.because_of[idx].invalid_reason = Some("inverse test failed".to_string());
+        }
+        let edge = self.state.because_of[idx].clone();
+        let causal_status = self.edge_causal_status(&edge);
+        self.flush()?;
+        Ok(WhyTestOutcome { consequent, cause, passed, causal_status })
+    }
+
+    /// Remove the outgoing `because_of` edge from `consequent`, freeing it to be
+    /// re-pointed at a different cause via `why_add` (chain reassignment).
+    /// Prefers the active edge; falls back to a refuted (invalid) one so a
+    /// failed link can be cleared before reassigning. Errors when the statement
+    /// has no outgoing causal edge.
+    pub fn why_remove(&mut self, consequent: u32) -> Result<WhyRemoveOutcome, String> {
+        // Prefer the active outgoing edge (the one cardinality enforces);
+        // fall back to a refuted edge so stale failed links can be cleared.
+        let idx = self.state.because_of.iter()
+            .position(|e| e.from == consequent && !e.invalid)
+            .or_else(|| self.state.because_of.iter().position(|e| e.from == consequent))
+            .ok_or(format!(
+                "Error: statement ID:{} has no because_of edge to remove",
+                consequent
+            ))?;
+        let removed = self.state.because_of.remove(idx);
+        self.flush()?;
+        Ok(WhyRemoveOutcome {
+            consequent,
+            cause: removed.to,
+            was_invalid: removed.invalid,
+        })
+    }
+
+    /// Mark every consequent above an invalidated cause as needing
+    /// re-investigation (metadata flag only — the causal chain is NOT
+    /// auto-invalidated, per braim-because-of-edge.tests.md §13).
+    fn flag_because_of_reinvestigation(&mut self, invalidated: u32) {
+        let mut visited = HashSet::new();
+        let mut stack = vec![invalidated];
+        while let Some(cur) = stack.pop() {
+            let parents: Vec<u32> = self.state.because_of.iter()
+                .filter(|e| !e.invalid && e.to == cur)
+                .map(|e| e.from)
+                .collect();
+            for p in parents {
+                if visited.insert(p) {
+                    if let Some(n) = self.state.nodes.get_mut(&p) {
+                        n.metadata.insert(
+                            "because_of_reinvestigate".to_string(),
+                            format!("cause {} invalidated", invalidated),
+                        );
+                    }
+                    stack.push(p);
+                }
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -1894,17 +2293,33 @@ impl Braim {
             return;
         }
 
-        let candidates: Vec<(u32, f64)> = self
-            .state
-            .nodes
-            .iter()
-            .filter(|(_, node)| {
-                node.status == NodeStatus::Active
-                    && node.depends_on.contains_key(&current)
-                    && !visited.contains(&node.id)
-            })
-            .map(|(_, node)| (node.id, node.depends_on[&current]))
-            .collect();
+        // Merge two edge sources into one candidate set (dedup by node, keeping
+        // the strongest weight): compositional depends_on (reversed: a node that
+        // references `current` as a dependency) and causal because_of (a
+        // consequent whose cause is `current`, so the walk runs cause →
+        // consequent, mirroring the dependency → dependent direction).
+        let mut candidate_w: HashMap<u32, f64> = HashMap::new();
+        for node in self.state.nodes.values() {
+            if node.status == NodeStatus::Active
+                && node.depends_on.contains_key(&current)
+                && !visited.contains(&node.id)
+            {
+                let w = node.depends_on[&current];
+                candidate_w.entry(node.id).and_modify(|e| if w > *e { *e = w }).or_insert(w);
+            }
+        }
+        // because_of is unweighted: an active causal link propagates at full
+        // strength (weight 1.0) so it never dilutes a multiplicative path.
+        for edge in &self.state.because_of {
+            if edge.invalid || edge.to != current || visited.contains(&edge.from) {
+                continue;
+            }
+            if self.state.nodes.get(&edge.from).map_or(true, |n| n.status != NodeStatus::Active) {
+                continue;
+            }
+            candidate_w.entry(edge.from).and_modify(|e| if 1.0 > *e { *e = 1.0 }).or_insert(1.0);
+        }
+        let candidates: Vec<(u32, f64)> = candidate_w.into_iter().collect();
 
         for (nid, edge_w) in candidates {
             visited.insert(nid);
@@ -2413,6 +2828,10 @@ impl Braim {
             }
         }
 
+        // because_of consequents above the invalidated cause are flagged for
+        // re-investigation but not auto-invalidated (tests.md §13).
+        self.flag_because_of_reinvestigation(statement_id);
+
         self.flush()?;
         Ok(cascade_ids)
     }
@@ -2796,6 +3215,186 @@ mod error_tests {
         let s: String = e.clone().into();
         assert_eq!(s, e.to_string());
         assert_eq!(GraphError::from("boom".to_string()), GraphError::Other("boom".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod because_of_tests {
+    use super::*;
+
+    fn temp_braim(tag: &str) -> Braim {
+        let dir = std::env::temp_dir().join(format!("braim_bo_test_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        Braim::new(dir.to_str().unwrap()).unwrap()
+    }
+
+    /// Two atomics (IDs 1,2) then `n` proven statements depending on them.
+    /// Returns the statement IDs in creation order.
+    fn seed(b: &mut Braim, n: usize) -> Vec<u32> {
+        b.add_concept("X: x", vec!["d".into()], vec!["doc:x.md".into()], None).unwrap();
+        b.add_concept("Y: y", vec!["d".into()], vec!["doc:y.md".into()], None).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let deps = HashMap::from([(1u32, 0.5), (2u32, 0.5)]);
+            let id = b.add_statement(
+                &format!("S{}: statement {}", i, i),
+                vec!["d".into(), "d".into()],
+                vec!["code:s.rs".into(), "doc:s.md".into()],
+                deps,
+                true,
+            ).unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn rejects_concept_endpoint() {
+        let mut b = temp_braim("concept");
+        let ids = seed(&mut b, 1);
+        // concept ID 1 is not a statement
+        let err = b.why_add(ids[0], 1, None).unwrap_err();
+        assert!(err.contains("only statement endpoints"), "{err}");
+    }
+
+    #[test]
+    fn enforces_single_cardinality() {
+        let mut b = temp_braim("card");
+        let ids = seed(&mut b, 3);
+        b.why_add(ids[0], ids[1], None).unwrap();
+        let err = b.why_add(ids[0], ids[2], None).unwrap_err();
+        assert!(err.contains("already has a cause"), "{err}");
+    }
+
+    #[test]
+    fn detects_cycle() {
+        let mut b = temp_braim("cycle");
+        let ids = seed(&mut b, 3);
+        b.why_add(ids[0], ids[1], None).unwrap();
+        b.why_add(ids[1], ids[2], None).unwrap();
+        let err = b.why_add(ids[2], ids[0], None).unwrap_err();
+        assert!(err.starts_with("Error: cycle detected:"), "{err}");
+    }
+
+    #[test]
+    fn depth_warns_then_rejects() {
+        let mut b = temp_braim("depth");
+        let ids = seed(&mut b, 12);
+        // Chain ids[0]->ids[1]->...; depth 7 (7th link) warns, depth 11 rejects.
+        for i in 0..6 {
+            assert!(b.why_add(ids[i], ids[i + 1], None).unwrap().is_none());
+        }
+        // 7th link → depth 7 → warning present
+        assert!(b.why_add(ids[6], ids[7], None).unwrap().is_some());
+        for i in 7..10 {
+            assert!(b.why_add(ids[i], ids[i + 1], None).unwrap().is_some());
+        }
+        // 11th link → depth 11 → reject
+        let err = b.why_add(ids[10], ids[11], None).unwrap_err();
+        assert!(err.contains("chain depth limit reached"), "{err}");
+    }
+
+    #[test]
+    fn causal_status_inherits_and_promotes() {
+        let mut b = temp_braim("inherit");
+        let ids = seed(&mut b, 2); // both proven
+        b.why_add(ids[0], ids[1], None).unwrap();
+        // both proven, untested → partial
+        let chain = b.why_chain(ids[0]).unwrap();
+        assert_eq!(chain.steps[0].causal_status, Some(VerificationStatus::Partial));
+        assert!(chain.root_verified);
+        // inverse test pass → proven
+        b.why_test(ids[0], true, Some("test:ablation.txt".into())).unwrap();
+        let chain = b.why_chain(ids[0]).unwrap();
+        assert_eq!(chain.steps[0].causal_status, Some(VerificationStatus::Proven));
+        assert!(chain.steps[0].edge_tested);
+    }
+
+    #[test]
+    fn inverse_test_fail_refutes_link_not_statements() {
+        let mut b = temp_braim("fail");
+        let ids = seed(&mut b, 2);
+        b.why_add(ids[0], ids[1], None).unwrap();
+        b.why_test(ids[0], false, None).unwrap();
+        // endpoint statements stay proven
+        assert_eq!(b.state.nodes[&ids[0]].verification_status, VerificationStatus::Proven);
+        assert_eq!(b.state.nodes[&ids[1]].verification_status, VerificationStatus::Proven);
+        // edge is invalid
+        let chain = b.why_chain(ids[0]).unwrap();
+        assert!(chain.steps[0].edge_invalid);
+        assert_eq!(chain.steps[0].causal_status, Some(VerificationStatus::Invalid));
+    }
+
+    #[test]
+    fn invalidating_cause_flags_ancestors_without_invalidating() {
+        let mut b = temp_braim("cascade");
+        let ids = seed(&mut b, 4); // A B C D
+        b.why_add(ids[0], ids[1], None).unwrap();
+        b.why_add(ids[1], ids[2], None).unwrap();
+        b.why_add(ids[2], ids[3], None).unwrap();
+        b.invalidate_statement(ids[3], "disproven").unwrap();
+        for anc in &ids[0..3] {
+            let n = &b.state.nodes[anc];
+            assert_ne!(n.verification_status, VerificationStatus::Invalid, "ancestor {anc} wrongly invalidated");
+            assert!(n.metadata.contains_key("because_of_reinvestigate"), "ancestor {anc} not flagged");
+        }
+    }
+
+    #[test]
+    fn traversal_isolated_from_depends_on() {
+        let mut b = temp_braim("iso");
+        let ids = seed(&mut b, 2);
+        b.why_add(ids[0], ids[1], None).unwrap();
+        // why follows because_of only: chain is exactly [consequent, cause]
+        let chain = b.why_chain(ids[0]).unwrap();
+        let walked: Vec<u32> = chain.steps.iter().map(|s| s.id).collect();
+        assert_eq!(walked, vec![ids[0], ids[1]]);
+    }
+
+    #[test]
+    fn why_remove_enables_reassignment() {
+        let mut b = temp_braim("remove");
+        let ids = seed(&mut b, 3); // A B C
+        b.why_add(ids[0], ids[1], None).unwrap();
+        // cardinality blocks re-pointing while the edge exists
+        assert!(b.why_add(ids[0], ids[2], None).is_err());
+        // remove the current cause, then reassign to a different one
+        let outcome = b.why_remove(ids[0]).unwrap();
+        assert_eq!(outcome.cause, ids[1]);
+        assert!(!outcome.was_invalid);
+        b.why_add(ids[0], ids[2], None).unwrap();
+        let chain = b.why_chain(ids[0]).unwrap();
+        assert_eq!(chain.steps.iter().map(|s| s.id).collect::<Vec<_>>(), vec![ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn perspective_traverses_because_of_between_statements() {
+        let mut b = temp_braim("persp_bo");
+        let ids = seed(&mut b, 3); // statements A,B,C ; concepts 1,2
+        // chain A → B → C (A consequent, C root cause)
+        b.why_add(ids[0], ids[1], None).unwrap();
+        b.why_add(ids[1], ids[2], None).unwrap();
+        // proximity from the cause (C) reaches the consequent (A) via because_of,
+        // running cause → consequent (mirrors dependency → dependent).
+        let paths = b.proximity(&ids[2].to_string(), &ids[0].to_string()).unwrap();
+        assert!(!paths.is_empty(), "because_of chain should be traversable cause → consequent");
+        assert_eq!(paths[0].path, vec![ids[2], ids[1], ids[0]]);
+        // a refuted link is not traversed
+        b.why_test(ids[1], false, None).unwrap(); // refute B → C
+        let broken = b.proximity(&ids[2].to_string(), &ids[0].to_string()).unwrap();
+        assert!(broken.is_empty(), "refuted causal link must not be traversed");
+    }
+
+    #[test]
+    fn why_remove_clears_refuted_edge() {
+        let mut b = temp_braim("remove_refuted");
+        let ids = seed(&mut b, 2);
+        b.why_add(ids[0], ids[1], None).unwrap();
+        b.why_test(ids[0], false, None).unwrap(); // refute the link
+        let outcome = b.why_remove(ids[0]).unwrap();
+        assert!(outcome.was_invalid);
+        // no outgoing edge remains
+        assert!(b.why_remove(ids[0]).is_err());
     }
 }
 

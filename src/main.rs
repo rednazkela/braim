@@ -158,6 +158,22 @@ CONTRADICTION RESOLUTION (when sources disagree):\n\
   Contested statements:\n\
     • Cannot promote past 'contested' until resolved\n\
     • Surface via 'braim query <term> --include-contested'\n\n\
+CAUSAL CHAINS (Five Whys):\n\
+  Link a statement to its cause (consequent → cause), directional and unweighted:\n\
+    braim why-add <consequent> --because <cause> [--source \"narrative:...\"]\n\
+  Walk the chain to its root cause:\n\
+    braim why <statement_id>\n\
+  Validate a link with the classical inverse test:\n\
+    braim why-test <id>          # cause confirmed (PASS)\n\
+    braim why-test <id> --fail   # consequent persists without cause (refutes the link)\n\
+  Reassign a cause (cardinality keeps one per statement — remove, then re-add):\n\
+    braim why-remove <id>        # detach the current cause\n\
+    braim why-add <id> --because <new_cause>\n\
+  Rules: statement endpoints only; one outgoing cause per statement (competing\n\
+  causes go through contradicts); cycles rejected; depth >= 7 warns, > 10 rejects.\n\
+  perspective/proximity traverse because_of (cause -> consequent, full weight)\n\
+  alongside depends_on; query stays depends_on-only. Concept-to-concept paths are\n\
+  unaffected since because_of endpoints are statements.\n\n\
 FOR AGENTS:\n\
   This help text is the authoritative usage contract. Re-read it after any prompt-context\n\
   reset or when uncertain. Constraints here are structural; constraints in your prompt are\n\
@@ -228,12 +244,12 @@ enum Commands {
         #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (requires --features embeddings)")]
         semantic: bool,
     },
-    #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.")]
+    #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.\n\nTraverses both depends_on (compositional, weighted) and because_of (causal,\nunweighted — followed cause → consequent at full weight, refuted links skipped).\nbecause_of endpoints are statements, so concept-to-concept paths are unaffected;\npass statement IDs to follow a causal chain.")]
     Proximity {
         term_a: String,
         term_b: String,
     },
-    #[command(about = "Show directed paths from one concept to another", long_about = "Perspective: Show how concept A influences/leads to concept B (directed).\n\nExamples:\n  braim perspective Payment Account\n  braim perspective Invoice PaidStatus\n\nUnlike Query (bidirectional), Perspective only shows paths in A→B direction.\nUses multiplicative weight propagation: relationship_strength = product of edge weights along path.")]
+    #[command(about = "Show directed paths from one concept to another", long_about = "Perspective: Show how concept A influences/leads to concept B (directed).\n\nExamples:\n  braim perspective Payment Account\n  braim perspective Invoice PaidStatus\n\nUnlike Query (bidirectional), Perspective only shows paths in A→B direction.\nUses multiplicative weight propagation: relationship_strength = product of edge weights along path.\n\nTraverses both depends_on and because_of (causal) edges. because_of is followed\ncause → consequent at full weight (1.0, unweighted); refuted causal links are\nskipped. Since because_of endpoints are statements, concept-to-concept paths are\nunchanged — pass statement IDs to trace a causal chain. (query stays depends_on-only.)")]
     Perspective {
         term_a: String,
         term_b: String,
@@ -298,6 +314,38 @@ enum Commands {
         set: Option<String>,
         #[arg(long, help = "Increment a numeric key (e.g. recurrence)")]
         inc: Option<String>,
+    },
+
+    #[command(name = "why-add", about = "Add a because_of causal edge (Five Whys)", long_about = "Why Add: record that one statement occurs because_of another (consequent → cause).\n\nUsage:\n  braim why-add 42 --because 17\n  braim why-add 42 --because 17 --source \"narrative:investigation_2026-06-19\"\n\nRules:\n  • Both endpoints must be STATEMENTS (not concepts).\n  • One outgoing because_of per statement (single cardinality). If a second cause\n    is suspected, model the competition with 'braim statement contradict'.\n  • Unweighted: each link asserts the principal cause.\n  • Cycles are rejected. Chain depth >= 7 warns; > 10 is rejected.\n  • --source must carry a typed prefix (code:|doc:|...|narrative:).\n\nThis edge is isolated from depends_on: perspective/proximity/query are unaffected.\nWalk the chain with 'braim why <id>'; validate a link with 'braim why-test <id>'.")]
+    WhyAdd {
+        #[arg(help = "Consequent statement ID (the effect)")]
+        consequent: u32,
+        #[arg(long = "because", help = "Cause statement ID (why the consequent occurs)")]
+        because: u32,
+        #[arg(long, help = "Optional typed source for the causal hypothesis (e.g. narrative:...)")]
+        source: Option<String>,
+    },
+
+    #[command(about = "Walk a because_of chain to its root cause (Five Whys)", long_about = "Why: walk the because_of chain from a statement down to its root cause.\n\nUsage:\n  braim why 42\n\nOutput: the ordered chain (consequent → ... → root cause). Each link shows the\ninherited causal-claim status. The terminal statement is marked root_cause; if it\nis unproven it is flagged a candidate root cause needing verification. Contested\nlinks (an unresolved contradicts edge on a chain member) are flagged but do not\nstop the walk. Follows because_of only — never depends_on.")]
+    Why {
+        #[arg(help = "Statement ID to walk from")]
+        id: u32,
+    },
+
+    #[command(name = "why-test", about = "Record an inverse-test result on a because_of edge", long_about = "Why Test: record the classical Five-Whys inverse test on a statement's causal edge.\n\nThe inverse test asks: does the consequent stop occurring when the cause is absent?\n\nUsage:\n  braim why-test 42                                    # pass (cause confirmed)\n  braim why-test 42 --source \"test:ablation_run.txt\"   # pass, with explicit test source\n  braim why-test 42 --fail                             # fail (consequent persists without cause)\n\nPass: logs a test: source on the edge; a both-endpoints-proven link is promoted\n      from partial to proven.\nFail: refutes the causal LINK (marked invalid) without invalidating either\n      statement; the consequent is suggested for re-investigation.")]
+    WhyTest {
+        #[arg(help = "Consequent statement ID whose causal edge is tested")]
+        id: u32,
+        #[arg(long, help = "Record a FAILING inverse test (consequent persists without the cause)")]
+        fail: bool,
+        #[arg(long, help = "Optional typed test source (default: test:inverse_test_passed)")]
+        source: Option<String>,
+    },
+
+    #[command(name = "why-remove", about = "Remove a statement's because_of edge to reassign its cause", long_about = "Why Remove: detach a statement's outgoing because_of edge so it can be re-pointed at a different cause.\n\nThe single-cardinality rule means a statement keeps exactly one cause; why-add\nrejects a second. To REASSIGN a cause, remove the current edge first, then add\nthe new one:\n  braim why-remove 42            # drop 42's current cause edge\n  braim why-add 42 --because 73  # point 42 at a new cause\n\nIt removes the active outgoing edge; if there is none but a refuted (failed\ninverse-test) edge remains, it clears that instead. Errors when the statement\nhas no outgoing causal edge. Only the link is removed — both statements and the\nrest of the chain stay intact.")]
+    WhyRemove {
+        #[arg(help = "Consequent statement ID whose cause edge is removed")]
+        id: u32,
     },
 }
 
@@ -1676,6 +1724,90 @@ fn main() {
                     } else {
                         println!("✓ Migrated {} node(s) to claim/fact/invalid_statement", changed);
                     }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::WhyAdd { consequent, because, source } => {
+            match braim.why_add(consequent, because, source) {
+                Ok(warning) => {
+                    println!("✓ because_of edge recorded: ID:{} → ID:{}", consequent, because);
+                    if let Some(w) = warning {
+                        eprintln!("⚠ {}", w);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Why { id } => {
+            match braim.why_chain(id) {
+                Ok(chain) => {
+                    println!("Why ID:{} — because_of chain to root cause:\n", id);
+                    let last = chain.steps.len().saturating_sub(1);
+                    for (i, step) in chain.steps.iter().enumerate() {
+                        let label: String = step.label.chars().take(72).collect();
+                        let is_root = i == last;
+                        let connector = if i == 0 { "  " } else { "  ↳ because " };
+                        print!("{}ID:{} [{}] {}", connector, step.id, step.verification_status.label(), label);
+                        if is_root {
+                            if step.edge_invalid {
+                                print!("   ⟵ causal link refuted — re-investigate");
+                            } else if chain.root_verified {
+                                print!("   ⟵ root_cause");
+                            } else {
+                                print!("   ⟵ candidate root cause, unverified (add sources or extend the chain)");
+                            }
+                        }
+                        println!();
+                        if let Some(cs) = step.causal_status {
+                            let tag = if step.edge_invalid {
+                                "  refuted by inverse test".to_string()
+                            } else if step.edge_tested {
+                                "  inverse-tested".to_string()
+                            } else {
+                                String::new()
+                            };
+                            println!("       causal claim: {} {}{}", cs.badge(), cs.label(), tag);
+                        }
+                        if !step.contested_with.is_empty() {
+                            let ids = step.contested_with.iter()
+                                .map(|i| format!("ID:{}", i))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!("       ⚠ contested with {} — see contradicts edge", ids);
+                        }
+                    }
+                    let verdict = if chain.root_verified { "verified" } else { "unverified" };
+                    println!("\nroot cause: ID:{} ({})", chain.root_id, verdict);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::WhyTest { id, fail, source } => {
+            match braim.why_test(id, !fail, source) {
+                Ok(outcome) => {
+                    if outcome.passed {
+                        println!("✓ Inverse test PASSED for ID:{} → ID:{}", outcome.consequent, outcome.cause);
+                        println!("  causal claim: {} {}", outcome.causal_status.badge(), outcome.causal_status.label());
+                    } else {
+                        println!("✗ Inverse test FAILED for ID:{} → ID:{}", outcome.consequent, outcome.cause);
+                        println!("  causal link marked invalid; statements unchanged.");
+                        println!("  → re-investigate the cause of ID:{}", outcome.consequent);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::WhyRemove { id } => {
+            match braim.why_remove(id) {
+                Ok(outcome) => {
+                    let kind = if outcome.was_invalid { " (refuted)" } else { "" };
+                    println!("✓ removed because_of edge ID:{} → ID:{}{}", outcome.consequent, outcome.cause, kind);
+                    println!("  ID:{} now has no cause — reassign with: braim why-add {} --because <cause_id>", outcome.consequent, outcome.consequent);
                     Ok(())
                 }
                 Err(e) => Err(e),

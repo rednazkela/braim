@@ -856,21 +856,204 @@ FAIL signal:
     claim), or prose hiding an inference inside an @[]
 
 ═══════════════════════════════════════════════════════════════
+SCENARIO 27 — root-cause trace (causal chain creation + replay)
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim why-add` — the because_of edge: a directional, unweighted causal
+    link between two STATEMENTS (consequent → cause), distinct from
+    compositional depends_on.
+  - `braim why` — walk the chain from a symptom statement to its root cause;
+    ordered output, terminal entry marked root_cause (or candidate root cause
+    when the leaf is unproven).
+  - because_of accepts statement endpoints only; one outgoing cause per
+    statement.
+
+Document anchors:
+  The corpus supports a four-step chain (lines 20-24): a borrowing block ←
+  more than ten dollars in unpaid Late Fees ← books returned past the
+  three-week loan period ← the three-week loan-period rule. Concepts such as
+  Borrowing Privileges, Late Fee, Loan already exist in the cumulative graph.
+
+PASS signal:
+  - At least three statements created for the trace steps, each a statement
+    node grounded in the corpus's documented policy (not invented).
+  - because_of edges recorded linking each step to the step that explains it
+    (consequent → cause) via `braim why-add`; verifiable in current.json
+    (state.because_of) or by `braim why`.
+  - `braim why <complaint_id>` replays the steps in order and ends at a
+    terminal entry it labels root_cause / candidate root cause; the bottom
+    entry corresponds to the loan-period / unpaid-balance policy.
+  - Links are unweighted and both endpoints of every link are statements.
+
+FAIL signal:
+  - Causal steps encoded as weighted depends_on edges instead of because_of.
+  - because_of attempted between concepts (braim rejects with "only statement
+    endpoints" — record the retry).
+  - No replay run, or `braim why` returns a single node because links were
+    never created.
+  - A second outgoing cause attached to one entry (braim rejects single
+    cardinality — record the error).
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 28 — competing cause discipline + inverse-test confirmation
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - single-cardinality on because_of: a statement has at most one outgoing
+    cause; competing causes are modeled with `braim statement contradict`
+    between the candidate-cause statements, NOT a second because_of edge.
+  - `braim why-test <id>` (PASS): records a test: source on the edge and flags
+    the link inverse-tested.
+
+Document anchors:
+  Continues scenario 27's chain. The competing explanation ("the card had
+  expired") is a second candidate cause for the same borrowing-block entry.
+  The confirmation ("cleared the balance, block disappeared") is the classical
+  inverse test on the block ← unpaid-balance link.
+
+PASS signal:
+  - The agent recognized that a second cause on the same effect is rejected —
+    transcript shows braim's "already has a cause" cardinality error, or the
+    agent routes around it without forcing a second edge.
+  - The competing explanation is recorded as a `braim statement contradict`
+    between the two candidate-cause statements (both move to contested), per
+    the path braim's error points to.
+  - `braim why-test <effect_id>` was run as a PASS: the original because_of
+    edge carries a test: source and `braim why` flags that link inverse-tested.
+
+  Note on the displayed causal status: contradicting the cause statement moves
+  it to contested, and a contested endpoint caps the edge's causal claim at
+  contested (weakest-endpoint rule) — so the link will NOT read ✓✓ proven while
+  the competition is unresolved. That capping is correct behavior, not a
+  failure; do not require a proven badge here. Full promotion applies only once
+  the contradiction is resolved (a contested endpoint cannot promote).
+
+FAIL signal:
+  - Two outgoing because_of edges from the same effect statement (cardinality
+    bypassed — a braim regression if present).
+  - Competing cause attached as another causal edge instead of via contradict.
+  - No inverse test recorded, or recorded as a plain source on a statement
+    rather than on the edge via `braim why-test`.
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 29 — invalidation cascade flag, refuted link, traversal isolation
+═══════════════════════════════════════════════════════════════
+
+Three findings, mapping to three distinct because_of behaviors. Note the two
+DIFFERENT refutation mechanics — they are not the same command:
+
+Finding (1) — node invalidation flags the chain above it:
+  - `braim statement invalidate <root_id>` on the bottom (root-cause) entry.
+  - Every consequent ABOVE it in the because_of chain is flagged with metadata
+    `because_of_reinvestigate` (visible via `braim meta <id>`) but is NOT
+    auto-invalidated and is NOT deleted. This is the cause-node-invalidation
+    cascade, distinct from finding (2).
+
+Finding (2) — failed inverse test refutes a LINK, not its statements:
+  - `braim why-test <consequent_id> --fail` on a middle link.
+  - The edge goes invalid in state.because_of (invalid=true, reason "inverse
+    test failed"); BOTH endpoint statements stay valid (status unchanged, not
+    deleted). braim prints a re-investigation suggestion for the consequent.
+  - NOTE: a failed inverse test does NOT write the because_of_reinvestigate
+    metadata — that flag belongs to finding (1)'s node-invalidation path only.
+    Do not require the metadata flag here.
+
+Finding (3) — concept-level query unaffected by causal edges:
+  - `braim perspective` / `braim proximity` between the two CONCEPTS the top
+    and bottom entries depend on return no causal trace. NOTE: perspective and
+    proximity DO traverse because_of now (cause → consequent), but only between
+    statement endpoints; because_of never attaches to concepts, so a concept-to-
+    concept query surfaces no causal path. The correct reason is "the trace
+    lives on statements," NOT "perspective ignores because_of."
+
+Document anchors:
+  Continues the cumulative chain from 27-28 (block ← unpaid balance ← overdue
+  returns ← loan-period rule). Run finding (1) before (2): invalidating the
+  root first lets the upward flag reach all ancestors over still-active edges;
+  refuting a link first would break the chain the flag walks. The two concepts
+  for (3) are those the top and bottom statements are built from (e.g. Borrowing
+  Privileges and Loan).
+
+PASS signal:
+  - (1) Root entry invalidated; `braim meta` on the entries above it shows
+    `because_of_reinvestigate`; none of those ancestors is invalid (status
+    unchanged) and none was deleted.
+  - (2) `braim why-test <id> --fail` run; the edge is invalid in
+    state.because_of (reason "inverse test failed"); both endpoint statements
+    remain valid; the agent reports the tool left them intact, did not delete
+    them.
+  - (3) `braim perspective` and `braim proximity` between the two chosen
+    CONCEPTS return no causal trace (a depends_on relationship or a registered
+    gap); the agent reports the trace is absent from the concept-to-concept
+    results. A conclusion that attributes this to "endpoints are statements" is
+    ideal; a blanket "perspective ignores because_of" is now inaccurate but is
+    not by itself a FAIL of findings (1) and (2).
+
+FAIL signal:
+  - (1) Ancestors auto-invalidated or deleted instead of flagged; or no flag
+    written.
+  - (2) The failed inverse test invalidates/deletes the endpoint statements
+    (it must refute only the link); or the failure was recorded by deleting the
+    edge/statements instead of `braim why-test --fail`.
+  - (3) The two CHOSEN endpoints are concepts yet a causal path appears between
+    them (would indicate because_of wrongly attached to concepts).
+  - Either refutation done with the wrong mechanic (e.g. `statement invalidate`
+    used where a failed inverse test was asked for, or vice versa).
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 30 — perspective/proximity traverse because_of (statement endpoints)
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim perspective` and `braim proximity` now traverse because_of edges
+    (cause → consequent) at full weight, alongside depends_on. A causal chain
+    between statement entries is reachable through the ordinary directed and
+    shortest connection views — NOT only through `braim why`.
+  - Direction: the walk runs cause → consequent, so the path is requested FROM
+    the deeper entry (cause) TO the surface entry (consequent).
+
+Document anchors:
+  Continues the cumulative chain. Surface entry = the borrowing-block complaint;
+  an entry two steps deeper = the run-up-balance / overdue-returns entry. The
+  intact links (block ← unpaid balance ← overdue returns) connect them even
+  though the lowest link to the loan-period rule was refuted earlier.
+
+PASS signal:
+  - The agent identifies the surface complaint entry and an entry two steps
+    deeper (e.g. via `braim why` or node inspection).
+  - `braim perspective <deeper> <surface>` AND `braim proximity <deeper>
+    <surface>` BOTH return a path (not "no path"); proximity's path tracks the
+    recorded because_of links in order (deeper → middle → surface).
+  - The agent reports the returned connection matches the explanation steps.
+
+FAIL signal:
+  - perspective/proximity return no path between the two statement entries
+    (because_of not wired into path-finding — a regression).
+  - The agent falls back to `braim why` instead of the directed/shortest
+    connection views the task asked for.
+  - The agent requests the path surface → deeper (against the cause → consequent
+    direction), gets nothing, and reports failure without noting directionality.
+
+═══════════════════════════════════════════════════════════════
 SCORING
 ═══════════════════════════════════════════════════════════════
 
 Each scenario yields a single PASS or FAIL based on its own oracle row.
-The suite is 26 scenarios: 01-20 cover braim CLI behavior and anti-pattern
+The suite is 30 scenarios: 01-20 cover braim CLI behavior and anti-pattern
 discipline; 21-23 cover the agent-integration policies in policies/; 24-26
 cover the memory evidence-discipline traits (policies/memory_braim_traits.md),
-with 26 scored against the saved reply text.
+with 26 scored against the saved reply text; 27-30 cover the because_of causal
+edge and the Five Whys commands (why-add / why / why-test / why-remove) plus
+its traversal in perspective / proximity.
 
-  21 or more PASS -> braim end-to-end behavior + anti-pattern discipline +
-                     agent-integration policies + evidence discipline verified
-  16 to 20 PASS  -> partial regression; note which scenario rows failed
-  fewer than 16  -> base behavior, anti-pattern detection, or policy
-                    enforcement is broken; investigate the failing oracle rows
-                    first before further scenarios are run
+  25 or more PASS -> braim end-to-end behavior + anti-pattern discipline +
+                     agent-integration policies + evidence discipline +
+                     causal-edge behavior verified
+  19 to 24 PASS  -> partial regression; note which scenario rows failed
+  fewer than 19  -> base behavior, anti-pattern detection, policy enforcement,
+                    or causal-edge handling is broken; investigate the failing
+                    oracle rows first before further scenarios are run
 
 Optional weighting: scenarios 09, 11, 14 carry higher signal because the
 underlying violations show up most often in real-world graphs. Scenarios
@@ -889,3 +1072,15 @@ fails on pseudo-compounds or unvalidated inference, 26 fails on unmarked
 claims, uncited facts, paraphrased figures, or unpaired hedge vocabulary.
 24-26 require policies/memory_braim_traits.md and corpus_appendix.txt; 26
 additionally requires the agent's reply saved verbatim to results_26.txt.
+Scenarios 27-30 carry high signal for the because_of causal edge — 27 fails if
+causal steps are encoded as weighted depends_on rather than because_of links,
+or the chain never replays via `braim why`; 28 fails if a second cause is
+forced onto one effect instead of routing competing causes through contradict,
+or the inverse test is not recorded on the edge via `braim why-test`; 29 fails
+if a failed inverse test invalidates the endpoint statements (it must refute
+only the link), auto-invalidates ancestors instead of flagging them, or a
+causal path appears between two CONCEPTS (because_of attaches to statements,
+not concepts); 30 fails if perspective/proximity return no path between two
+statement entries a because_of chain connects (causal traversal not wired into
+path-finding). 27-30 build on the cumulative graph and run in order
+(27 → 28 → 29 → 30).
