@@ -338,11 +338,35 @@ pub struct PathInfo {
     pub domains: Vec<String>,
 }
 
+/// A `because_of` edge surfaced by audit, with both endpoint labels resolved
+/// for display. Used for refuted-link and untested-link findings.
+#[derive(Clone, Debug)]
+pub struct CausalEdgeInfo {
+    pub from: u32,
+    pub from_label: String,
+    pub to: u32,
+    pub to_label: String,
+    /// invalid_reason for a refuted link; None for an untested link.
+    pub reason: Option<String>,
+}
+
 pub struct AuditReport {
     pub orphans: Vec<Node>,
     pub pending: Vec<Node>,
     pub gaps: Vec<GapRecord>,
     pub deprecated_referenced: Vec<Node>,
+    /// because_of edges refuted by a failing inverse test (`why-test --fail`):
+    /// unfinished investigations left in the graph.
+    pub refuted_causal_links: Vec<CausalEdgeInfo>,
+    /// Statements carrying the `because_of_reinvestigate` metadata flag because
+    /// a cause below them was invalidated — they need a fresh look.
+    pub reinvestigate_flagged: Vec<Node>,
+    /// Active because_of edges with no inverse-test source: unvalidated causal
+    /// hypotheses (Five Whys discipline says links should be inverse-tested).
+    pub untested_causal_links: Vec<CausalEdgeInfo>,
+    /// Terminal root-cause statements of a because_of chain whose verification
+    /// is below `proven`: chains that bottom out without solid evidence.
+    pub unverified_roots: Vec<Node>,
 }
 
 /// A single candidate source returned by `verify_suggest`.
@@ -2449,6 +2473,10 @@ impl Braim {
         let mut orphans = Vec::new();
         let mut pending = Vec::new();
         let mut deprecated_referenced = Vec::new();
+        let mut refuted_causal_links = Vec::new();
+        let mut reinvestigate_flagged = Vec::new();
+        let mut untested_causal_links = Vec::new();
+        let mut unverified_roots = Vec::new();
 
         for node in self.state.nodes.values() {
             if node.status == NodeStatus::Active
@@ -2463,13 +2491,76 @@ impl Braim {
             if node.status == NodeStatus::Deprecated && referenced.contains(&node.id) {
                 deprecated_referenced.push(node.clone());
             }
+            // Statements flagged for re-investigation after a cause below them
+            // was invalidated (flag_because_of_reinvestigation).
+            if node.metadata.contains_key("because_of_reinvestigate") {
+                reinvestigate_flagged.push(node.clone());
+            }
         }
+
+        // because_of-derived findings. label() resolves an endpoint id to a
+        // short label for display (falls back to the bare id when missing).
+        let label = |id: u32| self.state.nodes.get(&id)
+            .map(|n| n.label.clone())
+            .unwrap_or_else(|| format!("ID:{}", id));
+
+        // Statements that are the cause end (`to`) of some active edge — i.e.
+        // they sit inside a chain — used to find terminal roots below.
+        let mut is_cause_in_chain: HashSet<u32> = HashSet::new();
+        let mut has_active_outgoing: HashSet<u32> = HashSet::new();
+        for edge in &self.state.because_of {
+            if edge.invalid {
+                refuted_causal_links.push(CausalEdgeInfo {
+                    from: edge.from,
+                    from_label: label(edge.from),
+                    to: edge.to,
+                    to_label: label(edge.to),
+                    reason: edge.invalid_reason.clone(),
+                });
+                continue;
+            }
+            // active edge
+            is_cause_in_chain.insert(edge.to);
+            has_active_outgoing.insert(edge.from);
+            if edge.test_source.is_none() {
+                untested_causal_links.push(CausalEdgeInfo {
+                    from: edge.from,
+                    from_label: label(edge.from),
+                    to: edge.to,
+                    to_label: label(edge.to),
+                    reason: None,
+                });
+            }
+        }
+
+        // Terminal root cause = cause-in-a-chain with no active outgoing edge of
+        // its own; flag when its verification is below `proven`.
+        for &id in &is_cause_in_chain {
+            if has_active_outgoing.contains(&id) {
+                continue;
+            }
+            if let Some(node) = self.state.nodes.get(&id) {
+                if node.verification_status.rank() < VerificationStatus::Proven.rank() {
+                    unverified_roots.push(node.clone());
+                }
+            }
+        }
+
+        // Deterministic ordering (HashMap/HashSet iteration is unordered).
+        refuted_causal_links.sort_by_key(|e| (e.from, e.to));
+        untested_causal_links.sort_by_key(|e| (e.from, e.to));
+        reinvestigate_flagged.sort_by_key(|n| n.id);
+        unverified_roots.sort_by_key(|n| n.id);
 
         AuditReport {
             orphans,
             pending,
             gaps: self.state.gaps.clone(),
             deprecated_referenced,
+            refuted_causal_links,
+            reinvestigate_flagged,
+            untested_causal_links,
+            unverified_roots,
         }
     }
 
@@ -3365,6 +3456,43 @@ mod because_of_tests {
         b.why_add(ids[0], ids[2], None).unwrap();
         let chain = b.why_chain(ids[0]).unwrap();
         assert_eq!(chain.steps.iter().map(|s| s.id).collect::<Vec<_>>(), vec![ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn audit_surfaces_because_of_findings() {
+        let mut b = temp_braim("audit_bo");
+        let ids = seed(&mut b, 4); // A B C D (all proven via code+doc seed sources)
+        // chain A → B → C → D
+        b.why_add(ids[0], ids[1], None).unwrap();
+        b.why_add(ids[1], ids[2], None).unwrap();
+        b.why_add(ids[2], ids[3], None).unwrap();
+
+        // baseline: all three links untested, root D proven (not unverified)
+        let r = b.audit();
+        assert_eq!(r.untested_causal_links.len(), 3);
+        assert!(r.refuted_causal_links.is_empty());
+        assert!(r.reinvestigate_flagged.is_empty());
+        assert!(r.unverified_roots.is_empty(), "proven root D must not be flagged");
+
+        // pass an inverse test on A→B → one fewer untested link
+        b.why_test(ids[0], true, Some("test:t.txt".into())).unwrap();
+        // invalidate root D first → flag walks up the still-active chain (A,B,C)
+        b.invalidate_statement(ids[3], "disproven").unwrap();
+        // then fail the inverse test on B→C → one refuted link
+        b.why_test(ids[1], false, None).unwrap();
+
+        let r = b.audit();
+        // refuted: B→C
+        assert_eq!(r.refuted_causal_links.len(), 1);
+        assert_eq!((r.refuted_causal_links[0].from, r.refuted_causal_links[0].to), (ids[1], ids[2]));
+        // untested active links remaining: only C→D (A→B passed, B→C now refuted/inactive)
+        assert_eq!(r.untested_causal_links.len(), 1);
+        assert_eq!((r.untested_causal_links[0].from, r.untested_causal_links[0].to), (ids[2], ids[3]));
+        // reinvestigate flags on A, B, C (ancestors of D)
+        let flagged: Vec<u32> = r.reinvestigate_flagged.iter().map(|n| n.id).collect();
+        assert_eq!(flagged, vec![ids[0], ids[1], ids[2]]);
+        // unverified root: D is now invalid (< proven) and still the cause end of C→D
+        assert!(r.unverified_roots.iter().any(|n| n.id == ids[3]));
     }
 
     #[test]

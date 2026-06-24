@@ -264,7 +264,7 @@ enum Commands {
     Version(VersionCommands),
     #[command(about = "List all domains in the graph with concept counts", long_about = "Domains: Discover all existing domains to avoid creating duplicates.\n\nUsage:\n  braim domains\n\nOutput: Alphabetical list of domains with count of concepts in each.\n\nWhy: LLMs and users should check existing domains before creating new ones.\nSlightly different domain names (e.g., 'payment' vs 'payments', 'Payment Domain')\nfragment the graph and reduce discoverability. Always reuse existing domains.")]
     Domains,
-    #[command(about = "Audit the graph for consistency, gaps, and verification issues", long_about = "Audit: Scan the entire graph for problems and verification status.\n\nChecks:\n  • Orphan nodes (active, unreferenced, no dependencies)\n  • Pending nodes (declared but unintegrated)\n  • Statements grouped by verification status:\n      ✓✓✓ ProvenStrong (3+ PRIMARY sources)\n      ✓✓ Proven (2+ PRIMARY sources)\n      ✓ Partial (1 PRIMARY source)\n      ✗ Unproven (0 PRIMARY sources)\n  • Invalid statements (refuted claims)\n  • Deprecated nodes still referenced\n  • Gap register: zero-path relationships\n  • Weight constraint violations (must sum to 1.0)\n\nOutput organization:\n  1. Orphan nodes needing integration\n  2. Pending nodes (incomplete)\n  3. Gap register (missing connections)\n  4. Deprecated nodes still in use\n  5. Statement verification status breakdown\n  6. Invalid statements with reasons\n\nUse audit regularly to track:\n  • Verification coverage (% proven vs unproven)\n  • Integration status (orphans, pending)\n  • Consistency issues (gaps, weight violations)\n  • Deprecation problems (deprecated referenced)\n\nSemantic checks (--semantic, requires --features embeddings):\n  • Near-duplicates: unconnected node pairs with label cosine >= 0.80\n  • Label echoes: statements restating a dependency's label (cosine >= 0.75)\n    — single-concept elaborations that add no relationship\nBoth reuse the .braim/embeddings.json sidecar index and are ADVISORY.")]
+    #[command(about = "Audit the graph for consistency, gaps, and verification issues", long_about = "Audit: Scan the entire graph for problems and verification status.\n\nChecks:\n  • Orphan nodes (active, unreferenced, no dependencies)\n  • Pending nodes (declared but unintegrated)\n  • Statements grouped by verification status:\n      ✓✓✓ ProvenStrong (3+ PRIMARY sources)\n      ✓✓ Proven (2+ PRIMARY sources)\n      ✓ Partial (1 PRIMARY source)\n      ✗ Unproven (0 PRIMARY sources)\n  • Invalid statements (refuted claims)\n  • Deprecated nodes still referenced\n  • Gap register: zero-path relationships\n  • Weight constraint violations (must sum to 1.0)\n  • Causal-edge (because_of) health:\n      - Refuted links: edges a failed inverse test marked invalid\n      - Re-investigation flags: statements above an invalidated cause\n      - Untested links: active because_of edges with no inverse test\n      - Unverified roots: chains bottoming out below proven\n\nOutput organization:\n  1. Orphan nodes needing integration\n  2. Pending nodes (incomplete)\n  3. Gap register (missing connections)\n  4. Deprecated nodes still in use\n  5. Causal-edge health (refuted / flagged / untested / unverified roots)\n  6. Statement verification status breakdown\n  7. Invalid statements with reasons\n\nUse audit regularly to track:\n  • Verification coverage (% proven vs unproven)\n  • Integration status (orphans, pending)\n  • Consistency issues (gaps, weight violations)\n  • Deprecation problems (deprecated referenced)\n\nSemantic checks (--semantic, requires --features embeddings):\n  • Near-duplicates: unconnected node pairs with label cosine >= 0.80\n  • Label echoes: statements restating a dependency's label (cosine >= 0.75)\n    — single-concept elaborations that add no relationship\nBoth reuse the .braim/embeddings.json sidecar index and are ADVISORY.")]
     Audit {
         #[arg(long, help = "Embedding-based checks: near-duplicate pairs and label echoes (requires --features embeddings)")]
         semantic: bool,
@@ -1417,6 +1417,47 @@ fn main() {
             } else {
                 for node in &report.deprecated_referenced {
                     println!("  ⚠ ID:{}  domains: {:?}  {}", node.id, node.domains, node.label);
+                }
+            }
+
+            println!("\n── Refuted causal links (because_of failed inverse test) ──");
+            if report.refuted_causal_links.is_empty() {
+                println!("  none");
+            } else {
+                for e in &report.refuted_causal_links {
+                    println!("  ✗ ID:{} '{}'  ─because→  ID:{} '{}'", e.from, e.from_label, e.to, e.to_label);
+                    if let Some(r) = &e.reason {
+                        println!("    {} — re-investigate the cause of ID:{}", r, e.from);
+                    }
+                }
+            }
+
+            println!("\n── Statements flagged for re-investigation (cause invalidated below) ──");
+            if report.reinvestigate_flagged.is_empty() {
+                println!("  none");
+            } else {
+                for node in &report.reinvestigate_flagged {
+                    let note = node.metadata.get("because_of_reinvestigate").map(|s| s.as_str()).unwrap_or("");
+                    println!("  ⚠ ID:{}  {}  ({})", node.id, node.label, note);
+                }
+            }
+
+            println!("\n── Untested causal links (because_of without inverse test) ──");
+            if report.untested_causal_links.is_empty() {
+                println!("  none");
+            } else {
+                for e in &report.untested_causal_links {
+                    println!("  ○ ID:{} '{}'  ─because→  ID:{} '{}'  — run: braim why-test {}",
+                        e.from, e.from_label, e.to, e.to_label, e.from);
+                }
+            }
+
+            println!("\n── Unverified root causes (chain bottoms out below proven) ──");
+            if report.unverified_roots.is_empty() {
+                println!("  none");
+            } else {
+                for node in &report.unverified_roots {
+                    println!("  ○ ID:{}  [{}]  {}", node.id, node.verification_status.label(), node.label);
                 }
             }
 

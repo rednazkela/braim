@@ -151,6 +151,8 @@ braim why-add 42 --because 73         # re-point 42 at a new cause
 
 @[perspective and proximity traverse because_of cause-to-consequent at weight 1.0; refuted edges are skipped; query stays depends_on-only] source: code:src/graph.rs dfs because_of branch
 
+@[audit surfaces four causal-edge findings: refuted links, statements flagged for re-investigation, untested links, and unverified root causes] source: code:src/graph.rs audit because_of findings
+
 @[A causal edge inherits the weakest endpoint's status; when both endpoints are proven the claim is partial until a passing inverse test promotes it to proven] source: code:src/graph.rs edge_causal_status
 
 @[Invalidating a cause flags every consequent above it (metadata because_of_reinvestigate) for re-investigation but does not auto-invalidate them] source: code:src/graph.rs flag_because_of_reinvestigation
@@ -188,7 +190,7 @@ braim list --meta scope=agent_scratch       # filter by metadata
 ### Maintenance
 
 ```bash
-braim audit                      # orphans, pending nodes, gap register, dangling refs
+braim audit                      # orphans, pending, gaps, dangling refs, causal-edge health
 braim audit --semantic           # + near-duplicate pairs and label echoes (embeddings builds)
 braim domains                    # domain inventory — check before adding (rule 4)
 braim version save "checkpoint"  # rule 3: checkpoint after each batch
