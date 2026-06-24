@@ -1,6 +1,6 @@
 # braim because_of Edge — Five Whys Methodology Support
 
-Status: Implemented. Commands `why-add`, `why`, `why-test`, `why-remove` ship in the braim binary; see `src/graph.rs` (BecauseOfEdge, `why_*` methods) and `src/main.rs` (WhyAdd/Why/WhyTest/WhyRemove). Test 18 (scope-based query filtering) is deliberately not implemented — it is orthogonal to the edge mechanics and would change core `query` semantics; tracked separately.
+Status: Implemented. Commands `why-add`, `why`, `why-test`, `why-remove` ship in the braim binary; see `src/graph.rs` (BecauseOfEdge, `why_*` methods) and `src/main.rs` (WhyAdd/Why/WhyTest/WhyRemove). `perspective`/`proximity` traverse the edge and `braim audit` reports four causal-edge findings (see Audit Integration). Test 18 (scope-based query filtering) is deliberately not implemented — it is orthogonal to the edge mechanics and would change core `query` semantics; tracked separately.
 
 ## Motivation
 
@@ -33,6 +33,17 @@ A new `because_of` edge is proposed to mean "A occurs because B is true".
 ## Verification Inheritance
 
 A `because_of` edge inherits the verification floor of its endpoints. Both endpoints proven → causal claim is partial until inverse test confirms; inverse-test confirmation upgrades to proven causal claim.
+
+## Audit Integration
+
+`braim audit` reports four `because_of`-derived findings (computed in one pass over `state.because_of`), surfacing unfinished investigations:
+
+- **Refuted links** — edges a failing `why-test --fail` marked invalid; a refuted causal claim left in place.
+- **Re-investigation flags** — statements carrying `because_of_reinvestigate` because a cause below them was invalidated (`flag_because_of_reinvestigation`).
+- **Untested links** — active edges with no `test:` source; unvalidated causal hypotheses awaiting the inverse test.
+- **Unverified root causes** — terminal chain ends whose verification is below `proven`.
+
+These are additive audit dimensions; they do not change the existing orphan / pending / gap / deprecated checks. Statements are never orphans (they always carry concept dependencies), so the orphan check is unaffected by causal edges.
 
 ## Open Questions
 
