@@ -855,7 +855,9 @@ impl Braim {
         fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
 
         let current_path = path.join("current.json");
-        let mut state: GraphState = if current_path.exists() {
+        let mut state: GraphState = if path.join("domains").is_dir() {
+            Self::load_sharded(&path)?
+        } else if current_path.exists() {
             let content = fs::read_to_string(&current_path)
                 .map_err(|e| format!("Failed to read current.json: {}", e))?;
             serde_json::from_str(&content)
@@ -1618,6 +1620,140 @@ impl Braim {
         }
     }
 
+    /// Home domain of a node in sharded layout: first entry of its domains list.
+    /// Nodes without domains (e.g. source entities) shard to "_unassigned".
+    fn home_domain(node: &Node) -> String {
+        node.domains.first().cloned().unwrap_or_else(|| "_unassigned".to_string())
+    }
+
+    /// Deterministic, filesystem-safe shard filename for a domain. Lowercases and
+    /// replaces non-alphanumerics — but distinct domains may then collide (real
+    /// case: "Billing" vs "billing", which also collide RAW on case-insensitive
+    /// filesystems, braim ID:225/236). Every name therefore carries a short FNV-1a
+    /// hash of the exact domain string, making files unique per distinct domain
+    /// on every platform while staying human-readable.
+    fn shard_filename(domain: &str) -> String {
+        let mut sanitized: String = domain.to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if sanitized.len() > 60 {
+            sanitized.truncate(60);
+        }
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in domain.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{}-{:08x}.json", sanitized, (hash >> 32) as u32 ^ hash as u32)
+    }
+
+    /// Load the sharded layout: graph.json (cross-domain state) + every
+    /// domains/*.json (per-domain node maps) merged into one in-memory view
+    /// (braim ID:217). A node id appearing in two shard files is corruption.
+    fn load_sharded(path: &PathBuf) -> Result<GraphState, String> {
+        let header_path = path.join("graph.json");
+        let mut state: GraphState = if header_path.exists() {
+            let content = fs::read_to_string(&header_path)
+                .map_err(|e| format!("Failed to read graph.json: {}", e))?;
+            serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse graph.json: {}", e))?
+        } else {
+            return Err("Error: sharded layout (domains/ exists) but graph.json is missing".to_string());
+        };
+
+        let dir = fs::read_dir(path.join("domains"))
+            .map_err(|e| format!("Failed to read domains dir: {}", e))?;
+        let mut files: Vec<PathBuf> = dir
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+
+        for file in files {
+            let content = fs::read_to_string(&file)
+                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+            let shard: HashMap<u32, Node> = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse {}: {}", file.display(), e))?;
+            for (id, node) in shard {
+                if state.nodes.insert(id, node).is_some() {
+                    return Err(format!(
+                        "Error: node ID {} appears in more than one domain shard ({}) — corrupt layout",
+                        id, file.display()
+                    ));
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    /// Persist the sharded layout: nodes split by home domain into
+    /// domains/<name>-<hash>.json, everything else into graph.json. Shard files
+    /// whose domain no longer has nodes are removed (node deleted or re-homed).
+    fn flush_sharded(&self) -> Result<(), String> {
+        let domains_dir = self.data_dir.join("domains");
+        fs::create_dir_all(&domains_dir).map_err(|e| format!("Failed to create domains dir: {}", e))?;
+
+        let mut shards: HashMap<String, HashMap<u32, Node>> = HashMap::new();
+        for (id, node) in &self.state.nodes {
+            shards.entry(Self::home_domain(node)).or_default().insert(*id, node.clone());
+        }
+
+        let mut live_files: HashSet<String> = HashSet::new();
+        for (domain, nodes) in &shards {
+            let filename = Self::shard_filename(domain);
+            let content = Self::canonical_json(nodes)?;
+            fs::write(domains_dir.join(&filename), content)
+                .map_err(|e| format!("Failed to write shard {}: {}", filename, e))?;
+            live_files.insert(filename);
+        }
+
+        // Remove shard files for domains that no longer own any node.
+        if let Ok(dir) = fs::read_dir(&domains_dir) {
+            for entry in dir.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".json") && !live_files.contains(&name) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        let header = GraphState {
+            nodes: HashMap::new(),
+            dictionary: self.state.dictionary.clone(),
+            id_to_domain: self.state.id_to_domain.clone(),
+            gaps: self.state.gaps.clone(),
+            next_id: self.state.next_id,
+            version: self.state.version,
+            contradicts: self.state.contradicts.clone(),
+            because_of: self.state.because_of.clone(),
+        };
+        let content = Self::canonical_json(&header)?;
+        fs::write(self.data_dir.join("graph.json"), content)
+            .map_err(|e| format!("Failed to write graph.json: {}", e))?;
+        Ok(())
+    }
+
+    /// Convert this data dir from single-file to sharded layout. current.json is
+    /// kept as current.json.pre-shard — a full snapshot escape hatch, since the
+    /// conversion itself is one-way. Idempotent error if already sharded.
+    pub fn shard_layout(&mut self) -> Result<usize, String> {
+        if self.data_dir.join("domains").is_dir() {
+            return Err("Error: this data dir already uses the sharded layout".to_string());
+        }
+        self.flush_sharded()?;
+        let current = self.data_dir.join("current.json");
+        if current.exists() {
+            fs::rename(&current, self.data_dir.join("current.json.pre-shard"))
+                .map_err(|e| format!("Failed to archive current.json: {}", e))?;
+        }
+        let domain_count = self.state.nodes.values()
+            .map(Self::home_domain)
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(domain_count)
+    }
+
     /// Serialize with deterministic key order. Persisted structs hold HashMaps,
     /// whose iteration order changes per process — direct to_string_pretty made
     /// identical graphs produce differently-ordered JSON (braim ID:218), which
@@ -1633,7 +1769,16 @@ impl Braim {
             .map_err(|e| format!("Failed to serialize state: {}", e))
     }
 
+    /// The full merged state as canonical JSON — what current.json holds in the
+    /// single-file layout. Lets consumers (e.g. `serve`) stay layout-agnostic.
+    pub fn state_json(&self) -> Result<String, String> {
+        Self::canonical_json(&self.state)
+    }
+
     fn flush(&mut self) -> Result<(), String> {
+        if self.data_dir.join("domains").is_dir() {
+            return self.flush_sharded();
+        }
         let path = self.data_dir.join("current.json");
         let content = Self::canonical_json(&self.state)?;
         fs::write(&path, content)
@@ -3996,6 +4141,61 @@ mod defect_tests {
         let m2 = dst.import_graph(src_path.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
         let new_s = m2.id_mappings[&s];
         assert_eq!(dst.get_node(new_s).unwrap().verification_status, VerificationStatus::ProvenStrong);
+    }
+
+    #[test]
+    fn shard_roundtrip_preserves_full_state() {
+        let (mut src, s1, _) = import_fixture("shard_roundtrip");
+        let dir = src.data_dir.clone();
+        let nodes_before = src.state.nodes.len();
+        let s1_status = src.get_node(s1).unwrap().verification_status;
+
+        let domain_count = src.shard_layout().unwrap();
+        assert!(domain_count >= 1);
+        assert!(dir.join("domains").is_dir());
+        assert!(dir.join("graph.json").exists());
+        assert!(!dir.join("current.json").exists(), "single file archived, not left as dual source");
+        assert!(dir.join("current.json.pre-shard").exists());
+
+        // Reload from disk: merged view identical
+        let reloaded = Braim::new(dir.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.state.nodes.len(), nodes_before);
+        assert_eq!(reloaded.get_node(s1).unwrap().verification_status, s1_status);
+        assert_eq!(reloaded.state.because_of.len(), src.state.because_of.len());
+        assert_eq!(reloaded.state.contradicts.len(), src.state.contradicts.len());
+        assert_eq!(reloaded.state.next_id, src.state.next_id);
+        assert_eq!(reloaded.state.dictionary.len(), src.state.dictionary.len());
+    }
+
+    #[test]
+    fn sharded_mutation_persists_and_reloads() {
+        let (mut b, _, _) = import_fixture("shard_mutate");
+        let dir = b.data_dir.clone();
+        b.shard_layout().unwrap();
+
+        // mutate AFTER sharding — flush must route to the sharded writer
+        let mut b = Braim::new(dir.to_str().unwrap()).unwrap();
+        let g = b.add_concept("Gamma: third", vec!["newdomain".into()], vec!["narrative:z".into()], None).unwrap();
+
+        let again = Braim::new(dir.to_str().unwrap()).unwrap();
+        assert!(again.get_node(g).is_some(), "mutation in sharded mode must persist");
+        assert_eq!(again.get_node(g).unwrap().domains, vec!["newdomain".to_string()]);
+        // and the new domain got its own shard file
+        let shard = dir.join("domains").join(Braim::shard_filename("newdomain"));
+        assert!(shard.exists(), "new home domain must create its shard file");
+    }
+
+    #[test]
+    fn case_colliding_domains_get_distinct_shards() {
+        // Real data has both "Billing" and "billing" as distinct domains; on
+        // case-insensitive filesystems raw names would be one file (ID:236).
+        let a = Braim::shard_filename("Billing");
+        let b = Braim::shard_filename("billing");
+        assert_ne!(a, b, "distinct domains must never share a shard file");
+        // and the sanitized prefix is still human-readable
+        assert!(a.starts_with("billing-") && b.starts_with("billing-"));
+        // determinism
+        assert_eq!(a, Braim::shard_filename("Billing"));
     }
 
     #[test]

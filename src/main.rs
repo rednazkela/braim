@@ -298,6 +298,8 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
+    #[command(about = "Convert this data dir to the sharded per-domain layout", long_about = "Shard: Convert single-file storage (current.json) to the sharded per-domain layout.\n\nLayout after conversion:\n  domains/<domain>-<hash>.json   one file per home domain (a node's home = first domains entry)\n  graph.json                     cross-domain state: dictionary, gaps, edges, counters\n  current.json.pre-shard         archived single-file snapshot (escape hatch)\n\nSemantics (braim ID:217/236):\n  • The in-memory graph stays ONE merged view — queries and traversal are unchanged.\n  • Every mutation rewrites the affected shard files; version save still writes whole-graph vNNNN.json snapshots.\n  • Domain filenames carry a deterministic hash suffix so distinct domains like 'Billing' and 'billing' never collide, including on case-insensitive filesystems (macOS/Windows).\n\nDetection is automatic: any braim command on a dir containing domains/ loads the sharded layout.")]
+    Shard,
     #[command(about = "Semantic similarity search over node labels (requires --features embeddings)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
     Similar {
         text: String,
@@ -1799,6 +1801,18 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Shard => {
+            match braim.shard_layout() {
+                Ok(domain_count) => {
+                    println!("✓ Converted to sharded layout");
+                    println!("  {} domain shard(s) under domains/", domain_count);
+                    println!("  Cross-domain state in graph.json");
+                    println!("  Previous single file archived as current.json.pre-shard");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         Commands::WhyAdd { consequent, because, source } => {
             match braim.why_add(consequent, because, source) {
                 Ok(warning) => {
@@ -2156,7 +2170,6 @@ fn query_semantic_fallback(_braim: &Braim, _data_dir: &str, _terms: &str, quiet:
 }
 
 fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
-    use std::path::Path;
     use tiny_http::{Response, Header};
 
     let addr = format!("127.0.0.1:{}", port);
@@ -2175,8 +2188,9 @@ fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
                     .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap())
             }
             "/current.json" => {
-                let path = Path::new(data_dir).join("current.json");
-                match std::fs::read_to_string(&path) {
+                // Load through Braim so both layouts work: single-file dirs and
+                // sharded dirs (domains/ + graph.json) serve the same merged view.
+                match Braim::new(data_dir).and_then(|b| b.state_json()) {
                     Ok(content) => Response::from_string(content)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap()),
                     Err(_) => Response::from_string("{\"error\": \"Data not found\"}")
