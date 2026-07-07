@@ -1776,6 +1776,45 @@ impl Braim {
         Ok(())
     }
 
+    /// Rename a domain across the graph: every node carrying `old` in its domains
+    /// list gets `new` instead. In sharded layout the next flush re-homes the
+    /// affected nodes into the new domain's shard and prunes the old current
+    /// shard; existing versioned snapshots are immutable history and keep the
+    /// old name. Central-governance operation (braim ID:244): distinguishing a
+    /// rename from a merge is the caller's evidence-checked decision.
+    pub fn rename_domain(&mut self, old: &str, new: &str) -> Result<usize, String> {
+        if old == new {
+            return Err("Error: old and new domain names are identical".to_string());
+        }
+        let mut touched = 0;
+        for node in self.state.nodes.values_mut() {
+            let mut hit = false;
+            for d in node.domains.iter_mut() {
+                if d == old {
+                    *d = new.to_string();
+                    hit = true;
+                }
+            }
+            if hit {
+                // A node already carrying the new name would end up with a
+                // duplicate entry — collapse it.
+                let mut seen = HashSet::new();
+                node.domains.retain(|d| seen.insert(d.clone()));
+                touched += 1;
+            }
+        }
+        if touched == 0 {
+            return Err(format!("Error: no node carries domain '{}'", old));
+        }
+        for v in self.state.id_to_domain.values_mut() {
+            if v == old {
+                *v = new.to_string();
+            }
+        }
+        self.flush()?;
+        Ok(touched)
+    }
+
     /// Convert this data dir from single-file to sharded layout. current.json is
     /// kept as current.json.pre-shard — a full snapshot escape hatch, since the
     /// conversion itself is one-way. Idempotent error if already sharded.
@@ -4424,6 +4463,27 @@ mod defect_tests {
         let m = dst.import_graph(dir.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
         assert!(m.id_mappings.contains_key(&s1), "import must load a sharded source dir");
         assert_eq!(m.because_of_imported, 1);
+    }
+
+    #[test]
+    fn rename_domain_rehomes_shards() {
+        let mut b = temp_braim("rename_domain");
+        let dir = b.data_dir.clone();
+        let a = b.add_concept("Alpha: first", vec!["Billing".into()], vec!["narrative:x".into()], None).unwrap();
+        b.add_concept("Beta: second", vec!["billing".into()], vec!["narrative:x".into()], None).unwrap();
+        b.shard_layout().unwrap();
+        let mut b = Braim::new(dir.to_str().unwrap()).unwrap();
+
+        let touched = b.rename_domain("Billing", "braim_demo").unwrap();
+        assert_eq!(touched, 1);
+        assert_eq!(b.get_node(a).unwrap().domains, vec!["braim_demo".to_string()]);
+        // shard re-homed: new file exists, old case-variant shard pruned
+        assert!(dir.join("domains").join(Braim::shard_filename("braim_demo")).exists());
+        assert!(!dir.join("domains").join(Braim::shard_filename("Billing")).exists());
+        assert!(dir.join("domains").join(Braim::shard_filename("billing")).exists(), "unrelated lowercase domain untouched");
+        // errors: unknown domain, identity rename
+        assert!(b.rename_domain("nope", "x").is_err());
+        assert!(b.rename_domain("billing", "billing").is_err());
     }
 
     #[test]
