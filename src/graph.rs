@@ -326,6 +326,30 @@ pub struct GraphState {
     pub because_of: Vec<BecauseOfEdge>,
 }
 
+/// One checkpoint in the sharded layout's versions.json index. Instead of a
+/// whole-graph clone, it records WHICH per-domain snapshot each domain was at —
+/// the domain snapshot file (domains/<name>-<hash>.v<NNNN>.json) is the pin
+/// artifact the mount manifest's pinned_version references (braim ID:214/242).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ShardedVersionEntry {
+    pub version: u32,
+    pub description: String,
+    pub saved_at: String,
+    pub node_count: usize,
+    /// domain → that domain's snapshot version at this checkpoint
+    pub domain_versions: HashMap<String, u32>,
+    /// version of the cross-domain header snapshot (graph.v<NNNN>.json)
+    pub header_version: u32,
+}
+
+/// Layout-agnostic version summary for listings.
+pub struct VersionInfo {
+    pub version: u32,
+    pub description: String,
+    pub saved_at: String,
+    pub node_count: usize,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VersionMeta {
     pub description: String,
@@ -1670,6 +1694,15 @@ impl Braim {
         let mut files: Vec<PathBuf> = dir
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            // Current shards only — versioned snapshots (*.vNNNN.json) are the
+            // immutable pin artifacts, not part of the working view.
+            .filter(|p| {
+                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                !name.rsplit_once(".v")
+                    .map(|(_, tail)| tail.trim_end_matches(".json").chars().all(|c| c.is_ascii_digit())
+                        && tail.ends_with(".json"))
+                    .unwrap_or(false)
+            })
             .collect();
         files.sort();
 
@@ -1711,11 +1744,17 @@ impl Braim {
             live_files.insert(filename);
         }
 
-        // Remove shard files for domains that no longer own any node.
+        // Remove CURRENT shard files for domains that no longer own any node.
+        // Versioned snapshots (*.vNNNN.json) are immutable pin artifacts
+        // (ID:214/242) and are never pruned.
         if let Ok(dir) = fs::read_dir(&domains_dir) {
             for entry in dir.filter_map(|e| e.ok()) {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".json") && !live_files.contains(&name) {
+                let is_snapshot = name.rsplit_once(".v")
+                    .map(|(_, tail)| tail.trim_end_matches(".json").chars().all(|c| c.is_ascii_digit())
+                        && tail.ends_with(".json"))
+                    .unwrap_or(false);
+                if name.ends_with(".json") && !is_snapshot && !live_files.contains(&name) {
                     let _ = fs::remove_file(entry.path());
                 }
             }
@@ -2734,45 +2773,164 @@ impl Braim {
         }
     }
 
+    fn versions_index_path(&self) -> PathBuf {
+        self.data_dir.join("versions.json")
+    }
+
+    fn read_versions_index(&self) -> Vec<ShardedVersionEntry> {
+        fs::read_to_string(self.versions_index_path())
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot filename for one domain at one version: the `<d><v>.json` pin
+    /// artifact (braim ID:214/242), hash-suffixed like the current shard.
+    fn shard_version_filename(domain: &str, version: u32) -> String {
+        let base = Self::shard_filename(domain);
+        format!("{}.v{:04}.json", base.trim_end_matches(".json"), version)
+    }
+
     pub fn version_save(&mut self, description: &str) -> Result<u32, String> {
         self.state.version += 1;
         let version_num = self.state.version;
-
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let meta = VersionMeta {
-            description: description.to_string(),
-            saved_at: now,
-            data: self.state.clone(),
-        };
 
-        let filename = format!("v{:04}.json", version_num);
-        let path = self.data_dir.join(&filename);
-        let content = Self::canonical_json(&meta)
-            .map_err(|e| format!("Failed to serialize version: {}", e))?;
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write version file: {}", e))?;
+        if self.data_dir.join("domains").is_dir() {
+            // Sharded: per-domain snapshots for changed domains only, plus a
+            // header snapshot and an index entry (ID:242). Unchanged domains
+            // keep their existing snapshot version — the pin stays stable.
+            let domains_dir = self.data_dir.join("domains");
+            let mut index = self.read_versions_index();
+            let prev: HashMap<String, u32> = index.last()
+                .map(|e| e.domain_versions.clone())
+                .unwrap_or_default();
+            let prev_header = index.last().map(|e| e.header_version).unwrap_or(0);
+
+            let mut shards: HashMap<String, HashMap<u32, Node>> = HashMap::new();
+            for (id, node) in &self.state.nodes {
+                shards.entry(Self::home_domain(node)).or_default().insert(*id, node.clone());
+            }
+
+            let mut domain_versions: HashMap<String, u32> = HashMap::new();
+            for (domain, nodes) in &shards {
+                let content = Self::canonical_json(nodes)?;
+                let next = match prev.get(domain) {
+                    Some(&v) => {
+                        let prev_file = domains_dir.join(Self::shard_version_filename(domain, v));
+                        match fs::read_to_string(&prev_file) {
+                            Ok(existing) if existing == content => {
+                                domain_versions.insert(domain.clone(), v);
+                                continue;
+                            }
+                            _ => v + 1,
+                        }
+                    }
+                    None => 1,
+                };
+                fs::write(domains_dir.join(Self::shard_version_filename(domain, next)), &content)
+                    .map_err(|e| format!("Failed to write domain snapshot: {}", e))?;
+                domain_versions.insert(domain.clone(), next);
+            }
+
+            let header = GraphState {
+                nodes: HashMap::new(),
+                dictionary: self.state.dictionary.clone(),
+                id_to_domain: self.state.id_to_domain.clone(),
+                gaps: self.state.gaps.clone(),
+                next_id: self.state.next_id,
+                version: self.state.version,
+                contradicts: self.state.contradicts.clone(),
+                because_of: self.state.because_of.clone(),
+            };
+            let header_content = Self::canonical_json(&header)?;
+            let header_version = {
+                let prev_file = self.data_dir.join(format!("graph.v{:04}.json", prev_header));
+                match fs::read_to_string(&prev_file) {
+                    Ok(existing) if existing == header_content => prev_header,
+                    _ => {
+                        let hv = prev_header + 1;
+                        fs::write(self.data_dir.join(format!("graph.v{:04}.json", hv)), &header_content)
+                            .map_err(|e| format!("Failed to write header snapshot: {}", e))?;
+                        hv
+                    }
+                }
+            };
+
+            index.push(ShardedVersionEntry {
+                version: version_num,
+                description: description.to_string(),
+                saved_at: now,
+                node_count: self.state.nodes.len(),
+                domain_versions,
+                header_version,
+            });
+            let index_content = Self::canonical_json(&index)?;
+            fs::write(self.versions_index_path(), index_content)
+                .map_err(|e| format!("Failed to write versions index: {}", e))?;
+        } else {
+            let meta = VersionMeta {
+                description: description.to_string(),
+                saved_at: now,
+                data: self.state.clone(),
+            };
+            let filename = format!("v{:04}.json", version_num);
+            let path = self.data_dir.join(&filename);
+            let content = Self::canonical_json(&meta)
+                .map_err(|e| format!("Failed to serialize version: {}", e))?;
+            fs::write(&path, content)
+                .map_err(|e| format!("Failed to write version file: {}", e))?;
+        }
 
         self.flush()?;
         Ok(version_num)
     }
 
     pub fn version_restore(&mut self, n: u32) -> Result<(), String> {
-        let filename = format!("v{:04}.json", n);
-        let path = self.data_dir.join(&filename);
+        if self.data_dir.join("domains").is_dir() {
+            let index = self.read_versions_index();
+            let entry = index.iter().find(|e| e.version == n)
+                .ok_or(format!("Error: Version {} not found in versions.json", n))?;
 
-        let content = fs::read_to_string(&path)
-            .map_err(|_| format!("Error: Version {} not found", n))?;
-        let meta: VersionMeta = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse version file: {}", e))?;
+            let header_content = fs::read_to_string(
+                self.data_dir.join(format!("graph.v{:04}.json", entry.header_version)))
+                .map_err(|_| format!("Error: header snapshot graph.v{:04}.json missing", entry.header_version))?;
+            let mut state: GraphState = serde_json::from_str(&header_content)
+                .map_err(|e| format!("Failed to parse header snapshot: {}", e))?;
 
-        self.state = meta.data;
+            for (domain, v) in &entry.domain_versions {
+                let file = self.data_dir.join("domains").join(Self::shard_version_filename(domain, *v));
+                let content = fs::read_to_string(&file)
+                    .map_err(|_| format!("Error: domain snapshot {} missing", file.display()))?;
+                let nodes: HashMap<u32, Node> = serde_json::from_str(&content)
+                    .map_err(|e| format!("Failed to parse domain snapshot: {}", e))?;
+                state.nodes.extend(nodes);
+            }
+            self.state = state;
+        } else {
+            let filename = format!("v{:04}.json", n);
+            let path = self.data_dir.join(&filename);
+            let content = fs::read_to_string(&path)
+                .map_err(|_| format!("Error: Version {} not found", n))?;
+            let meta: VersionMeta = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse version file: {}", e))?;
+            self.state = meta.data;
+        }
         self.flush()?;
         Ok(())
     }
 
-    pub fn version_list(&self) -> Result<Vec<VersionMeta>, String> {
-        let mut versions = Vec::new();
+    pub fn version_list(&self) -> Result<Vec<VersionInfo>, String> {
+        if self.data_dir.join("domains").is_dir() {
+            return Ok(self.read_versions_index().into_iter().map(|e| VersionInfo {
+                version: e.version,
+                description: e.description,
+                saved_at: e.saved_at,
+                node_count: e.node_count,
+            }).collect());
+        }
 
+        let mut versions = Vec::new();
         for entry in fs::read_dir(&self.data_dir)
             .map_err(|e| format!("Failed to read data dir: {}", e))?
         {
@@ -2786,7 +2944,12 @@ impl Braim {
             if filename.starts_with('v') && filename.ends_with(".json") {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(meta) = serde_json::from_str::<VersionMeta>(&content) {
-                        versions.push(meta);
+                        versions.push(VersionInfo {
+                            version: meta.data.version,
+                            description: meta.description,
+                            saved_at: meta.saved_at,
+                            node_count: meta.data.nodes.len(),
+                        });
                     }
                 }
             }
@@ -4261,6 +4424,43 @@ mod defect_tests {
         let m = dst.import_graph(dir.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
         assert!(m.id_mappings.contains_key(&s1), "import must load a sharded source dir");
         assert_eq!(m.because_of_imported, 1);
+    }
+
+    #[test]
+    fn sharded_versions_are_per_domain_and_incremental() {
+        let mut b = temp_braim("sharded_versions");
+        let dir = b.data_dir.clone();
+        let a = b.add_concept("Alpha: first", vec!["billing".into()], vec!["narrative:x".into()], None).unwrap();
+        b.add_concept("Beta: second", vec!["crm".into()], vec!["narrative:x".into()], None).unwrap();
+        b.shard_layout().unwrap();
+
+        let mut b = Braim::new(dir.to_str().unwrap()).unwrap();
+        let v1 = b.version_save("first checkpoint").unwrap();
+        // per-domain pin artifacts exist (ID:214/242)
+        let billing_v1 = dir.join("domains").join(Braim::shard_version_filename("billing", 1));
+        let crm_v1 = dir.join("domains").join(Braim::shard_version_filename("crm", 1));
+        assert!(billing_v1.exists() && crm_v1.exists(), "each domain gets its own versioned snapshot");
+
+        // change ONLY billing, checkpoint again
+        let c = b.add_concept("Invoice: payment request", vec!["billing".into()], vec!["narrative:y".into()], None).unwrap();
+        let v2 = b.version_save("billing changed").unwrap();
+        assert!(dir.join("domains").join(Braim::shard_version_filename("billing", 2)).exists(),
+            "changed domain advances to v2");
+        assert!(!dir.join("domains").join(Braim::shard_version_filename("crm", 2)).exists(),
+            "unchanged domain must NOT get a new snapshot — its pin stays stable");
+
+        // list reflects both checkpoints; restore v1 drops the new node, keeps the rest
+        let list = b.version_list().unwrap();
+        assert_eq!(list.len(), 2);
+        b.version_restore(v1).unwrap();
+        assert!(b.get_node(c).is_none(), "node added after v1 gone on restore");
+        assert!(b.get_node(a).is_some());
+        // restore v2 brings it back
+        b.version_restore(v2).unwrap();
+        assert!(b.get_node(c).is_some());
+        // reload from disk still clean (snapshots not merged into working view)
+        let again = Braim::new(dir.to_str().unwrap()).unwrap();
+        assert_eq!(again.state.nodes.len(), b.state.nodes.len());
     }
 
     #[test]

@@ -1308,9 +1308,8 @@ fn main() {
             match braim.version_list() {
                 Ok(versions) => {
                     println!("Saved versions ({}):\n", versions.len());
-                    for meta in versions {
-                        let node_count = meta.data.nodes.len();
-                        println!("  v{:04}  {} nodes {}  \"{}\"", meta.data.version, node_count, meta.saved_at, meta.description);
+                    for info in versions {
+                        println!("  v{:04}  {} nodes {}  \"{}\"", info.version, info.node_count, info.saved_at, info.description);
                     }
                     Ok(())
                 }
