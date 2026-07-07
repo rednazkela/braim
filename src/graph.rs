@@ -225,7 +225,10 @@ impl From<GraphError> for String {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Node {
     pub id: u32,
+    /// Defaulted: pre-domains graphs (May 2026 era) lack the field entirely.
+    #[serde(default)]
     pub domains: Vec<String>,
+    #[serde(default)]
     pub sources: Vec<String>,
     pub node_type: NodeType,
     pub label: String,
@@ -3268,6 +3271,36 @@ impl Braim {
             list.sort_by_key(|n| n.id);
         }
 
+        // --only-proven admits statements at proven rank or above PLUS the concept
+        // closure they depend on. Concepts are vocabulary — they rarely reach
+        // proven — so gating them by status starves every proven statement of its
+        // dependencies and imports nothing. Statement-typed dependencies need no
+        // exemption: MIN-inheritance already guarantees a proven statement's
+        // statement deps are themselves at proven rank.
+        let needed_concepts: HashSet<u32> = if only_proven {
+            let mut needed: HashSet<u32> = HashSet::new();
+            let mut frontier: Vec<u32> = statements.iter()
+                .filter(|s| proven_ok(s.verification_status))
+                .flat_map(|s| s.depends_on.keys().copied())
+                .collect();
+            while let Some(id) = frontier.pop() {
+                if !needed.insert(id) {
+                    continue;
+                }
+                if let Some(n) = source_state.nodes.get(&id) {
+                    if !n.node_type.is_statement_family() {
+                        frontier.extend(n.depends_on.keys().copied());
+                    }
+                }
+            }
+            needed
+        } else {
+            HashSet::new()
+        };
+        let concept_admitted = |node: &Node| -> bool {
+            !only_proven || proven_ok(node.verification_status) || needed_concepts.contains(&node.id)
+        };
+
         // Process source entities first: statements remap source_ids against them.
         // Dedup key: same label (case-insensitive) and location.
         for node in source_entities {
@@ -3301,7 +3334,7 @@ impl Braim {
                 }
             }
 
-            if only_proven && !proven_ok(node.verification_status) {
+            if !concept_admitted(&node) {
                 skipped_count += 1;
                 continue;
             }
@@ -3362,7 +3395,7 @@ impl Braim {
                 }
             }
 
-            if only_proven && !proven_ok(node.verification_status) {
+            if !concept_admitted(&node) {
                 skipped_count += 1;
                 continue;
             }
@@ -4126,21 +4159,21 @@ mod defect_tests {
             vec!["code:a.rs:1".into(), "doc:a.md:2".into(), "test:t.log:3".into()],
             HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
         assert_eq!(src.get_node(s).unwrap().verification_status, VerificationStatus::ProvenStrong);
+
+        // an unproven statement that must NOT cross with --only-proven
+        let junk = src.add_statement("unproven aside", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(a, 1.0)]), true).unwrap();
         let src_path = src.data_dir.join("current.json");
 
         let mut dst = temp_braim("proven_strong_dst");
-        // concepts are unproven and filtered by --only-proven, so the statement
-        // can only land if its deps do — import without filter first, then assert
-        // the rank fix directly on a statement-only comparison.
+        // --only-proven admits: the proven_strong statement (rank fix: != Proven
+        // used to drop it) PLUS its concept closure (concepts are vocabulary and
+        // are admitted as dependencies regardless of their own status).
         let m = dst.import_graph(src_path.to_str().unwrap(), None, true, HashMap::new(), true).unwrap();
-        // with only_proven, unproven concepts are filtered → statement deps missing → skipped;
-        // but the statement itself must NOT be the thing filtered by status.
-        // Verify by checking skip accounting: 2 concepts filtered, statement skipped for deps.
-        assert_eq!(m.imported_count, 0);
-        // now without the filter: proven_strong statement imports and keeps its status
-        let m2 = dst.import_graph(src_path.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
-        let new_s = m2.id_mappings[&s];
+        assert_eq!(m.imported_count, 3, "proven_strong statement + its 2 concepts");
+        let new_s = m.id_mappings[&s];
         assert_eq!(dst.get_node(new_s).unwrap().verification_status, VerificationStatus::ProvenStrong);
+        assert!(!m.id_mappings.contains_key(&junk), "unproven statement must not cross");
     }
 
     #[test]

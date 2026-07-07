@@ -1673,15 +1673,18 @@ fn main() {
                 format!("{}/.braim/current.json", source)
             };
 
-            // Parse domain mappings
+            // Parse domain mappings. Each --domain-map value may carry several
+            // comma-separated pairs — the documented "old:new,old2:new2" form.
             let mut domain_mappings = HashMap::new();
             for mapping in domain_map {
-                let parts: Vec<&str> = mapping.split(':').collect();
-                if parts.len() != 2 {
-                    eprintln!("Error: Invalid domain mapping format. Use --domain-map \"source:target\"");
-                    std::process::exit(1);
+                for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
+                    let parts: Vec<&str> = pair.split(':').collect();
+                    if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+                        eprintln!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair);
+                        std::process::exit(1);
+                    }
+                    domain_mappings.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
                 }
-                domain_mappings.insert(parts[0].to_string(), parts[1].to_string());
             }
 
             match braim.import_graph(
