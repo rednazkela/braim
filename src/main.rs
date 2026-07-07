@@ -284,15 +284,17 @@ enum Commands {
         #[arg(long, default_value = "8000", help = "Port to listen on")]
         port: u16,
     },
-    #[command(about = "Import concepts/statements from external source", long_about = "Import: Load graph data from JSON/CSV or other braim exports.\n\nUsage:\n  braim import data.json\n  braim import graph.csv --filter-domain payment\n  braim import backup.json --only-proven\n  braim import data.json --domain-map \"old:new,legacy:current\"\n\nAfter import, run: braim version save \"imported from X\"")]
+    #[command(about = "Import concepts/statements from external source", long_about = "Import: Load graph data from JSON/CSV or other braim exports.\n\nUsage:\n  braim import data.json\n  braim import graph.csv --filter-domain payment\n  braim import backup.json --only-proven\n  braim import data.json --domain-map \"old:new,legacy:current\"\n  braim import /other/.braim --full   # full-fidelity (trusted) import\n\nDefault mode treats the source as UNTRUSTED: verification resets to unproven,\nsource entities are dropped, and because_of/contradicts edges are not carried.\n\n--full is the TRUSTED self-import for consolidating your own graphs:\n  • verification status and verified_by preserved\n  • source entities imported, statement source_ids remapped\n  • because_of and contradicts edges carried (endpoints remapped)\n  • dedup hits UNION the duplicate's sources into the target and recompute\n    its status — corroboration stacks, promotion still needs distinct\n    PRIMARY types (braim ID:185/190)\n\n--only-proven admits proven AND proven_strong nodes.\n\nAfter import, run: braim version save \"imported from X\"")]
     Import {
         source: String,
         #[arg(long, help = "Only import nodes from specified domain")]
         filter_domain: Option<String>,
-        #[arg(long, help = "Only import proven statements")]
+        #[arg(long, help = "Only import proven/proven_strong statements")]
         only_proven: bool,
         #[arg(long, help = "Remap domain names during import (format: old:new,old2:new2)")]
         domain_map: Vec<String>,
+        #[arg(long, help = "Full-fidelity trusted import: preserve verification, carry source entities and because_of/contradicts edges, union duplicate sources")]
+        full: bool,
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
@@ -1660,7 +1662,7 @@ fn main() {
         Commands::Serve { port } => {
             serve_viewer(braim.data_dir.to_str().unwrap_or(".braim"), port)
         }
-        Commands::Import { source, filter_domain, only_proven, domain_map } => {
+        Commands::Import { source, filter_domain, only_proven, domain_map, full } => {
             let actual_source = if source.ends_with(".json") {
                 source.clone()
             } else if source.ends_with(".braim") {
@@ -1685,12 +1687,18 @@ fn main() {
                 filter_domain.as_deref(),
                 only_proven,
                 domain_mappings,
+                full,
             ) {
                 Ok(manifest) => {
-                    println!("✓ Import complete");
+                    println!("✓ Import complete{}", if full { " (full-fidelity)" } else { "" });
                     println!("  Imported: {} nodes", manifest.imported_count);
                     println!("  Deduplicated: {} (skipped, target version kept)", manifest.deduplicated_count);
                     println!("  Filtered out: {} (by domain/status)", manifest.skipped_count);
+                    if full {
+                        println!("  Source entities: {} imported", manifest.sources_imported);
+                        println!("  Edges carried: {} because_of, {} contradicts", manifest.because_of_imported, manifest.contradicts_imported);
+                        println!("  Dedup targets with unioned sources: {}", manifest.sources_unioned);
+                    }
 
                     if !manifest.duplicates.is_empty() {
                         println!("\n── Duplicates found ──");
