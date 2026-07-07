@@ -1,4 +1,5 @@
 mod graph;
+mod manifest;
 mod tips;
 // Without the embeddings feature the module compiles but only its pure helpers
 // are reachable from tests; suppress dead-code noise in that configuration.
@@ -430,6 +431,10 @@ enum StatementCommands {
         id: u32,
         #[arg(long, help = "Reason why statement is invalid")]
         reason: String,
+    },
+    #[command(about = "Revive an invalidated statement (inverse of invalidate)", long_about = "Statement Revalidate: Clear the invalid flags on a single statement and recompute its verification_status from sources + dependency inheritance.\n\nUsage:\n  braim statement revalidate 169\n\nEffect:\n  • invalid flag, reason, and timestamp are cleared\n  • verification_status is recomputed from typed sources and valid-dependency inheritance\n  • node_type is reset accordingly (claim / fact)\n  • Does NOT cascade: revive dependents explicitly, in dependency order outward\n\nInvalid dependencies:\n  A dependency that is itself invalid is SKIPPED in the inheritance cap (not allowed to\n  re-poison this node) and reported as a warning. Re-anchor it with 'statement update-deps'\n  so the revival is durable.\n\nUse this to recover from an over-broad invalidate cascade, or when refuting evidence is withdrawn.")]
+    Revalidate {
+        id: u32,
     },
     #[command(about = "Suggest verification sources for a statement", long_about = "Statement VerifySuggest: Find candidate verification sources for an unproven statement.\n\nProblem: Verifying statements requires agents to manually search for evidence.\nSolution: suggest recommends candidate sources based on domain context and similarity.\n\nUsage:\n  braim statement verify-suggest 42\n  braim statement verify-suggest 5\n\nOutput recommendations (by priority):\n  1. Similar verified statements in same domain\n     → If domain:payment has verified statements, show them\n     → Suggests which sources proved similar claims\n  \n  2. Code locations mentioned in statement\n     → If statement mentions \"messageService.js:110-149\"\n     → Suggests code:src/services/messageService.js:110-149\n  \n  3. Recommended source types by domain\n     → domain:payment → suggests doc: sources (spec links)\n     → domain:security → suggests config: sources (settings)\n     → domain:database → suggests schema: sources (DDL)\n\nWorkflow:\n  1. Create unproven statement: braim statement add \"...\" --sources \"narrative:assumption\" ...\n  2. Get suggestions: braim statement verify-suggest <ID>\n  3. Re-create with typed sources: braim statement add \"...\" --sources \"code:verified.rs,doc:spec.md\" ...\n  4. Verification status auto-calculates to PROVEN\n\nNote: Helps agents find evidence without manual investigation.")]
     VerifySuggest {
@@ -971,6 +976,22 @@ fn main() {
                             cascaded_ids.len(), cascaded_ids);
                     }
                     tips::emit_tip_invalidate(&cascaded_ids, cli.quiet);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::Revalidate { id }) => {
+            match braim.revalidate_statement(id) {
+                Ok((status, invalid_deps)) => {
+                    let node = &braim.state.nodes[&id];
+                    println!("✓ Statement ID:{} revalidated", id);
+                    println!("  Status: {} {}", status.badge(), status.label());
+                    println!("  Original: {}", node.label);
+                    if !invalid_deps.is_empty() {
+                        eprintln!("⚠ still depends on invalid node(s): {:?}", invalid_deps);
+                        eprintln!("  these were skipped in the inheritance cap — re-anchor with 'braim statement update-deps {} --set ...' to make the revival durable", id);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),

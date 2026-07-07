@@ -2927,6 +2927,86 @@ impl Braim {
         Ok(cascade_ids)
     }
 
+    /// Inverse of `invalidate_statement` for a single node: clears the invalid
+    /// flags and recomputes verification_status from sources + dependency
+    /// inheritance. Dependencies that are themselves invalid are SKIPPED in the
+    /// inheritance cap (and returned) rather than re-poisoning the node — this is
+    /// what lets a node be revived while a foundational dep stays intentionally
+    /// retired; the caller re-anchors those deps with `update-deps`. Does NOT
+    /// cascade to dependents: revive explicitly, dependency order outward.
+    pub fn revalidate_statement(&mut self, statement_id: u32) -> Result<(VerificationStatus, Vec<u32>), String> {
+        {
+            let node = self.state.nodes.get(&statement_id)
+                .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+            if !node.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", statement_id));
+            }
+            let is_invalid = node.invalid || node.verification_status == VerificationStatus::Invalid;
+            let is_contested = node.verification_status == VerificationStatus::Contested;
+            // A node stuck contested purely by inheritance (a dependency was contested
+            // when this node was created, then removed) has no contradiction edge of its
+            // own. update_statement_deps refuses to recompute contested nodes, so it can
+            // never clear — revalidate recomputes it. A node with a real, unresolved
+            // contradiction edge must NOT be touched here; that is the contradiction
+            // lifecycle's job (resolve-contradiction).
+            let has_active_contradiction = self.state.contradicts.iter().any(|e| {
+                !e.resolved && (e.from == statement_id || e.to == statement_id)
+            });
+            if is_contested && has_active_contradiction {
+                return Err(format!(
+                    "Error: Statement ID {} is contested by an active contradiction edge — resolve it with 'statement resolve-contradiction', not revalidate",
+                    statement_id
+                ));
+            }
+            if !is_invalid && !is_contested {
+                return Err(format!("Error: Statement ID {} is neither invalid nor contested — nothing to revalidate", statement_id));
+            }
+        }
+
+        {
+            let node = self.state.nodes.get_mut(&statement_id).unwrap();
+            node.invalid = false;
+            node.invalid_reason = None;
+            node.invalidated_at = None;
+        }
+
+        let (new_status, invalid_deps) = {
+            let stmt = self.state.nodes.get(&statement_id).unwrap();
+            let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+            let source_derived =
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types);
+            let mut cap: Option<u8> = None;
+            let mut invalid_deps: Vec<u32> = Vec::new();
+            for dep_id in stmt.depends_on.keys() {
+                if let Some(dep) = self.state.nodes.get(dep_id) {
+                    if !dep.node_type.is_statement_family() {
+                        continue;
+                    }
+                    if dep.invalid || dep.verification_status == VerificationStatus::Invalid {
+                        invalid_deps.push(*dep_id);
+                        continue;
+                    }
+                    let r = dep.verification_status.rank();
+                    cap = Some(cap.map_or(r, |p: u8| p.min(r)));
+                }
+            }
+            let status = match cap {
+                Some(c) if source_derived.rank() > c => VerificationStatus::from_rank(c),
+                _ => source_derived,
+            };
+            (status, invalid_deps)
+        };
+
+        {
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.verification_status = new_status;
+            stmt.node_type = NodeType::from_verification_status(new_status);
+        }
+
+        self.flush()?;
+        Ok((new_status, invalid_deps))
+    }
+
     pub fn verify_statement(&mut self, statement_id: u32, domain: &str, note: Option<String>) -> Result<(), String> {
         let node = self.state.nodes.get_mut(&statement_id)
             .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
@@ -3613,5 +3693,70 @@ mod defect_tests {
         assert!(b.update_statement_deps(s, None, None, Some(HashMap::from([(a, 0.4), (c, 0.4)]))).is_err());
         // concept update-deps still rejects statements
         assert!(b.update_deps(s, None, None, Some(HashMap::from([(a, 1.0)]))).is_err());
+    }
+
+    #[test]
+    fn revalidate_round_trips_invalidate() {
+        let mut b = temp_braim("revalidate_roundtrip");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s = b.add_statement("alpha relates to beta", vec!["t".into()],
+            vec!["code:x.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        assert_eq!(b.get_node(s).unwrap().verification_status, VerificationStatus::Partial);
+        b.invalidate_statement(s, "test").unwrap();
+        assert_eq!(b.get_node(s).unwrap().verification_status, VerificationStatus::Invalid);
+        let (status, invalid_deps) = b.revalidate_statement(s).unwrap();
+        assert_eq!(status, VerificationStatus::Partial, "one code source → partial after revalidate");
+        assert!(invalid_deps.is_empty());
+        let node = b.get_node(s).unwrap();
+        assert!(!node.invalid);
+        assert!(node.invalid_reason.is_none());
+        assert_eq!(node.node_type, NodeType::Fact);
+    }
+
+    #[test]
+    fn revalidate_skips_invalid_dep_in_cap() {
+        let mut b = temp_braim("revalidate_skip_invalid_dep");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        // S1 is a statement; S2 depends on S1 so the cascade reaches it.
+        let s1 = b.add_statement("base claim", vec!["t".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("dependent claim", vec!["t".into()],
+            vec!["code:b.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        b.invalidate_statement(s1, "retired").unwrap();
+        // cascade reached s2
+        assert_eq!(b.get_node(s2).unwrap().verification_status, VerificationStatus::Invalid);
+        // revalidate s2 while s1 stays invalid: invalid dep is skipped, not re-poisoning.
+        let (status, invalid_deps) = b.revalidate_statement(s2).unwrap();
+        assert_eq!(status, VerificationStatus::Partial, "s2 revives to its own source-derived status");
+        assert_eq!(invalid_deps, vec![s1], "the still-invalid dep is reported for re-anchoring");
+        assert!(!b.get_node(s2).unwrap().invalid);
+    }
+
+    #[test]
+    fn revalidate_clears_orphan_contested_but_refuses_active_contradiction() {
+        let mut b = temp_braim("revalidate_orphan_contested");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("claim one", vec!["t".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("claim two", vec!["t".into()],
+            vec!["code:b.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        b.contradict_statements(s1, s2, "conflict", None).unwrap();
+        // active contradiction edge → revalidate must refuse
+        assert!(b.revalidate_statement(s1).is_err(), "must not touch a genuinely contested node");
+        // Orphan-contested trap: s3 inherits contested from s1, then its contested dep is
+        // swapped out. update_statement_deps skips recompute for contested nodes, so s3 is
+        // left contested with only concept deps and no contradiction edge of its own.
+        let s3 = b.add_statement("inherits contested", vec!["t".into()],
+            vec!["code:c.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        assert_eq!(b.get_node(s3).unwrap().verification_status, VerificationStatus::Contested);
+        b.update_statement_deps(s3, None, None, Some(HashMap::from([(a, 0.6), (c, 0.4)]))).unwrap();
+        assert_eq!(b.get_node(s3).unwrap().verification_status, VerificationStatus::Contested,
+            "update-deps leaves the orphan-contested node stuck");
+        // revalidate recomputes it off the contested state.
+        let (status, _) = b.revalidate_statement(s3).unwrap();
+        assert_eq!(status, VerificationStatus::Partial, "orphan-contested node recomputes to its source-derived status");
     }
 }
