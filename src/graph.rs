@@ -1610,10 +1610,24 @@ impl Braim {
         }
     }
 
+    /// Serialize with deterministic key order. Persisted structs hold HashMaps,
+    /// whose iteration order changes per process — direct to_string_pretty made
+    /// identical graphs produce differently-ordered JSON (braim ID:218), which
+    /// makes git diffs of shared packs unreadable and breaks byte-level
+    /// integrity checks (braim ID:226). Round-tripping through serde_json::Value
+    /// sorts every map: with the preserve_order feature off, Value objects are
+    /// BTreeMap-backed. Numeric keys sort lexicographically ("10" < "2") — ugly
+    /// but stable, and stability is the requirement.
+    fn canonical_json<T: Serialize>(value: &T) -> Result<String, String> {
+        let v = serde_json::to_value(value)
+            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        serde_json::to_string_pretty(&v)
+            .map_err(|e| format!("Failed to serialize state: {}", e))
+    }
+
     fn flush(&mut self) -> Result<(), String> {
         let path = self.data_dir.join("current.json");
-        let content = serde_json::to_string_pretty(&self.state)
-            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        let content = Self::canonical_json(&self.state)?;
         fs::write(&path, content)
             .map_err(|e| format!("Failed to write current.json: {}", e))?;
         Ok(())
@@ -2577,7 +2591,7 @@ impl Braim {
 
         let filename = format!("v{:04}.json", version_num);
         let path = self.data_dir.join(&filename);
-        let content = serde_json::to_string_pretty(&meta)
+        let content = Self::canonical_json(&meta)
             .map_err(|e| format!("Failed to serialize version: {}", e))?;
         fs::write(&path, content)
             .map_err(|e| format!("Failed to write version file: {}", e))?;
@@ -3693,6 +3707,28 @@ mod defect_tests {
         assert!(b.update_statement_deps(s, None, None, Some(HashMap::from([(a, 0.4), (c, 0.4)]))).is_err());
         // concept update-deps still rejects statements
         assert!(b.update_deps(s, None, None, Some(HashMap::from([(a, 1.0)]))).is_err());
+    }
+
+    #[test]
+    fn serialization_is_deterministic_across_instances() {
+        // Two graphs, identical operation sequences, separate HashMap seeds →
+        // current.json must still be byte-identical (braim ID:218/226: diffable
+        // packs and byte-level integrity both require canonical serialization).
+        let build = |name: &str| -> String {
+            let mut b = temp_braim(name);
+            let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+            let c = b.add_concept("Beta: second", vec!["u".into()], vec!["narrative:y".into()], None).unwrap();
+            let g = b.add_concept("Gamma: third", vec!["t".into()], vec!["narrative:z".into()], None).unwrap();
+            let s = b.add_statement("alpha relates to beta", vec!["t".into()],
+                vec!["code:x.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+            b.add_statement("beta relates to gamma", vec!["u".into()],
+                vec!["doc:y.md:2".into()], HashMap::from([(c, 0.7), (g, 0.3)]), true).unwrap();
+            b.set_meta(s, "scope", "agent_scratch").unwrap();
+            std::fs::read_to_string(b.data_dir.join("current.json")).unwrap()
+        };
+        let one = build("determinism_a");
+        let two = build("determinism_b");
+        assert_eq!(one, two, "identical operations must produce byte-identical current.json");
     }
 
     #[test]
