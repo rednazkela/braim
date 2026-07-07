@@ -298,6 +298,16 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
+    #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • proven-only (issue braims are per-task scratch; only verified knowledge earns\n    central, ID:231) — override with --include-unproven\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
+    Export {
+        domain: String,
+        #[arg(long, help = "Target braim data dir (e.g. ~/.braim_central)")]
+        to: String,
+        #[arg(long, help = "Also export unproven/partial statements (default: proven and proven_strong only)")]
+        include_unproven: bool,
+        #[arg(long, help = "Remap domain names during export (format: old:new,old2:new2)")]
+        domain_map: Vec<String>,
+    },
     #[command(about = "Convert this data dir to the sharded per-domain layout", long_about = "Shard: Convert single-file storage (current.json) to the sharded per-domain layout.\n\nLayout after conversion:\n  domains/<domain>-<hash>.json   one file per home domain (a node's home = first domains entry)\n  graph.json                     cross-domain state: dictionary, gaps, edges, counters\n  current.json.pre-shard         archived single-file snapshot (escape hatch)\n\nSemantics (braim ID:217/236):\n  • The in-memory graph stays ONE merged view — queries and traversal are unchanged.\n  • Every mutation rewrites the affected shard files; version save still writes whole-graph vNNNN.json snapshots.\n  • Domain filenames carry a deterministic hash suffix so distinct domains like 'Billing' and 'billing' never collide, including on case-insensitive filesystems (macOS/Windows).\n\nDetection is automatic: any braim command on a dir containing domains/ loads the sharded layout.")]
     Shard,
     #[command(about = "Semantic similarity search over node labels (requires --features embeddings)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
@@ -1800,6 +1810,48 @@ fn main() {
                         println!("✓ Migrated {} node(s) to claim/fact/invalid_statement", changed);
                     }
                     Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Export { domain, to, include_unproven, domain_map } => {
+            let mut domain_mappings = HashMap::new();
+            for mapping in domain_map {
+                for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
+                    let parts: Vec<&str> = pair.split(':').collect();
+                    if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+                        eprintln!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair);
+                        std::process::exit(1);
+                    }
+                    domain_mappings.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
+                }
+            }
+            // Mappings apply before filtering, so filter on the post-map name.
+            let effective_domain = domain_mappings.get(&domain).cloned().unwrap_or_else(|| domain.clone());
+
+            match Braim::new(&to) {
+                Ok(mut target) => {
+                    match target.import_state(
+                        braim.state.clone(),
+                        Some(&effective_domain),
+                        !include_unproven,
+                        domain_mappings,
+                        true,
+                    ) {
+                        Ok(manifest) => {
+                            println!("✓ Exported domain '{}' → {}", effective_domain, to);
+                            println!("  Published: {} nodes ({} deduplicated into existing central nodes)",
+                                manifest.imported_count, manifest.deduplicated_count);
+                            println!("  Source entities: {}  Edges: {} because_of, {} contradicts",
+                                manifest.sources_imported, manifest.because_of_imported, manifest.contradicts_imported);
+                            if manifest.sources_unioned > 0 {
+                                println!("  Corroboration: {} central node(s) gained sources from this export", manifest.sources_unioned);
+                            }
+                            println!("\nCheckpoint central: braim --data-dir {} version save \"export {} from $(pwd)\"", to, effective_domain);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             }

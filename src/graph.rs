@@ -3216,12 +3216,31 @@ impl Braim {
         domain_mappings: HashMap<String, String>,
         full: bool,
     ) -> Result<ImportManifest, String> {
-        // Load source graph
-        let source_content = fs::read_to_string(source_path)
-            .map_err(|e| format!("Error reading source file: {}", e))?;
-        let mut source_state: GraphState = serde_json::from_str(&source_content)
-            .map_err(|e| format!("Error parsing source graph: {}", e))?;
+        let path = PathBuf::from(source_path);
+        let source_state: GraphState = if path.is_dir() && path.join("domains").is_dir() {
+            // Sharded source dir: merge its shards exactly as load does.
+            Self::load_sharded(&path)?
+        } else {
+            let file = if path.is_dir() { path.join("current.json") } else { path };
+            let source_content = fs::read_to_string(&file)
+                .map_err(|e| format!("Error reading source file: {}", e))?;
+            serde_json::from_str(&source_content)
+                .map_err(|e| format!("Error parsing source graph: {}", e))?
+        };
+        self.import_state(source_state, filter_domain, only_proven, domain_mappings, full)
+    }
 
+    /// Core of import/export: merge an in-memory source state into this graph.
+    /// `braim export` calls this directly with the working graph's state — the
+    /// contribute flow and the consume flow are one code path (braim ID:232/240).
+    pub fn import_state(
+        &mut self,
+        mut source_state: GraphState,
+        filter_domain: Option<&str>,
+        only_proven: bool,
+        domain_mappings: HashMap<String, String>,
+        full: bool,
+    ) -> Result<ImportManifest, String> {
         // Apply domain mappings to source nodes
         for node in source_state.nodes.values_mut() {
             let mut remapped_domains = Vec::new();
@@ -3241,6 +3260,33 @@ impl Braim {
         let mut because_of_imported = 0;
         let mut contradicts_imported = 0;
         let mut sources_unioned = 0;
+
+        // Domain filtering is closure-aware: the admitted set is the domain's own
+        // nodes PLUS everything they transitively depend on (concepts, statements,
+        // attached source entities), regardless of those dependencies' domains.
+        // Bare same-domain filtering silently dropped every statement with a
+        // cross-domain dependency (braim ID:180); a published domain slice must be
+        // self-contained — the vendored-closure pack decision (ID:220).
+        let domain_admitted: Option<HashSet<u32>> = filter_domain.map(|d| {
+            let mut admitted: HashSet<u32> = HashSet::new();
+            let mut frontier: Vec<u32> = source_state.nodes.values()
+                .filter(|n| n.domains.contains(&d.to_string()))
+                .map(|n| n.id)
+                .collect();
+            while let Some(id) = frontier.pop() {
+                if !admitted.insert(id) {
+                    continue;
+                }
+                if let Some(n) = source_state.nodes.get(&id) {
+                    frontier.extend(n.depends_on.keys().copied());
+                    frontier.extend(n.source_ids.iter().copied());
+                }
+            }
+            admitted
+        });
+        let in_domain_scope = |node: &Node| -> bool {
+            domain_admitted.as_ref().map_or(true, |adm| adm.contains(&node.id))
+        };
 
         // Meets the only-proven bar: proven AND proven_strong (rank comparison —
         // `!= Proven` silently dropped proven_strong nodes).
@@ -3302,8 +3348,13 @@ impl Braim {
         };
 
         // Process source entities first: statements remap source_ids against them.
-        // Dedup key: same label (case-insensitive) and location.
+        // Dedup key: same label (case-insensitive) and location. Under a domain
+        // filter, only entities referenced by admitted statements cross.
         for node in source_entities {
+            if !in_domain_scope(&node) {
+                skipped_count += 1;
+                continue;
+            }
             let found = self.state.nodes.iter().find(|(_, t)| {
                 t.node_type == NodeType::Source
                     && t.label.to_lowercase() == node.label.to_lowercase()
@@ -3327,11 +3378,9 @@ impl Braim {
 
         // Process atomics first
         for node in atomics {
-            if let Some(domain_filter) = filter_domain {
-                if !node.domains.contains(&domain_filter.to_string()) {
-                    skipped_count += 1;
-                    continue;
-                }
+            if !in_domain_scope(&node) {
+                skipped_count += 1;
+                continue;
             }
 
             if !concept_admitted(&node) {
@@ -3388,11 +3437,9 @@ impl Braim {
 
         // Process compounds
         for node in compounds {
-            if let Some(domain_filter) = filter_domain {
-                if !node.domains.contains(&domain_filter.to_string()) {
-                    skipped_count += 1;
-                    continue;
-                }
+            if !in_domain_scope(&node) {
+                skipped_count += 1;
+                continue;
             }
 
             if !concept_admitted(&node) {
@@ -3476,11 +3523,9 @@ impl Braim {
             let mut progressed = false;
 
             for node in pending {
-                if let Some(domain_filter) = filter_domain {
-                    if !node.domains.contains(&domain_filter.to_string()) {
-                        skipped_count += 1;
-                        continue;
-                    }
+                if !in_domain_scope(&node) {
+                    skipped_count += 1;
+                    continue;
                 }
 
                 if only_proven && !proven_ok(node.verification_status) {
@@ -4174,6 +4219,48 @@ mod defect_tests {
         let new_s = m.id_mappings[&s];
         assert_eq!(dst.get_node(new_s).unwrap().verification_status, VerificationStatus::ProvenStrong);
         assert!(!m.id_mappings.contains_key(&junk), "unproven statement must not cross");
+    }
+
+    #[test]
+    fn domain_export_carries_dependency_closure() {
+        // Working graph: billing statement standing on a concept from another
+        // domain, plus an unrelated other-domain node. Export must vendored-carry
+        // the closure (ID:220, fixing lossy slice ID:180) and leave the rest.
+        let mut work = temp_braim("export_closure_src");
+        let bill = work.add_concept("Invoice: payment request document", vec!["billing".into()], vec!["narrative:x".into()], None).unwrap();
+        let other = work.add_concept("Account: customer record", vec!["crm".into()], vec!["narrative:x".into()], None).unwrap();
+        let unrelated = work.add_concept("Ticket: support case", vec!["crm".into()], vec!["narrative:x".into()], None).unwrap();
+        let s = work.add_statement("invoices belong to accounts", vec!["billing".into()],
+            vec!["code:b.rs:1".into(), "doc:b.md:2".into()], HashMap::from([(bill, 0.6), (other, 0.4)]), true).unwrap();
+        let se = work.add_source("billing spec", "doc", Some("doc:spec.md".into()), None).unwrap();
+        work.add_source_to_statement(s, se).unwrap();
+
+        let mut central = temp_braim("export_closure_dst");
+        let m = central.import_state(work.state.clone(), Some("billing"), true, HashMap::new(), true).unwrap();
+
+        // statement + its billing concept + its cross-domain concept dep cross
+        assert!(m.id_mappings.contains_key(&s), "proven billing statement crosses");
+        assert!(m.id_mappings.contains_key(&bill));
+        assert!(m.id_mappings.contains_key(&other), "cross-domain dependency must be vendored (ID:180)");
+        assert_eq!(m.sources_imported, 1, "attached source entity crosses via closure");
+        // unrelated other-domain node stays home
+        assert!(!m.id_mappings.contains_key(&unrelated), "unrelated crm node must not cross");
+        // fidelity: status preserved through the export path
+        let ns = m.id_mappings[&s];
+        assert_eq!(central.get_node(ns).unwrap().verification_status,
+            work.get_node(s).unwrap().verification_status);
+    }
+
+    #[test]
+    fn import_reads_sharded_source_dir() {
+        let (mut src, s1, _) = import_fixture("sharded_source");
+        let dir = src.data_dir.clone();
+        src.shard_layout().unwrap();
+
+        let mut dst = temp_braim("sharded_source_dst");
+        let m = dst.import_graph(dir.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
+        assert!(m.id_mappings.contains_key(&s1), "import must load a sharded source dir");
+        assert_eq!(m.because_of_imported, 1);
     }
 
     #[test]
