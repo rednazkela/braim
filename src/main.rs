@@ -119,7 +119,7 @@ QUERY DEFAULTS (filter flags compose orthogonally):\n\
   --min-trust partial|proven                 → filter by verification level\n\
   --primary-only                             → only statements with ≥1 PRIMARY source\n\n\
   Concepts (atomic/compound) are always returned regardless of these flags.\n\n\
-SEMANTIC SIMILARITY (optional; build with --features embeddings):\n\
+SEMANTIC SIMILARITY (included in the default build):\n\
   braim similar \"<text>\"            → nearest labels by MEANING (zero shared words ok)\n\
   braim similar \"<label>\" --dedup   → write-time duplicate check (floor 0.8)\n\
   --check-dupes on concept/statement add → same check inline, advisory warn\n\
@@ -242,7 +242,7 @@ enum Commands {
         include_invalid: bool,
         #[arg(long, help = "Include contested statements (hidden by default)")]
         include_contested: bool,
-        #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (requires --features embeddings)")]
+        #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (default build; absent only with --no-default-features)")]
         semantic: bool,
     },
     #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.\n\nTraverses both depends_on (compositional, weighted) and because_of (causal,\nunweighted — followed cause → consequent at full weight, refuted links skipped).\nbecause_of endpoints are statements, so concept-to-concept paths are unaffected;\npass statement IDs to follow a causal chain.")]
@@ -267,7 +267,7 @@ enum Commands {
     Domains,
     #[command(about = "Audit the graph for consistency, gaps, and verification issues", long_about = "Audit: Scan the entire graph for problems and verification status.\n\nChecks:\n  • Orphan nodes (active, unreferenced, no dependencies)\n  • Pending nodes (declared but unintegrated)\n  • Statements grouped by verification status:\n      ✓✓✓ ProvenStrong (3+ PRIMARY sources)\n      ✓✓ Proven (2+ PRIMARY sources)\n      ✓ Partial (1 PRIMARY source)\n      ✗ Unproven (0 PRIMARY sources)\n  • Invalid statements (refuted claims)\n  • Deprecated nodes still referenced\n  • Gap register: zero-path relationships\n  • Weight constraint violations (must sum to 1.0)\n  • Causal-edge (because_of) health:\n      - Refuted links: edges a failed inverse test marked invalid\n      - Re-investigation flags: statements above an invalidated cause\n      - Untested links: active because_of edges with no inverse test\n      - Unverified roots: chains bottoming out below proven\n\nOutput organization:\n  1. Orphan nodes needing integration\n  2. Pending nodes (incomplete)\n  3. Gap register (missing connections)\n  4. Deprecated nodes still in use\n  5. Causal-edge health (refuted / flagged / untested / unverified roots)\n  6. Statement verification status breakdown\n  7. Invalid statements with reasons\n\nUse audit regularly to track:\n  • Verification coverage (% proven vs unproven)\n  • Integration status (orphans, pending)\n  • Consistency issues (gaps, weight violations)\n  • Deprecation problems (deprecated referenced)\n\nSemantic checks (--semantic, requires --features embeddings):\n  • Near-duplicates: unconnected node pairs with label cosine >= 0.80\n  • Label echoes: statements restating a dependency's label (cosine >= 0.75)\n    — single-concept elaborations that add no relationship\nBoth reuse the .braim/embeddings.json sidecar index and are ADVISORY.")]
     Audit {
-        #[arg(long, help = "Embedding-based checks: near-duplicate pairs and label echoes (requires --features embeddings)")]
+        #[arg(long, help = "Embedding-based checks: near-duplicate pairs and label echoes (default build; absent only with --no-default-features)")]
         semantic: bool,
     },
     #[command(about = "List all nodes (optionally filtered by domain or type)", long_about = "List: Display all nodes in the graph.\n\nExamples:\n  braim list                        # All nodes\n  braim list --domain payment       # Only 'payment' domain\n  braim list --type statement       # Only statements\n  braim list --domain acme --type atomic  # Combine filters\n\nOutput: ID, label, type, domains, source count, verification status.")]
@@ -315,7 +315,7 @@ enum Commands {
     },
     #[command(about = "Convert this data dir to the sharded per-domain layout", long_about = "Shard: Convert single-file storage (current.json) to the sharded per-domain layout.\n\nLayout after conversion:\n  domains/<domain>-<hash>.json   one file per home domain (a node's home = first domains entry)\n  graph.json                     cross-domain state: dictionary, gaps, edges, counters\n  current.json.pre-shard         archived single-file snapshot (escape hatch)\n\nSemantics (braim ID:217/236):\n  • The in-memory graph stays ONE merged view — queries and traversal are unchanged.\n  • Every mutation rewrites the affected shard files; version save still writes whole-graph vNNNN.json snapshots.\n  • Domain filenames carry a deterministic hash suffix so distinct domains like 'Billing' and 'billing' never collide, including on case-insensitive filesystems (macOS/Windows).\n\nDetection is automatic: any braim command on a dir containing domains/ loads the sharded layout.")]
     Shard,
-    #[command(about = "Semantic similarity search over node labels (requires --features embeddings)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
+    #[command(about = "Semantic similarity search over node labels (default build; absent only with --no-default-features)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
     Similar {
         text: String,
         #[arg(long, default_value = "8", help = "Number of results to return")]
@@ -382,7 +382,7 @@ enum ConceptCommands {
         depends: Option<String>,
         #[arg(long, help = "Reject concepts with duplicate sources or PRIMARY+TERTIARY mix")]
         strict_sources: bool,
-        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
     },
     #[command(about = "Delete a concept (requires --force unless unused)", long_about = "Concept Delete: Remove a concept from the graph.\n\nUsage:\n  braim concept delete 42         # Fails if concept is referenced\n  braim concept delete 42 --force # Force delete (dangerous, breaks statements)\n\nSafety: Deleting a concept breaks any statements/compounds that depend on it.\nUse --force only if you're certain no statements reference this ID.")]
@@ -428,7 +428,7 @@ enum StatementCommands {
         strict_sources: bool,
         #[arg(long, help = "Reject statements with duplicate domains")]
         strict_domains: bool,
-        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
     },
     #[command(about = "Add verification evidence for a statement", long_about = "Statement Verify: Record evidence that supports a statement.\n\n⚠ NOTE: Verification status is now AUTO-CALCULATED from typed sources at statement creation.\nThis command is maintained for backward compatibility but is rarely needed.\n\nModern approach (preferred):\n  braim statement add \"...\" --sources \"code:a.rs,doc:b.md\" ...\n  → Status auto-calculated to PROVEN (2 PRIMARY sources)\n\nLegacy approach (still supported):\n  braim statement verify 42 wikipedia --note \"https://en.wikipedia.org/wiki/Payment\"\n  braim statement verify 42 rfc --note \"RFC 3501 section 3.2\"\n\nOld Verification Levels (deprecated, kept for audit trail):\n  • 0-1 verified_by domains: Unproven\n  • 2 verified_by domains: Partial\n  • 3+ verified_by domains: Proven\n\nUse statement add with typed sources instead. Sources determine verification automatically.")]
