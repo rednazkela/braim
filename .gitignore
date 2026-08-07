@@ -5,5 +5,12 @@ Cargo.lock
 
 # local run artifacts (not source)
 .braim/
-.claude/
 .rctags/
+
+.claude/
+
+# NOTE: .claude/skills/ IS tracked despite the rule above — skills are agent
+# contracts that ship with the tool the way policies/ does, and .claude/skills
+# is the only place they are invocable from. They were added with `git add -f`;
+# already-tracked files stay tracked, so no negation pattern is needed (and a
+# negation could not work anyway while a global ignore excludes .claude/).
