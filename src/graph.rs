@@ -3571,6 +3571,7 @@ impl Braim {
         Ok(())
     }
 
+    /// `min_status` is the verification floor for admission (`None` = admit all).
     /// `full` = full-fidelity (trusted self-import, braim ID:229/234): preserves
     /// verification state instead of resetting it, imports source entities and
     /// remaps statement source_ids, carries because_of/contradicts edges, and
@@ -3580,7 +3581,7 @@ impl Braim {
         &mut self,
         source_path: &str,
         filter_domain: Option<&str>,
-        only_proven: bool,
+        min_status: Option<VerificationStatus>,
         domain_mappings: HashMap<String, String>,
         full: bool,
     ) -> Result<ImportManifest, String> {
@@ -3596,7 +3597,7 @@ impl Braim {
             serde_json::from_str(&source_content)
                 .map_err(|e| format!("Error parsing source graph: {}", e))?
         };
-        self.import_state(source_state, filter_domain, only_proven, domain_mappings, full)
+        self.import_state(source_state, filter_domain, min_status, domain_mappings, full)
     }
 
     /// Core of import/export: merge an in-memory source state into this graph.
@@ -3606,7 +3607,7 @@ impl Braim {
         &mut self,
         mut source_state: GraphState,
         filter_domain: Option<&str>,
-        only_proven: bool,
+        min_status: Option<VerificationStatus>,
         domain_mappings: HashMap<String, String>,
         full: bool,
     ) -> Result<ImportManifest, String> {
@@ -3657,9 +3658,13 @@ impl Braim {
             domain_admitted.as_ref().map_or(true, |adm| adm.contains(&node.id))
         };
 
-        // Meets the only-proven bar: proven AND proven_strong (rank comparison —
-        // `!= Proven` silently dropped proven_strong nodes).
-        let proven_ok = |s: VerificationStatus| s.rank() >= VerificationStatus::Proven.rank();
+        // Verification floor for admission. A rank comparison, not equality:
+        // `!= Proven` silently dropped proven_strong nodes. `None` admits
+        // everything. Export defaults to a Partial floor so a statement with one
+        // PRIMARY source can publish and corroborate (braim ID:253); import
+        // --only-proven passes Proven.
+        let meets_floor =
+            |s: VerificationStatus| min_status.map_or(true, |m| s.rank() >= m.rank());
 
         // Collect nodes by type for ordered processing; sorted by id so import
         // results don't depend on HashMap iteration order.
@@ -3692,10 +3697,10 @@ impl Braim {
         // dependencies and imports nothing. Statement-typed dependencies need no
         // exemption: MIN-inheritance already guarantees a proven statement's
         // statement deps are themselves at proven rank.
-        let needed_concepts: HashSet<u32> = if only_proven {
+        let needed_concepts: HashSet<u32> = if min_status.is_some() {
             let mut needed: HashSet<u32> = HashSet::new();
             let mut frontier: Vec<u32> = statements.iter()
-                .filter(|s| proven_ok(s.verification_status))
+                .filter(|s| meets_floor(s.verification_status))
                 .flat_map(|s| s.depends_on.keys().copied())
                 .collect();
             while let Some(id) = frontier.pop() {
@@ -3713,7 +3718,7 @@ impl Braim {
             HashSet::new()
         };
         let concept_admitted = |node: &Node| -> bool {
-            !only_proven || proven_ok(node.verification_status) || needed_concepts.contains(&node.id)
+            min_status.is_none() || meets_floor(node.verification_status) || needed_concepts.contains(&node.id)
         };
 
         // Process source entities first: statements remap source_ids against them.
@@ -3897,7 +3902,7 @@ impl Braim {
                     continue;
                 }
 
-                if only_proven && !proven_ok(node.verification_status) {
+                if !meets_floor(node.verification_status) {
                     skipped_count += 1;
                     continue;
                 }
@@ -4498,7 +4503,7 @@ mod defect_tests {
         let src_status = src.get_node(s1).unwrap().verification_status;
 
         let mut dst = temp_braim("full_import_dst");
-        let m = dst.import_graph(src_path.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
 
         // everything crossed: 2 concepts + 3 statements imported, 1 source entity
         assert_eq!(m.imported_count, 5);
@@ -4525,7 +4530,7 @@ mod defect_tests {
         let src_path = src.data_dir.join("current.json");
 
         let mut dst = temp_braim("legacy_import_dst");
-        let m = dst.import_graph(src_path.to_str().unwrap(), None, false, HashMap::new(), false).unwrap();
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, None, HashMap::new(), false).unwrap();
 
         assert_eq!(m.sources_imported, 0);
         assert_eq!(m.because_of_imported, 0);
@@ -4553,7 +4558,7 @@ mod defect_tests {
             vec!["doc:spec.md:9".into()], HashMap::from([(sa, 0.6), (sc, 0.4)]), true).unwrap();
         let src_path = src.data_dir.join("current.json");
 
-        let m = dst.import_graph(src_path.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
         assert_eq!(m.sources_unioned, 1);
 
         let n = dst.get_node(s).unwrap();
@@ -4583,7 +4588,7 @@ mod defect_tests {
         // --only-proven admits: the proven_strong statement (rank fix: != Proven
         // used to drop it) PLUS its concept closure (concepts are vocabulary and
         // are admitted as dependencies regardless of their own status).
-        let m = dst.import_graph(src_path.to_str().unwrap(), None, true, HashMap::new(), true).unwrap();
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, Some(VerificationStatus::Proven), HashMap::new(), true).unwrap();
         assert_eq!(m.imported_count, 3, "proven_strong statement + its 2 concepts");
         let new_s = m.id_mappings[&s];
         assert_eq!(dst.get_node(new_s).unwrap().verification_status, VerificationStatus::ProvenStrong);
@@ -4605,7 +4610,7 @@ mod defect_tests {
         work.add_source_to_statement(s, se).unwrap();
 
         let mut central = temp_braim("export_closure_dst");
-        let m = central.import_state(work.state.clone(), Some("billing"), true, HashMap::new(), true).unwrap();
+        let m = central.import_state(work.state.clone(), Some("billing"), Some(VerificationStatus::Proven), HashMap::new(), true).unwrap();
 
         // statement + its billing concept + its cross-domain concept dep cross
         assert!(m.id_mappings.contains_key(&s), "proven billing statement crosses");
@@ -4627,7 +4632,7 @@ mod defect_tests {
         src.shard_layout().unwrap();
 
         let mut dst = temp_braim("sharded_source_dst");
-        let m = dst.import_graph(dir.to_str().unwrap(), None, false, HashMap::new(), true).unwrap();
+        let m = dst.import_graph(dir.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
         assert!(m.id_mappings.contains_key(&s1), "import must load a sharded source dir");
         assert_eq!(m.because_of_imported, 1);
     }

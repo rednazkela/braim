@@ -7,7 +7,7 @@ mod tips;
 mod embed;
 
 use clap::{Parser, Subcommand};
-use graph::{Braim, NodeType, AddSourceResult};
+use graph::{Braim, NodeType, AddSourceResult, VerificationStatus};
 use std::collections::HashMap;
 
 #[derive(Parser)]
@@ -298,12 +298,12 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
-    #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • proven-only (issue braims are per-task scratch; only verified knowledge earns\n    central, ID:231) — override with --include-unproven\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
+    #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • floor at PARTIAL: a statement needs at least one PRIMARY source to publish,\n    so evidence-free claims stay home while single-source findings can reach\n    central and corroborate there (braim ID:253). --include-unproven removes\n    the floor entirely.\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
     Export {
         domain: String,
         #[arg(long, help = "Target braim data dir (e.g. ~/.braim_central)")]
         to: String,
-        #[arg(long, help = "Also export unproven/partial statements (default: proven and proven_strong only)")]
+        #[arg(long, help = "Also export unproven statements (default floor: partial, i.e. at least one PRIMARY source)")]
         include_unproven: bool,
         #[arg(long, help = "Remap domain names during export (format: old:new,old2:new2)")]
         domain_map: Vec<String>,
@@ -1736,7 +1736,7 @@ fn main() {
             match braim.import_graph(
                 &actual_source,
                 filter_domain.as_deref(),
-                only_proven,
+                if only_proven { Some(VerificationStatus::Proven) } else { None },
                 domain_mappings,
                 full,
             ) {
@@ -1872,7 +1872,10 @@ fn main() {
                     match target.import_state(
                         braim.state.clone(),
                         Some(&effective_domain),
-                        !include_unproven,
+                        // Floor at Partial, not Proven: one PRIMARY source is real
+                        // evidence and must be publishable, or two teammates each
+                        // holding one type can never corroborate (braim ID:253).
+                        if include_unproven { None } else { Some(VerificationStatus::Partial) },
                         domain_mappings,
                         true,
                     ) {

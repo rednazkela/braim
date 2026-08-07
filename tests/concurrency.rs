@@ -676,12 +676,12 @@ fn concurrent_identical_findings_union_their_sources() {
     shared(&a, "code:billing.rs:42");
     shared(&b, "doc:billing_spec.md:7");
 
-    // --include-unproven is required, and that is itself the finding recorded as
-    // braim ID:251: each client alone holds ONE PRIMARY type, so each is only
-    // `partial`. Under the proven-only export default neither would publish and
-    // the union that promotes them to proven could never happen.
-    let ca = braim_spawn(&a, &["export", "billing", "--to", &central, "--include-unproven"]);
-    let cb = braim_spawn(&b, &["export", "billing", "--to", &central, "--include-unproven"]);
+    // Deliberately NO --include-unproven: each client alone holds one PRIMARY
+    // type and is therefore only `partial`. The default export floor sits at
+    // partial precisely so both publish and corroborate in central (braim
+    // ID:253); under the old proven-only default neither would have crossed.
+    let ca = braim_spawn(&a, &["export", "billing", "--to", &central]);
+    let cb = braim_spawn(&b, &["export", "billing", "--to", &central]);
     for mut c in [ca, cb] {
         c.wait().unwrap();
     }
