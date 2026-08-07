@@ -1,3 +1,4 @@
+mod dream;
 mod graph;
 mod manifest;
 mod tips;
@@ -7,6 +8,7 @@ mod tips;
 mod embed;
 
 use clap::{Parser, Subcommand};
+use dream::{Candidate, DreamOptions, Strategy};
 use graph::{Braim, NodeType, AddSourceResult, VerificationStatus};
 use std::collections::HashMap;
 
@@ -308,6 +310,8 @@ enum Commands {
         #[arg(long, help = "Remap domain names during export (format: old:new,old2:new2)")]
         domain_map: Vec<String>,
     },
+    #[command(subcommand, about = "Dream: surface node pairs an LLM should examine for missing relations")]
+    Dream(DreamCommands),
     #[command(about = "Rename a domain across the graph", long_about = "RenameDomain: Replace a domain name on every node that carries it.\n\nUsage:\n  braim rename-domain Billing braim_demo\n\nEffect:\n  • Every node listing the old domain gets the new name (duplicates collapsed)\n  • In sharded layout, affected nodes re-home into the new domain's shard file;\n    the old current shard is pruned\n  • Versioned snapshots (*.vNNNN.json) are immutable history and keep the old name\n\nRename vs merge: renaming onto an EXISTING domain name merges the two domains —\nverify with evidence first that they mean the same thing (braim ID:244: same-name\ndomains proved to be demo vocabulary vs real billing knowledge).")]
     RenameDomain {
         old: String,
@@ -504,6 +508,34 @@ enum StatementCommands {
 }
 
 #[derive(Subcommand)]
+enum DreamCommands {
+    #[command(about = "List node pairs worth an LLM's judgement", long_about = "Dream Candidates: rank unconnected node pairs that an LLM should examine for a missing relation.\n\nUsage:\n  braim dream candidates --limit 50\n  braim dream candidates --strategy shared-source,two-hop --json\n  braim dream candidates --strategy semantic --min-semantic 0.8\n\nWhy braim picks the pairs: a 3,000-node graph has ~5 million pairs, so unguided\nsampling burns an overnight budget on noise. braim does the cheap deterministic\nhalf (which pairs are worth reading); the LLM does the expensive half (whether a\nrelation is real and whether sources prove it).\n\nStrategies:\n  shared-source  both nodes cite the same PRIMARY source but were never linked\n  two-hop        A-B and B-C exist, A-C does not (transitive candidate)\n  semantic       labels semantically close yet more than two hops apart\n  gap            a registered zero-path pair a real query already wanted\n\nA pair nominated by several strategies scores higher — independent structural\nsignals agreeing is itself evidence.\n\nExcluded by default: directly linked pairs, invalid nodes, source entities,\nagent-scratch markers (--include-scratch overrides), and pairs already recorded\nin the dream ledger (--replay overrides).\n\nThis command is READ-ONLY. Dream output must land as unproven claims in a local\nworking graph and earn promotion through genuinely re-grounded PRIMARY sources,\nlike any other statement — an LLM asked whether two nodes relate will nearly\nalways say yes.\n\nRefused on graphs marked central (.braim.central): a dream is an unreviewed\nhypothesis, and an unattended central has no reviewer.")]
+    Candidates {
+        #[arg(long, default_value = "25", help = "Maximum pairs to emit")]
+        limit: usize,
+        #[arg(long, help = "Comma-separated: shared-source, two-hop, semantic, gap (default: all but semantic)")]
+        strategy: Option<String>,
+        #[arg(long, help = "Minimum cosine for the semantic strategy")]
+        min_semantic: Option<f32>,
+        #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
+        include_scratch: bool,
+        #[arg(long, help = "Reconsider pairs already recorded in the dream ledger")]
+        replay: bool,
+        #[arg(long, help = "Emit JSON for an agent loop to consume")]
+        json: bool,
+    },
+    #[command(about = "Record a dream verdict so the pair is not re-examined", long_about = "Dream Seen: write a pair's adjudication into the dream ledger (dreams.json).\n\nUsage:\n  braim dream seen 42 99 --verdict no-relation\n  braim dream seen 42 99 --verdict proposed --note \"statement ID:150 added\"\n\nVerdicts:\n  no-relation    examined, nothing there — never offer this pair again\n  proposed       a relation was recorded as an unproven claim for review\n  verified       a relation was recorded WITH re-grounded PRIMARY sources\n  contradiction  the two nodes actually disagree; a contradicts edge was raised\n\nThe ledger is what lets successive nights advance instead of re-treading the\nsame pairs.")]
+    Seen {
+        a: u32,
+        b: u32,
+        #[arg(long, help = "no-relation | proposed | verified | contradiction")]
+        verdict: String,
+        #[arg(long, help = "Optional note (e.g. the statement id that was created)")]
+        note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SourceCommands {
     #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim source add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim source add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n  --strict-sources: Reject if label contains a line-number suffix (default: warn)\n\nLine-number warning:\n  Labels like 'tests/oracle.txt:104-127' or 'file.rs:42' are warned by default\n  and rejected with --strict-sources. Source nodes are stable file-level identity;\n  line numbers belong in --sources metadata strings, not node labels.\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
     Add {
@@ -621,6 +653,7 @@ fn is_read_only(cmd: &Commands) -> bool {
             | Commands::Similar { .. }
             | Commands::Why { .. }
             | Commands::Export { .. }
+            | Commands::Dream(DreamCommands::Candidates { .. })
             | Commands::Statement(StatementCommands::VerifySuggest { .. })
             | Commands::Version(VersionCommands::List)
     )
@@ -1897,6 +1930,65 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Dream(DreamCommands::Candidates {
+            limit,
+            strategy,
+            min_semantic,
+            include_scratch,
+            replay,
+            json,
+        }) => {
+            if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            // Default set omits `semantic`: it needs the embedding index, which
+            // costs a model load and a full pass. Ask for it explicitly.
+            let strategies = match strategy.as_deref() {
+                None => vec![Strategy::SharedSource, Strategy::TwoHop, Strategy::RegisteredGap],
+                Some(list) => {
+                    let mut out = Vec::new();
+                    for part in list.split(',').filter(|p| !p.trim().is_empty()) {
+                        match Strategy::parse(part) {
+                            Ok(s) => out.push(s),
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    out
+                }
+            };
+            let opts = DreamOptions {
+                min_semantic: min_semantic.unwrap_or(dream::DEFAULT_MIN_SEMANTIC),
+                limit,
+                include_scratch,
+                replay,
+                strategies: strategies.clone(),
+            };
+            let semantic_pairs = if strategies.contains(&Strategy::Semantic) {
+                semantic_pair_scores(&braim, &cli.data_dir, opts.min_semantic, cli.quiet)
+            } else {
+                Vec::new()
+            };
+            let found = dream::candidates(&braim, &opts, &semantic_pairs);
+            print_candidates(&found, json, limit);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Seen { a, b, verdict, note }) => {
+            if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            match dream::record_ledger(&braim.data_dir, a, b, &verdict, note) {
+                Ok(()) => {
+                    println!("✓ Dream ledger updated: ID:{} ↔ ID:{} = {}", a, b, verdict);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         Commands::RenameDomain { old, new } => {
             match braim.rename_domain(&old, &new) {
                 Ok(touched) => {
@@ -2310,4 +2402,100 @@ fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Render the dream worklist. JSON is the agent-loop surface; the text form is
+/// for a human sanity-checking what the night will chew on.
+fn print_candidates(found: &[Candidate], json: bool, limit: usize) {
+    if json {
+        match serde_json::to_string_pretty(found) {
+            Ok(s) => println!("{}", s),
+            Err(e) => eprintln!("Failed to serialize candidates: {}", e),
+        }
+        return;
+    }
+    if found.is_empty() {
+        println!("No dream candidates — every eligible pair is already linked or adjudicated.");
+        return;
+    }
+    println!("Dream candidates ({} of max {}):\n", found.len(), limit);
+    for c in found {
+        println!(
+            "  {:.2}  [{}]  ID:{} ↔ ID:{}",
+            c.score,
+            c.strategies.join("+"),
+            c.a,
+            c.b
+        );
+        println!("        A: {}  {:?}", c.a_label, c.a_domains);
+        println!("        B: {}  {:?}", c.b_label, c.b_domains);
+        println!("        why: {}\n", c.rationale);
+    }
+    println!("Adjudicate each pair, then record it:");
+    println!("  braim dream seen <a> <b> --verdict no-relation|proposed|verified|contradiction");
+}
+
+/// All node pairs whose labels sit above `threshold` cosine. Quadratic in nodes,
+/// which is fine for a local working graph — and dreaming is refused on central,
+/// the only graph large enough for that to matter.
+#[cfg(feature = "embeddings")]
+fn semantic_pair_scores(
+    braim: &Braim,
+    data_dir: &str,
+    threshold: f32,
+    quiet: bool,
+) -> Vec<(u32, u32, f32)> {
+    use embed::{corpus, cosine, refresh_index, EmbedIndex, FastEmbedder, EMBED_SIDECAR};
+
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = match FastEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("(semantic strategy unavailable: {})", e);
+            return Vec::new();
+        }
+    };
+    match refresh_index(&mut embedder, &mut index, &rows, false) {
+        Ok(n) if n > 0 => {
+            let _ = index.save(data_path);
+            if !quiet {
+                eprintln!("(refreshed index: embedded {} node(s) -> {})", n, EMBED_SIDECAR);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("(semantic strategy unavailable: {})", e);
+            return Vec::new();
+        }
+    }
+
+    let ids: Vec<u32> = {
+        let mut v: Vec<u32> = index.vectors.keys().copied().collect();
+        v.sort();
+        v
+    };
+    let mut out = Vec::new();
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            let (a, b) = (ids[i], ids[j]);
+            if let (Some(va), Some(vb)) = (index.vectors.get(&a), index.vectors.get(&b)) {
+                let c = cosine(&va.vec, &vb.vec);
+                if c >= threshold {
+                    out.push((a, b, c));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn semantic_pair_scores(_: &Braim, _: &str, _: f32, _: bool) -> Vec<(u32, u32, f32)> {
+    eprintln!("(the semantic strategy needs the embeddings feature; this binary was built with --no-default-features)");
+    Vec::new()
 }
