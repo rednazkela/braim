@@ -62,7 +62,7 @@ source document disagree, the document wins.
 
 | Verdict | When |
 |---|---|
-| `no-relation` | the default — nothing specific connects them |
+| `no-relation` | the default — nothing specific connects them, **or** the relation is real but already asserted by an existing statement, in which case say so in the note rather than restating it |
 | `duplicate` | both assert the same thing about the same subject |
 | `contradiction` | both are about the same subject and cannot both be true |
 | `proposed` | a real relation, but you could not verify it in sources |
@@ -72,13 +72,19 @@ source document disagree, the document wins.
 
 `no-relation` — no graph write.
 
-`duplicate` — pick the survivor: better-sourced first, then more precise label,
-then more referenced. Then:
+`duplicate` — pick the survivor by **verification status first**, then by
+referent count, and only then by label precision. Status is the right primary
+key because verification is `MIN(source-derived, weakest statement dependency)`:
+the winner's dependency structure sets a ceiling that unioned sources cannot
+lift. Choosing the prettier label over the better-verified node demotes the
+surviving knowledge — measured, not hypothetical (braim ID:262).
+
 ```bash
 braim merge-nodes <winner> <loser>
 ```
-If it warns about dependencies only the loser had, **do not** wire them in
-yourself; note them in the report for the human.
+The loser's label is destroyed, so if it carried detail the winner lacks, say so
+in the report. If the command warns about dependencies only the loser had, **do
+not** wire them in yourself; note them for the human.
 
 `contradiction` —
 ```bash
