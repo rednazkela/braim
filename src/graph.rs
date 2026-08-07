@@ -548,6 +548,21 @@ pub struct AddSourceResult {
     pub winner_status: Option<VerificationStatus>,
 }
 
+/// What a merge_nodes call did, so the caller can report it honestly.
+pub struct MergeOutcome {
+    pub winner: u32,
+    pub loser: u32,
+    /// Source strings + source entities the winner gained from the loser.
+    pub sources_added: usize,
+    pub referents_rewired: usize,
+    pub edges_rewired: usize,
+    pub new_status: VerificationStatus,
+    /// Dependencies the loser had and the winner does not. NOT merged — that
+    /// would rewrite what the surviving statement asserts — so they surface here
+    /// for a human to decide about.
+    pub dep_differences: Vec<u32>,
+}
+
 pub struct ImportManifest {
     /// Full-fidelity mode only: source entities imported.
     pub sources_imported: usize,
@@ -1940,6 +1955,150 @@ impl Braim {
         // Last: signals to lock-free readers that this multi-file update is whole.
         bump_seq(&self.data_dir)?;
         Ok(())
+    }
+
+    /// Fold `loser` into `winner`: union the evidence, move every reference, drop
+    /// the duplicate. This is the union-merge the corroboration model assumes
+    /// (braim ID:190/248) — before it existed the only route was update-deps plus
+    /// delete, which threw the loser's sources away, the exact anti-pattern the
+    /// import-union fix removed.
+    ///
+    /// Deliberately does NOT merge the loser's own dependencies into the winner:
+    /// that would silently rewrite what the surviving statement asserts. Any
+    /// difference is reported for a human to act on instead.
+    pub fn merge_nodes(&mut self, winner: u32, loser: u32) -> Result<MergeOutcome, String> {
+        if winner == loser {
+            return Err("Error: winner and loser are the same node".to_string());
+        }
+        let (w_node, l_node) = {
+            let w = self.state.nodes.get(&winner)
+                .ok_or(format!("Error: node ID {} not found", winner))?;
+            let l = self.state.nodes.get(&loser)
+                .ok_or(format!("Error: node ID {} not found", loser))?;
+            (w.clone(), l.clone())
+        };
+
+        // A refuted node's evidence must never be folded into a live one.
+        for (id, n) in [(winner, &w_node), (loser, &l_node)] {
+            if n.invalid || n.verification_status == VerificationStatus::Invalid {
+                return Err(format!(
+                    "Error: node ID {} is invalid — merging would launder refuted evidence into a live node",
+                    id
+                ));
+            }
+        }
+        // Statements and concepts are different kinds of thing.
+        if w_node.node_type.is_statement_family() != l_node.node_type.is_statement_family() {
+            return Err(format!(
+                "Error: cannot merge across kinds — ID:{} is a {:?} and ID:{} is a {:?}",
+                winner, w_node.node_type, loser, l_node.node_type
+            ));
+        }
+        // Either direction of dependency between the two means they are not
+        // duplicates, and folding them would create a self-loop.
+        if w_node.depends_on.contains_key(&loser) || l_node.depends_on.contains_key(&winner) {
+            return Err(format!(
+                "Error: ID:{} and ID:{} depend on each other — related nodes, not duplicates",
+                winner, loser
+            ));
+        }
+
+        // 1. Union the evidence. Source-entity ids are already local here, so the
+        //    remap is the identity.
+        let identity: HashMap<u32, u32> = l_node.source_ids.iter().map(|s| (*s, *s)).collect();
+        let before = self.state.nodes[&winner].sources.len()
+            + self.state.nodes[&winner].source_ids.len();
+        self.union_sources_into(winner, &l_node, &identity);
+        let sources_added = self.state.nodes[&winner].sources.len()
+            + self.state.nodes[&winner].source_ids.len()
+            - before;
+
+        // 2. Move every reference. Weights SUM, which preserves the 1.0 invariant
+        //    for a referent that depended on both.
+        let mut referents_rewired = 0;
+        let referent_ids: Vec<u32> = self.state.nodes.iter()
+            .filter(|(id, n)| **id != loser && n.depends_on.contains_key(&loser))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in referent_ids {
+            let node = self.state.nodes.get_mut(&id).unwrap();
+            if let Some(w) = node.depends_on.remove(&loser) {
+                *node.depends_on.entry(winner).or_insert(0.0) += w;
+                referents_rewired += 1;
+            }
+        }
+
+        // 3. Move relationship edges, dropping self-edges and duplicates.
+        let mut edges_rewired = 0;
+        for e in self.state.because_of.iter_mut() {
+            if e.from == loser { e.from = winner; edges_rewired += 1; }
+            if e.to == loser { e.to = winner; edges_rewired += 1; }
+        }
+        self.state.because_of.retain(|e| e.from != e.to);
+        let mut seen = HashSet::new();
+        self.state.because_of.retain(|e| seen.insert((e.from, e.to)));
+
+        for e in self.state.contradicts.iter_mut() {
+            if e.from == loser { e.from = winner; edges_rewired += 1; }
+            if e.to == loser { e.to = winner; edges_rewired += 1; }
+            if e.source_id == Some(loser) { e.source_id = Some(winner); }
+            if e.resolution_winner == Some(loser) { e.resolution_winner = Some(winner); }
+            if e.resolution_source == Some(loser) { e.resolution_source = Some(winner); }
+        }
+        self.state.contradicts.retain(|e| e.from != e.to);
+        let mut seen = HashSet::new();
+        self.state.contradicts.retain(|e| seen.insert((e.from, e.to)));
+
+        // 4. Gap register entries pointing at the loser now point at the winner.
+        for g in self.state.gaps.iter_mut() {
+            if g.concept_a == loser { g.concept_a = winner; }
+            if g.concept_b == loser { g.concept_b = winner; }
+        }
+        self.state.gaps.retain(|g| g.concept_a != g.concept_b);
+
+        // 5. Drop the loser from the label index.
+        for ids in self.state.dictionary.values_mut() {
+            ids.retain(|id| *id != loser);
+        }
+        self.state.dictionary.retain(|_, ids| !ids.is_empty());
+
+        // 6. Leave a trace: a merge is not a deletion, and the audit trail should
+        //    say where the winner's extra evidence came from.
+        let dep_differences: Vec<u32> = l_node.depends_on.keys()
+            .filter(|d| **d != winner && !w_node.depends_on.contains_key(d))
+            .copied()
+            .collect();
+        {
+            let w = self.state.nodes.get_mut(&winner).unwrap();
+            let prior = w.metadata.get("merged_from").cloned().unwrap_or_default();
+            let trace = if prior.is_empty() {
+                loser.to_string()
+            } else {
+                format!("{},{}", prior, loser)
+            };
+            w.metadata.insert("merged_from".to_string(), trace);
+        }
+
+        self.state.nodes.remove(&loser);
+
+        // 7. New evidence may promote the winner.
+        if self.state.nodes[&winner].node_type.is_statement_family() {
+            self.recompute_statement_status(winner);
+        }
+        self.dependents = Self::build_dependents(&self.state);
+        self.flush()?;
+
+        let mut dep_differences = dep_differences;
+        dep_differences.sort();
+        Ok(MergeOutcome {
+            winner,
+            loser,
+            sources_added,
+            referents_rewired,
+            edges_rewired,
+            new_status: self.state.nodes[&winner].verification_status,
+            dep_differences,
+        })
     }
 
     /// Rename a domain across the graph: every node carrying `old` in its domains
@@ -4635,6 +4794,88 @@ mod defect_tests {
         let m = dst.import_graph(dir.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
         assert!(m.id_mappings.contains_key(&s1), "import must load a sharded source dir");
         assert_eq!(m.because_of_imported, 1);
+    }
+
+    #[test]
+    fn merge_unions_evidence_rewires_referents_and_can_promote() {
+        let mut b = temp_braim("merge_union");
+        let a = b.add_concept("Alpha: first", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        // Two statements saying the same thing with DIFFERENT primary evidence.
+        let keep = b.add_statement("payment settles invoice", vec!["d".into()],
+            vec!["code:pay.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let dup = b.add_statement("payment settles the invoice", vec!["d".into()],
+            vec!["doc:spec.md:9".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        assert_eq!(b.get_node(keep).unwrap().verification_status, VerificationStatus::Partial);
+
+        // A third statement depends on BOTH — after merge its weights must still sum to 1.0.
+        let referent = b.add_statement("settlement matters", vec!["d".into()],
+            vec!["code:z.rs:1".into()], HashMap::from([(keep, 0.7), (dup, 0.3)]), true).unwrap();
+
+        let out = b.merge_nodes(keep, dup).unwrap();
+        assert!(b.get_node(dup).is_none(), "loser is removed");
+        assert_eq!(out.referents_rewired, 1);
+
+        let w = b.get_node(keep).unwrap();
+        assert!(w.sources.contains(&"doc:spec.md:9".to_string()), "loser's evidence unioned");
+        assert_eq!(w.verification_status, VerificationStatus::Proven,
+            "code + doc from the merge promotes the survivor");
+        assert_eq!(w.metadata.get("merged_from").map(String::as_str), Some(dup.to_string().as_str()));
+
+        let r = b.get_node(referent).unwrap();
+        assert_eq!(r.depends_on.len(), 1, "both edges collapsed onto the winner");
+        let total: f64 = r.depends_on.values().sum();
+        assert!((total - 1.0).abs() < 1e-9, "summed weights preserve the 1.0 invariant, got {}", total);
+    }
+
+    #[test]
+    fn merge_moves_edges_and_reports_dependency_differences() {
+        let mut b = temp_braim("merge_edges");
+        let a = b.add_concept("Alpha: first", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let extra = b.add_concept("Gamma: third", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let keep = b.add_statement("claim one", vec!["d".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        // duplicate stands on a dependency the winner lacks
+        let dup = b.add_statement("claim one restated", vec!["d".into()],
+            vec!["doc:a.md:1".into()], HashMap::from([(a, 0.5), (extra, 0.5)]), true).unwrap();
+        let cause = b.add_statement("root cause", vec!["d".into()],
+            vec!["code:c.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        b.why_add(dup, cause, Some("narrative:why".into())).unwrap();
+
+        let out = b.merge_nodes(keep, dup).unwrap();
+        assert!(out.edges_rewired >= 1, "because_of edge moved to the winner");
+        assert!(b.state.because_of.iter().any(|e| e.from == keep && e.to == cause));
+        assert_eq!(out.dep_differences, vec![extra],
+            "a dependency only the loser had is reported, never silently merged");
+        assert!(!b.get_node(keep).unwrap().depends_on.contains_key(&extra),
+            "the winner's assertion is left intact");
+    }
+
+    #[test]
+    fn merge_refuses_unsafe_pairs() {
+        let mut b = temp_braim("merge_refuse");
+        let a = b.add_concept("Alpha: first", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("one", vec!["d".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("two", vec!["d".into()],
+            vec!["code:b.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+
+        assert!(b.merge_nodes(s1, s1).is_err(), "same node");
+        assert!(b.merge_nodes(s1, 9999).is_err(), "missing node");
+        assert!(b.merge_nodes(s1, a).is_err(), "concept into statement");
+
+        // depends-on either way means related, not duplicate
+        let dependent = b.add_statement("depends on one", vec!["d".into()],
+            vec!["code:c.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        assert!(b.merge_nodes(dependent, s1).is_err(), "winner depends on loser");
+        assert!(b.merge_nodes(s1, dependent).is_err(), "loser depends on winner");
+
+        // refuted evidence must not be laundered into a live node
+        b.invalidate_statement(s2, "refuted").unwrap();
+        assert!(b.merge_nodes(s1, s2).is_err(), "invalid loser");
+        assert!(b.merge_nodes(s2, s1).is_err(), "invalid winner");
     }
 
     #[test]

@@ -102,7 +102,7 @@ pub struct Candidate {
 pub struct LedgerEntry {
     pub a: u32,
     pub b: u32,
-    /// no-relation | proposed | verified | contradiction
+    /// no-relation | proposed | verified | contradiction | duplicate
     pub verdict: String,
     pub note: Option<String>,
     pub recorded_at: String,
@@ -134,7 +134,8 @@ pub fn record_ledger(
     verdict: &str,
     note: Option<String>,
 ) -> Result<(), String> {
-    const VERDICTS: [&str; 4] = ["no-relation", "proposed", "verified", "contradiction"];
+    const VERDICTS: [&str; 5] =
+        ["no-relation", "proposed", "verified", "contradiction", "duplicate"];
     if !VERDICTS.contains(&verdict) {
         return Err(format!(
             "Error: verdict must be one of {} (got '{}')",

@@ -312,6 +312,11 @@ enum Commands {
     },
     #[command(subcommand, about = "Dream: surface node pairs an LLM should examine for missing relations")]
     Dream(DreamCommands),
+    #[command(about = "Fold a duplicate node into the one that survives", long_about = "MergeNodes: union two duplicate nodes into one, keeping all the evidence.\n\nUsage:\n  braim merge-nodes 42 99      # 42 survives, 99 is folded into it\n\nWhat it does:\n  • Unions the loser's sources, source entities, and verified_by into the winner\n  • Moves every reference: a node that depended on the loser now depends on the\n    winner, with weights SUMMED so a referent that cited both keeps its 1.0 total\n  • Moves because_of, contradicts, and gap-register entries, dropping self-edges\n  • Records merged_from on the winner as an audit trace, then removes the loser\n  • Recomputes the winner's verification — new PRIMARY types may promote it\n\nWhat it deliberately does NOT do:\n  • Merge the loser's dependencies into the winner. That would silently rewrite\n    what the surviving statement asserts, so any difference is REPORTED instead.\n\nRefused when: the nodes are the same, either is invalid (merging would launder\nrefuted evidence into a live node), they are of different kinds (concept vs\nstatement), or either depends on the other (related, not duplicate).\n\nThis is the union-merge the corroboration model assumes (braim ID:190/248):\nbefore it, deduplicating meant update-deps plus delete, which discarded the\nloser's sources entirely.")]
+    MergeNodes {
+        winner: u32,
+        loser: u32,
+    },
     #[command(about = "Rename a domain across the graph", long_about = "RenameDomain: Replace a domain name on every node that carries it.\n\nUsage:\n  braim rename-domain Billing braim_demo\n\nEffect:\n  • Every node listing the old domain gets the new name (duplicates collapsed)\n  • In sharded layout, affected nodes re-home into the new domain's shard file;\n    the old current shard is pruned\n  • Versioned snapshots (*.vNNNN.json) are immutable history and keep the old name\n\nRename vs merge: renaming onto an EXISTING domain name merges the two domains —\nverify with evidence first that they mean the same thing (braim ID:244: same-name\ndomains proved to be demo vocabulary vs real billing knowledge).")]
     RenameDomain {
         old: String,
@@ -1984,6 +1989,24 @@ fn main() {
             match dream::record_ledger(&braim.data_dir, a, b, &verdict, note) {
                 Ok(()) => {
                     println!("✓ Dream ledger updated: ID:{} ↔ ID:{} = {}", a, b, verdict);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::MergeNodes { winner, loser } => {
+            match braim.merge_nodes(winner, loser) {
+                Ok(o) => {
+                    println!("✓ Merged ID:{} into ID:{}", o.loser, o.winner);
+                    println!("  Evidence gained: {} source(s)", o.sources_added);
+                    println!("  Rewired: {} referent(s), {} edge(s)", o.referents_rewired, o.edges_rewired);
+                    println!("  Winner status: {} {}", o.new_status.badge(), o.new_status.label());
+                    if !o.dep_differences.is_empty() {
+                        eprintln!(
+                            "⚠ the merged node depended on {:?}, which ID:{} does not — NOT merged, \n  because that would change what the surviving statement asserts. Wire them \n  deliberately with 'braim statement update-deps {}' if they belong.",
+                            o.dep_differences, o.winner, o.winner
+                        );
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
