@@ -68,6 +68,7 @@ why-add | why | why-test | why-remove           causal chains (because_of, Five 
 similar                                         semantic search + dedup (embeddings builds)
 node | list | domains | audit | meta            inspection and metadata
 version    save | list | restore                checkpoints (per-domain when sharded)
+init | policy                                   team bootstrap + agent policy payloads
 dream      candidates | seen                    pair discovery for overnight LLM adjudication
 merge-nodes                                     fold a duplicate into its survivor, unioning evidence
 export | shard | rename-domain                  publish a domain, per-domain storage, governance
@@ -205,12 +206,25 @@ braim import /other/.braim --domain-map "Finance:Billing" --only-proven
 
 @[Never use jq or other tools directly on current.json] source: braim --help REQUIRED RULES:2
 
+### Getting set up
+
+```bash
+braim init --team --central ~/.braim_central   # local graph + agent policy hooks
+braim policy perturn                           # what the hooks inject
+```
+
+@[init installs UserPromptSubmit and PreCompact hooks that call `braim policy`, so the settings file carries no absolute paths or shell tools and works unchanged on Linux, macOS, and Windows] source: code:src/bootstrap.rs install_hooks
+
+@[The merge is safe: existing settings and foreign hooks are preserved, re-running is idempotent, and an unparseable settings file is refused rather than clobbered] source: test:src/bootstrap.rs
+
+#[Adoption is solo-first because a teammate starting out has no graphs to consume; what ships day one is the setup that already works alone] based_on: @[greenfield bootstrap decision] + @[the policy hooks automate the discipline a human would otherwise have to learn]
+
 ### Federation — working graphs publish into a central braim
 
 ```bash
 braim shard                                   # split storage into domains/<name>-<hash>.json
 braim import /other/.braim --full             # trusted self-import: keeps verification, edges, sources
-braim export billing --to ~/.braim_central    # publish one domain + its dependency closure
+braim export billing                          # publish a domain (target from init --central)
 braim merge-nodes 42 99                       # fold a duplicate into 42, unioning its evidence
 braim rename-domain Billing braim_demo        # governance: re-home a domain across the graph
 ```
