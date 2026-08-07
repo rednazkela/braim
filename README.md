@@ -60,13 +60,17 @@ concept    add | delete | update-weights |      atomics + compounds
 statement  add | verify | verify-suggest |      claims/facts lifecycle
            add-source | contradict |
            resolve-contradiction | invalidate |
-           update-weights | update-deps | delete
+           revalidate | update-weights |
+           update-deps | delete
 source     add                                  first-class source entities
 lookup | query | proximity | perspective        discovery and navigation
 why-add | why | why-test | why-remove           causal chains (because_of, Five Whys)
 similar                                         semantic search + dedup (embeddings builds)
 node | list | domains | audit | meta            inspection and metadata
-version    save | list | restore                checkpoints
+version    save | list | restore                checkpoints (per-domain when sharded)
+dream      candidates | seen                    pair discovery for overnight LLM adjudication
+merge-nodes                                     fold a duplicate into its survivor, unioning evidence
+export | shard | rename-domain                  publish a domain, per-domain storage, governance
 serve | import | migrate-node-types             viewer, cross-project, migration
 ```
 
@@ -200,6 +204,37 @@ braim import /other/.braim --domain-map "Finance:Billing" --only-proven
 ```
 
 @[Never use jq or other tools directly on current.json] source: braim --help REQUIRED RULES:2
+
+### Federation — working graphs publish into a central braim
+
+```bash
+braim shard                                   # split storage into domains/<name>-<hash>.json
+braim import /other/.braim --full             # trusted self-import: keeps verification, edges, sources
+braim export billing --to ~/.braim_central    # publish one domain + its dependency closure
+braim merge-nodes 42 99                       # fold a duplicate into 42, unioning its evidence
+braim rename-domain Billing braim_demo        # governance: re-home a domain across the graph
+```
+
+@[Sharded storage keeps ONE merged in-memory view; version save then writes per-domain snapshots that are the pin artifacts the mount manifest references] source: doc:braim-mount-manifest.md
+
+@[Export defaults to a PARTIAL floor — a statement needs at least one PRIMARY source to publish, so two people each holding one source type can both publish and corroborate in central] source: code:src/main.rs Export
+
+@[Concurrent writers are serialised by a cross-process lock taken before loading; all writes are atomic renames; readers stay lock-free via a seqlock] source: code:src/graph.rs FileLock
+
+### Dreaming — overnight relation discovery
+
+```bash
+braim dream candidates --strategy semantic --json   # ranked pairs worth an LLM's judgement
+braim dream seen 42 99 --verdict duplicate          # ledger, so nights advance
+braim list --meta scope=dream                       # morning review
+```
+
+@[Candidate generation is read-only and refused on graphs marked .braim.central — a dream is an unreviewed hypothesis and an unattended central has no reviewer] source: code:src/dream.rs refuse_if_central
+
+#[Strategies differ by two orders of magnitude in selectivity, so budget runs semantic-first] based_on: @[measured yields on a 714-node graph: 30 semantic / 148 shared-source / 5135 two-hop]
+
+The adjudication loop itself is `.claude/skills/dream/` — install with
+`ln -sfn <repo>/.claude/skills/dream ~/.claude/skills/dream`.
 
 ---
 
