@@ -1,3 +1,4 @@
+mod bootstrap;
 mod dream;
 mod graph;
 mod manifest;
@@ -303,12 +304,25 @@ enum Commands {
     #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • floor at PARTIAL: a statement needs at least one PRIMARY source to publish,\n    so evidence-free claims stay home while single-source findings can reach\n    central and corroborate there (braim ID:253). --include-unproven removes\n    the floor entirely.\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
     Export {
         domain: String,
-        #[arg(long, help = "Target braim data dir (e.g. ~/.braim_central)")]
-        to: String,
+        #[arg(long, help = "Target braim data dir (default: the central recorded by `braim init --team --central`)")]
+        to: Option<String>,
         #[arg(long, help = "Also export unproven statements (default floor: partial, i.e. at least one PRIMARY source)")]
         include_unproven: bool,
         #[arg(long, help = "Remap domain names during export (format: old:new,old2:new2)")]
         domain_map: Vec<String>,
+    },
+    #[command(about = "Set up this project for braim: local graph + agent policy hooks", long_about = "Init: bootstrap a working braim setup in one command.\n\nUsage:\n  braim init --team\n  braim init --team --central ~/.braim_central\n  braim init --team --settings .claude/settings.local.json\n\nWhat it does:\n  • Creates the local graph if absent\n  • Installs the agent policy hooks into .claude/settings.json:\n      UserPromptSubmit -> braim policy perturn      (per-turn marker logging)\n      PreCompact       -> braim policy compaction   (what to keep when compacting)\n  • Records where central lives, so `braim export <domain>` needs no --to\n\nThe hooks invoke `braim policy`, not a shell tool reading an absolute path, so\nthe same settings file works on Linux, macOS, and Windows and the policy stays\nversion-locked to the braim binary enforcing it.\n\nIdempotent: re-running reports what is already present and changes nothing.\nExisting settings and any hooks braim did not add are preserved.\n\nWhy solo-first: a teammate starting out has no graphs, so day-one value is the\nsetup that already works alone — a local graph plus the discipline hooks.\nSharing layers on once several graphs exist (braim ID:223).")]
+    Init {
+        #[arg(long, help = "Install the team agent setup (currently the only mode)")]
+        team: bool,
+        #[arg(long, help = "Path or URL of the central braim, recorded for later exports")]
+        central: Option<String>,
+        #[arg(long, help = "Settings file to write (default: .claude/settings.json)")]
+        settings: Option<String>,
+    },
+    #[command(about = "Print an agent policy payload (used by the hooks braim init installs)", long_about = "Policy: emit an agent-integration policy on stdout.\n\nUsage:\n  braim policy perturn        # UserPromptSubmit payload: per-turn marker logging\n  braim policy compaction     # PreCompact payload: keep IDs and edges, not prose\n  braim policy traits         # evidence-capture discipline, for agent memory\n\nThese are the contracts in policies/, embedded in the binary. Hooks call this\ncommand instead of reading a file, which keeps the wiring free of absolute paths\nand shell tools — portable across platforms and version-locked to this binary.")]
+    Policy {
+        name: String,
     },
     #[command(subcommand, about = "Dream: surface node pairs an LLM should examine for missing relations")]
     Dream(DreamCommands),
@@ -659,6 +673,8 @@ fn is_read_only(cmd: &Commands) -> bool {
             | Commands::Why { .. }
             | Commands::Export { .. }
             | Commands::Dream(DreamCommands::Candidates { .. })
+            | Commands::Policy { .. }
+            | Commands::Init { .. }
             | Commands::Statement(StatementCommands::VerifySuggest { .. })
             | Commands::Version(VersionCommands::List)
     )
@@ -1889,6 +1905,16 @@ fn main() {
             }
         }
         Commands::Export { domain, to, include_unproven, domain_map } => {
+            // Fall back to the central recorded at bootstrap, so routine
+            // publishing is `braim export <domain>` with nothing to remember.
+            let to = match to.or_else(|| bootstrap::read_central_pointer(&braim.data_dir)) {
+                Some(t) => t,
+                None => {
+                    eprintln!("Error: no target. Pass --to <dir>, or record one once with \
+                               `braim init --team --central <dir>`.");
+                    std::process::exit(1);
+                }
+            };
             let mut domain_mappings = HashMap::new();
             for mapping in domain_map {
                 for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
@@ -1989,6 +2015,57 @@ fn main() {
             match dream::record_ledger(&braim.data_dir, a, b, &verdict, note) {
                 Ok(()) => {
                     println!("✓ Dream ledger updated: ID:{} ↔ ID:{} = {}", a, b, verdict);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Policy { name } => {
+            match bootstrap::policy_body(&name) {
+                Ok(body) => {
+                    println!("{}", body);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Init { team, central, settings } => {
+            if !team {
+                eprintln!("Error: pass --team (the only mode today). See `braim init --help`.");
+                std::process::exit(1);
+            }
+            let settings_path = std::path::PathBuf::from(
+                settings.unwrap_or_else(|| ".claude/settings.json".to_string()),
+            );
+            let graph_dir = braim.data_dir.clone();
+            // Constructing `braim` already created the dir; report whether it
+            // had a graph before this run rather than claiming a fresh one.
+            let graph_created = braim.state.nodes.is_empty();
+
+            match bootstrap::install_hooks(&settings_path) {
+                Ok(changes) => {
+                    println!("✓ braim is set up for this project");
+                    println!("  Graph: {} ({})", graph_dir.display(),
+                        if graph_created { "new, empty" } else { "existing" });
+                    println!("  Settings: {}", settings_path.display());
+                    for c in &changes {
+                        match c {
+                            bootstrap::Change::Added(e) =>
+                                println!("    + {} hook installed", e),
+                            bootstrap::Change::AlreadyPresent(e) =>
+                                println!("    = {} hook already present, left alone", e),
+                        }
+                    }
+                    if let Some(c) = central {
+                        match bootstrap::write_central_pointer(&graph_dir, &c) {
+                            Ok(()) => println!("  Central: {} (recorded)", c),
+                            Err(e) => eprintln!("⚠ could not record central pointer: {}", e),
+                        }
+                    }
+                    println!("\nStart a new session so the hooks load, then work as usual.");
+                    if changes.iter().any(|c| matches!(c, bootstrap::Change::Added(_))) {
+                        println!("Verify a hook any time with: braim policy perturn");
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
