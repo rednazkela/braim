@@ -1,8 +1,116 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use chrono::Utc;
+
+/// Cross-process exclusive write lock over one data dir.
+///
+/// Every braim mutation is a read-modify-write cycle spanning the whole process:
+/// `Braim::new` loads the graph, the command mutates memory, `flush` rewrites the
+/// files. Without a lock, concurrent writers clobber each other — measured, not
+/// theorised: six simultaneous exports into one central lost two contributions
+/// outright, and six simultaneous `version save` runs recorded four of six index
+/// entries (braim ID:250). Writers hold this from BEFORE the load until the
+/// process exits; readers never take it and rely on atomic renames instead, so
+/// queries and the viewer stay non-blocking.
+///
+/// Built on `create_new` rather than an OS advisory lock to stay dependency-free
+/// and behave identically on Linux, macOS, and Windows.
+pub struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// A lock file older than this is assumed abandoned by a crashed process.
+    const STALE_AFTER: Duration = Duration::from_secs(60);
+    /// How long a writer waits for a peer before giving up with a clear error.
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    pub fn acquire(dir: &Path) -> Result<FileLock, String> {
+        let path = dir.join(".braim.lock");
+        let start = Instant::now();
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(FileLock { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().map(|age| age > Self::STALE_AFTER).unwrap_or(false))
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > Self::WAIT_TIMEOUT {
+                        return Err(format!(
+                            "Error: timed out after {}s waiting for the write lock at {}. \
+                             Another braim process is writing to this graph; if none is running, \
+                             delete that file.",
+                            Self::WAIT_TIMEOUT.as_secs(),
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("Failed to acquire write lock: {}", e)),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Monotonic counter bumped after a sharded write completes. Atomic renames make
+/// each shard file individually sound, but a sharded update touches MANY files,
+/// so a lock-free reader can otherwise merge shard A's new state with shard B's
+/// old one — observed in practice as dangling cross-domain references
+/// (tests/concurrency.rs::readers_never_observe_an_inconsistent_shard_set).
+/// Paired with the writer's lock file this forms a seqlock: see `load_sharded`.
+fn seq_path(dir: &Path) -> PathBuf {
+    dir.join(".braim.seq")
+}
+
+fn read_seq(dir: &Path) -> u64 {
+    fs::read_to_string(seq_path(dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Bumped only AFTER every file of an update has landed, so a reader seeing an
+/// unchanged sequence across its read knows no write completed inside it.
+fn bump_seq(dir: &Path) -> Result<(), String> {
+    let next = read_seq(dir).wrapping_add(1);
+    write_atomic(&seq_path(dir), &next.to_string())
+}
+
+fn writer_active(dir: &Path) -> bool {
+    dir.join(".braim.lock").exists()
+}
+
+/// Write a file atomically: fill a temp sibling, then rename over the target.
+/// `fs::write` truncates before writing, so a concurrent reader can observe an
+/// empty or half-written graph; rename is atomic on POSIX and replaces on
+/// Windows, so readers only ever see a complete prior or new state.
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, content)
+        .map_err(|e| format!("Failed to write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to replace {}: {}", path.display(), e)
+    })
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -469,6 +577,10 @@ pub struct Braim {
     /// which (with the visited-set) bounds traversal to O(V+E) and fixes the
     /// high-fan-out query hang.
     pub dependents: HashMap<u32, Vec<(u32, f64)>>,
+    /// Held for the process lifetime by instances opened via `open_for_write`,
+    /// serialising this graph's read-modify-write cycle against other processes.
+    /// `None` on read-only instances, which never block and never write.
+    write_lock: Option<FileLock>,
 }
 
 /// Canonical list of PRIMARY-tier source type prefix names.
@@ -878,12 +990,16 @@ impl Braim {
     }
 
     pub fn new(data_dir: &str) -> Result<Self, String> {
+        Self::load_from(data_dir, false)
+    }
+
+    fn load_from(data_dir: &str, holds_lock: bool) -> Result<Self, String> {
         let path = PathBuf::from(data_dir);
         fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
 
         let current_path = path.join("current.json");
         let mut state: GraphState = if path.join("domains").is_dir() {
-            Self::load_sharded(&path)?
+            Self::load_sharded(&path, holds_lock)?
         } else if current_path.exists() {
             let content = fs::read_to_string(&current_path)
                 .map_err(|e| format!("Failed to read current.json: {}", e))?;
@@ -938,7 +1054,21 @@ impl Braim {
             state,
             legacy_node_types_migrated: legacy_count,
             dependents,
+            write_lock: None,
         })
+    }
+
+    /// Open for mutation: take the cross-process write lock BEFORE loading, and
+    /// hold it until this instance is dropped. Acquiring first is the whole
+    /// point — a lock taken after the load would leave the read half of the
+    /// read-modify-write cycle unprotected and still lose updates (braim ID:250).
+    pub fn open_for_write(data_dir: &str) -> Result<Self, String> {
+        let path = PathBuf::from(data_dir);
+        fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
+        let lock = FileLock::acquire(&path)?;
+        let mut braim = Self::load_from(data_dir, true)?;
+        braim.write_lock = Some(lock);
+        Ok(braim)
     }
 
     /// dependents[X] = (node_id, weight) for every ACTIVE node whose
@@ -1678,7 +1808,41 @@ impl Braim {
     /// Load the sharded layout: graph.json (cross-domain state) + every
     /// domains/*.json (per-domain node maps) merged into one in-memory view
     /// (braim ID:217). A node id appearing in two shard files is corruption.
-    fn load_sharded(path: &PathBuf) -> Result<GraphState, String> {
+    /// Seqlock read: retry until the shard set is provably free of a concurrent
+    /// update. A write is detected if the writer's lock was present at either
+    /// end of our read, or if the completion sequence moved during it — which
+    /// together cover a writer that starts before, during, or wholly inside the
+    /// read. Readers never take the lock, so queries and the viewer stay
+    /// non-blocking.
+    /// `holds_lock` is set by writers, which already have exclusive access — for
+    /// them a plain read is correct, and running the seqlock would make them spin
+    /// against their own lock file until timeout.
+    fn load_sharded(path: &PathBuf, holds_lock: bool) -> Result<GraphState, String> {
+        if holds_lock {
+            return Self::load_sharded_once(path);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let seq_before = read_seq(path);
+            if !writer_active(path) {
+                let attempt = Self::load_sharded_once(path)?;
+                if !writer_active(path) && read_seq(path) == seq_before {
+                    return Ok(attempt);
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Starvation fallback: under sustained writes a lock-free reader may never
+        // find a quiet window, so take the writer lock briefly to force one.
+        // Guarantees progress; costs a short wait only on a saturated graph.
+        let _guard = FileLock::acquire(path)?;
+        Self::load_sharded_once(path)
+    }
+
+    fn load_sharded_once(path: &PathBuf) -> Result<GraphState, String> {
         let header_path = path.join("graph.json");
         let mut state: GraphState = if header_path.exists() {
             let content = fs::read_to_string(&header_path)
@@ -1739,7 +1903,7 @@ impl Braim {
         for (domain, nodes) in &shards {
             let filename = Self::shard_filename(domain);
             let content = Self::canonical_json(nodes)?;
-            fs::write(domains_dir.join(&filename), content)
+            write_atomic(&domains_dir.join(&filename), &content)
                 .map_err(|e| format!("Failed to write shard {}: {}", filename, e))?;
             live_files.insert(filename);
         }
@@ -1771,8 +1935,10 @@ impl Braim {
             because_of: self.state.because_of.clone(),
         };
         let content = Self::canonical_json(&header)?;
-        fs::write(self.data_dir.join("graph.json"), content)
+        write_atomic(&self.data_dir.join("graph.json"), &content)
             .map_err(|e| format!("Failed to write graph.json: {}", e))?;
+        // Last: signals to lock-free readers that this multi-file update is whole.
+        bump_seq(&self.data_dir)?;
         Ok(())
     }
 
@@ -1862,7 +2028,7 @@ impl Braim {
         }
         let path = self.data_dir.join("current.json");
         let content = Self::canonical_json(&self.state)?;
-        fs::write(&path, content)
+        write_atomic(&path, &content)
             .map_err(|e| format!("Failed to write current.json: {}", e))?;
         Ok(())
     }
@@ -2867,7 +3033,7 @@ impl Braim {
                     }
                     None => 1,
                 };
-                fs::write(domains_dir.join(Self::shard_version_filename(domain, next)), &content)
+                write_atomic(&domains_dir.join(Self::shard_version_filename(domain, next)), &content)
                     .map_err(|e| format!("Failed to write domain snapshot: {}", e))?;
                 domain_versions.insert(domain.clone(), next);
             }
@@ -2889,7 +3055,7 @@ impl Braim {
                     Ok(existing) if existing == header_content => prev_header,
                     _ => {
                         let hv = prev_header + 1;
-                        fs::write(self.data_dir.join(format!("graph.v{:04}.json", hv)), &header_content)
+                        write_atomic(&self.data_dir.join(format!("graph.v{:04}.json", hv)), &header_content)
                             .map_err(|e| format!("Failed to write header snapshot: {}", e))?;
                         hv
                     }
@@ -2905,7 +3071,7 @@ impl Braim {
                 header_version,
             });
             let index_content = Self::canonical_json(&index)?;
-            fs::write(self.versions_index_path(), index_content)
+            write_atomic(&self.versions_index_path(), &index_content)
                 .map_err(|e| format!("Failed to write versions index: {}", e))?;
         } else {
             let meta = VersionMeta {
@@ -2917,7 +3083,7 @@ impl Braim {
             let path = self.data_dir.join(&filename);
             let content = Self::canonical_json(&meta)
                 .map_err(|e| format!("Failed to serialize version: {}", e))?;
-            fs::write(&path, content)
+            write_atomic(&path, &content)
                 .map_err(|e| format!("Failed to write version file: {}", e))?;
         }
 
@@ -3420,8 +3586,9 @@ impl Braim {
     ) -> Result<ImportManifest, String> {
         let path = PathBuf::from(source_path);
         let source_state: GraphState = if path.is_dir() && path.join("domains").is_dir() {
-            // Sharded source dir: merge its shards exactly as load does.
-            Self::load_sharded(&path)?
+            // Sharded source dir: merge its shards exactly as load does. Not our
+            // lock, so use the reader path.
+            Self::load_sharded(&path, false)?
         } else {
             let file = if path.is_dir() { path.join("current.json") } else { path };
             let source_content = fs::read_to_string(&file)

@@ -599,10 +599,42 @@ fn statement_family_visible(
     }
 }
 
+/// True for commands that only read this data dir. Everything else takes the
+/// cross-process write lock before loading, so its read-modify-write cycle
+/// cannot interleave with another process's (braim ID:250).
+///
+/// Two entries deserve their reasoning:
+///   • `Proximity`/`Perspective` are deliberately ABSENT — they look like
+///     queries but register gap records and flush, so they are writers.
+///   • `Export` is present because it only READS this dir; the target central
+///     graph is opened separately with its own lock.
+fn is_read_only(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Lookup { .. }
+            | Commands::Query { .. }
+            | Commands::Node { .. }
+            | Commands::List { .. }
+            | Commands::Domains
+            | Commands::Audit { .. }
+            | Commands::Serve { .. }
+            | Commands::Similar { .. }
+            | Commands::Why { .. }
+            | Commands::Export { .. }
+            | Commands::Statement(StatementCommands::VerifySuggest { .. })
+            | Commands::Version(VersionCommands::List)
+    )
+}
+
 fn main() {
     let cli = Cli::parse();
 
-    let mut braim = match Braim::new(&cli.data_dir) {
+    let open = if is_read_only(&cli.command) {
+        Braim::new(&cli.data_dir)
+    } else {
+        Braim::open_for_write(&cli.data_dir)
+    };
+    let mut braim = match open {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{}", e);
@@ -1833,7 +1865,9 @@ fn main() {
             // Mappings apply before filtering, so filter on the post-map name.
             let effective_domain = domain_mappings.get(&domain).cloned().unwrap_or_else(|| domain.clone());
 
-            match Braim::new(&to) {
+            // The target is mutated by this export, so it takes its own write
+            // lock; the source graph above stays read-only and unlocked.
+            match Braim::open_for_write(&to) {
                 Ok(mut target) => {
                     match target.import_state(
                         braim.state.clone(),

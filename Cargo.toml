@@ -17,6 +17,11 @@ path = "src/main.rs"
 default = ["embeddings"]
 embeddings = ["dep:fastembed"]
 
+[dev-dependencies]
+# Integration tests link only against dev-dependencies, so the concurrency
+# suite needs its own handle on serde_json to inspect central's files.
+serde_json = "1"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
