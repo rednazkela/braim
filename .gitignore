@@ -1,6 +1,8 @@
 /target/
 OldDocs/
-Cargo.lock
+# Cargo.lock IS tracked: braim is a binary, not a library, and the release
+# workflow builds with --locked so a published artifact comes from the committed
+# dependency graph rather than whatever resolves on build day.
 .DS_Store
 
 # local run artifacts (not source)

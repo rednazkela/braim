@@ -42,6 +42,83 @@ so two-hop is a reserve, not a starting point.
 Dreaming is refused on graphs marked `.braim.central` — a dream is an unreviewed
 hypothesis and an unattended central has no reviewer. Work on a local graph.
 
+## After an ingest: work the frontier first
+
+Once a graph has been swept, old-versus-old is where the ledger is dense and the
+remaining candidates score flat — braim stops discriminating and every pair looks
+alike (measured at 0.018 across 319 survivors, braim ID:1329). New material
+changes that, and the pairs worth working are the ones involving the new nodes.
+
+```bash
+python3 <skill-dir>/frontier.py .braim <highest-id-before-the-ingest> \
+  /path/to/semantic.json /path/to/shared-source.json /path/to/two-hop.json
+```
+
+It lists unadjudicated, adjudicable pairs touching anything above that id, and
+puts **cross-era** pairs first — a new node against an older one brings two
+vintages of evidence together, where frontier-versus-frontier is usually one
+ingest talking to itself.
+
+This is a **scheduling** rule, not a yield rule. Recency does not predict a
+finding: bucketing 1894 adjudications by the newest node in the pair gives 7.3 /
+11.7 / 6.7 / 7.3 percent, and by id-gap 7.8 / 9.4 / 6.7 / 6.5 / 0 percent — flat
+either way (braim ID:1330). It earns its place only because after an ingest the
+new nodes' pairs are the ones that have not been looked at.
+
+## Pre-pass: measure the highest-exposure unverified nodes
+
+Before adjudicating anything, spend a few minutes settling the claims you are
+about to reason *from*. Every pair you judge rests on both nodes' labels, and a
+label you have not checked is a premise you are taking on trust.
+
+```bash
+python3 <skill-dir>/rank_exposure.py .braim 10 \
+  /path/to/semantic.json /path/to/shared-source.json /path/to/two-hop.json
+```
+
+It ranks nodes that are **weak** (unproven or contested) *and* **measurable**
+(sourced to `code`/`schema`/`config`/`test`) by how many unadjudicated pairs they
+sit in. Take the top **two or three** and settle them:
+
+1. Run the command that decides the claim — a `grep -c`, an `ls | wc -l`, a
+   `sed` of the cited lines. Read the output.
+2. If it confirms the label, record the observation as a first-class source and
+   attach it. This is evidence, not fiat — you ran the command:
+   ```bash
+   braim source add "<what was counted>" --type test \
+     --location "test:<exact command> = <exact result>, observed <YYYY-MM-DD>"
+   braim statement add-source <node> --source-id <new-source-id>
+   ```
+3. If it refutes the label, do **not** attach. Raise a contradiction against
+   whichever node disagrees, or record a correction statement citing the
+   measurement, and leave the original text alone.
+4. If the claim cannot be settled from this checkout at all — the cited file is
+   missing, the path moved, the evidence only exists off-disk — mark it so the
+   ranking stops offering it, and say which correction records the finding:
+   ```bash
+   braim meta <node> --set measured=unfixable
+   braim meta <node> --set measured_note="<why, and the correction's ID>"
+   ```
+   Without this the node ranks first every round forever, since no measurement
+   can change its status (ID:684 topped two consecutive rounds — braim ID:1282).
+
+Two things this pre-pass is **not**:
+
+- It is not a way to lift dependents. Verification is computed at creation and
+  never propagates; `add-source` recomputes from sources only and ignores the
+  dependency cap. Promoting a parent moves nothing downstream (measured: 13
+  promotions moved the unproven count by one — braim ID:1251).
+- It is not a pair filter. Pairs where one side is weak-and-measurable yield
+  findings at **4.8%** against **9.5%** for the rest — testability is
+  anti-predictive at the pair level and useful only at the node level (braim
+  ID:1272).
+
+Do not accept `braim statement verify-suggest` output as the measurement. It
+ranks by graph adjacency, not evidential relevance: asked to promote a claim
+about a directory's file count it offered a Prismatic design document, labelled
+"Promotion impact: proven" (braim ID:1240). Use it to find *statements worth
+measuring*, never as a list of sources worth attaching.
+
 ## Per pair
 
 **1. Read both nodes.**
@@ -113,6 +190,19 @@ braim's own math decides the resulting status from PRIMARY-type diversity.
 **Never promote by fiat**, never cite a file you did not open, and never reuse a
 source string copied from a node label without confirming it in the file.
 
+**Before every `statement add`, query the paths you are about to cite:**
+```bash
+python3 <skill-dir>/whocites.py .braim "<each --sources path>"
+```
+Read whatever it prints. If an existing node already carries the claim, record
+`no-relation` with a pointer to it instead of writing a second one.
+
+`braim query` is not a substitute here. It matches prose, and two statements
+about the same file need not share a single content word — five duplicates in
+one session came from querying the new finding's own wording, or from skipping
+the check because the finding came straight off a file read (braim ID:1233,
+ID:1284). The path is the reliable key, so the check runs on the path.
+
 **5. Record it**, always, whatever the verdict:
 ```bash
 braim dream seen <a> <b> --verdict <verdict> --note "<one line>"
@@ -135,6 +225,8 @@ This is what stops the next session re-treading the same pair.
 
 Finish with a short prose summary the user can read at breakfast:
 
+- the pre-pass: which nodes you measured, the command and result for each, and
+  whether the measurement confirmed or refuted the label
 - pairs adjudicated, and the verdict counts
 - every `verified` and `duplicate` with its node ids, since those changed the graph
 - anything that looked like a contradiction you were not confident enough to raise
