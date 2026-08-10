@@ -552,6 +552,17 @@ enum DreamCommands {
         #[arg(long, help = "Emit JSON for an agent loop to consume")]
         json: bool,
     },
+    #[command(about = "Walk one constraint: what rests on it, what it serves, and whether it is stale", long_about = "Dream What-If: relax one constraint and see what moves.\n\nUsage:\n  braim dream whatif 186\n  braim dream whatif 186 --json\n\nPick a target with `braim dream constraints`, then walk it here. The walk goes\nboth ways: DOWN through because_of to everything resting on the constraint (what\ncomes into play if it is lifted), and UP to the root goal the constraint\nultimately serves (what the relaxation is FOR).\n\nStaleness signals come first for a reason. Whether relaxing a constraint would\nimprove anything is unprovable, but whether the constraint STILL HOLDS is an\nordinary question about current sources — and that is the half of what-if\ndreaming that yields real findings (braim ID:324). A signal is a statement\nciting the same PRIMARY source file, written later, evidenced at least as well,\nwith no contradiction linking the two yet. braim reports them and stops:\nraising a contradiction is a deliberate claim needing a reason and a source,\nnot something to infer from a shared file path.\n\nWhatever the LLM writes from the relaxation itself is a hypothesis. Tag it\n`braim meta <id> --set counterfactual=true` — export refuses those by design,\nbecause no source can prove that removing a constraint would improve an outcome\n(braim ID:322).\n\nRead-only, and refused on graphs marked .braim.central like the rest of dream.")]
+    Whatif {
+        #[arg(help = "Statement id to relax — pick one from `braim dream constraints`")]
+        id: u32,
+        #[arg(long, default_value = "5", help = "Maximum staleness signals to report")]
+        signals: usize,
+        #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
+        include_scratch: bool,
+        #[arg(long, help = "Emit JSON for an agent loop to consume")]
+        json: bool,
+    },
     #[command(about = "Record a dream verdict so the pair is not re-examined", long_about = "Dream Seen: write a pair's adjudication into the dream ledger (dreams.json).\n\nUsage:\n  braim dream seen 42 99 --verdict no-relation\n  braim dream seen 42 99 --verdict proposed --note \"statement ID:150 added\"\n\nVerdicts:\n  no-relation    examined, nothing there — never offer this pair again\n  proposed       a relation was recorded as an unproven claim for review\n  verified       a relation was recorded WITH re-grounded PRIMARY sources\n  contradiction  the two nodes actually disagree; a contradicts edge was raised\n\nThe ledger is what lets successive nights advance instead of re-treading the\nsame pairs.")]
     Seen {
         a: u32,
@@ -683,6 +694,7 @@ fn is_read_only(cmd: &Commands) -> bool {
             | Commands::Export { .. }
             | Commands::Dream(DreamCommands::Candidates { .. })
             | Commands::Dream(DreamCommands::Constraints { .. })
+            | Commands::Dream(DreamCommands::Whatif { .. })
             | Commands::Policy { .. }
             | Commands::Init { .. }
             | Commands::Statement(StatementCommands::VerifySuggest { .. })
@@ -1799,6 +1811,9 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                     println!("  Imported: {} nodes", manifest.imported_count);
                     println!("  Deduplicated: {} (skipped, target version kept)", manifest.deduplicated_count);
                     println!("  Filtered out: {} (by domain/status)", manifest.skipped_count);
+                    if manifest.counterfactuals_refused > 0 {
+                        println!("  Quarantined: {} counterfactual node(s) refused (braim ID:322)", manifest.counterfactuals_refused);
+                    }
                     if full {
                         println!("  Source entities: {} imported", manifest.sources_imported);
                         println!("  Edges carried: {} because_of, {} contradicts", manifest.because_of_imported, manifest.contradicts_imported);
@@ -1949,6 +1964,11 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                             if manifest.sources_unioned > 0 {
                                 println!("  Corroboration: {} central node(s) gained sources from this export", manifest.sources_unioned);
                             }
+                            if manifest.counterfactuals_refused > 0 {
+                                println!("  Quarantined: {} counterfactual node(s) held back — a what-if is a hypothesis,",
+                                    manifest.counterfactuals_refused);
+                                println!("               and no source can prove one (braim ID:322).");
+                            }
                             println!("\nCheckpoint central: braim --data-dir {} version save \"export {} from $(pwd)\"", to, effective_domain);
                             Ok(())
                         }
@@ -2029,6 +2049,56 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 println!("Leverage only — whether these are constraints, and whether they can be");
                 println!("relaxed, is the judgement call. Read each one before acting on it.");
             }
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Whatif { id, signals, include_scratch, json }) => {
+            dream::refuse_if_central(&braim.data_dir)?;
+            let cf = dream::counterfactual(&braim, id, include_scratch, signals)?;
+            if json {
+                let text = serde_json::to_string_pretty(&cf)
+                    .map_err(|e| format!("Failed to serialize counterfactual: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            println!("What-if ID:{}  [{}]\n  {}\n", cf.id, cf.verification, cf.label);
+
+            // Staleness first: if the constraint is already obsolete there is no
+            // counterfactual to write, only a contradiction to raise.
+            if cf.stale_signals.is_empty() {
+                println!("Staleness: no statement cites the same source file more recently.\n");
+            } else {
+                println!("Staleness signals ({}) — read these before imagining anything:", cf.stale_signals.len());
+                for sg in &cf.stale_signals {
+                    println!("  ID:{}  [{}]  {}", sg.id, sg.verification, sg.why);
+                    println!("        {}", sg.label);
+                }
+                println!("  If one of these supersedes the constraint, that is a contradiction, not a dream:");
+                println!("  braim statement contradict {} <that_id> --reason \"...\" --source <id>\n", cf.id);
+            }
+
+            if cf.rests_on.is_empty() {
+                println!("Nothing rests on this yet — relaxing it moves nothing measurable.\n");
+            } else {
+                println!("Rests on it ({}):", cf.rests_on.len());
+                for l in &cf.rests_on {
+                    println!("  {}{} ID:{}  [{}]", "  ".repeat(l.depth - 1), "└─", l.id, l.verification);
+                    println!("  {}   {}", "  ".repeat(l.depth - 1), l.label);
+                }
+                println!();
+            }
+
+            match (&cf.root, cf.serves.len()) {
+                (Some(r), n) => {
+                    println!("Serves ({} link(s) up to the root goal):", n);
+                    for l in &cf.serves {
+                        println!("  {}↑ ID:{}  [{}]  {}", "  ".repeat(l.depth - 1), l.id, l.verification, l.label);
+                    }
+                    println!("  root: ID:{}\n", r.id);
+                }
+                (None, _) => println!("Serves: nothing records what this constraint ultimately answers to.\n"),
+            }
+
+            println!("Frame:\n{}", cf.frame);
             Ok(())
         }
         Commands::Dream(DreamCommands::Seen { a, b, verdict, note }) => {

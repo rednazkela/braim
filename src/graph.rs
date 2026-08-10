@@ -575,6 +575,10 @@ pub struct ImportManifest {
     pub imported_count: usize,
     pub deduplicated_count: usize,
     pub skipped_count: usize,
+    /// Counterfactual hypotheses refused at the boundary, plus anything resting
+    /// on them. Reported rather than silently dropped: a quarantine nobody sees
+    /// is indistinguishable from a bug.
+    pub counterfactuals_refused: usize,
     pub id_mappings: HashMap<u32, u32>,
     pub duplicates: Vec<DuplicateRecord>,
 }
@@ -3762,6 +3766,44 @@ impl Braim {
     /// Core of import/export: merge an in-memory source state into this graph.
     /// `braim export` calls this directly with the working graph's state — the
     /// contribute flow and the consume flow are one code path (braim ID:232/240).
+    /// Remove counterfactual-tagged nodes and everything resting on them from a
+    /// state about to be imported. Returns how many were refused.
+    ///
+    /// Dependents are found by fixpoint rather than one pass: a hypothesis three
+    /// statements deep still taints the chain above it.
+    fn strip_counterfactuals(state: &mut GraphState) -> usize {
+        let mut tainted: HashSet<u32> = state
+            .nodes
+            .values()
+            .filter(|n| n.metadata.get("counterfactual").map(|v| v == "true").unwrap_or(false))
+            .map(|n| n.id)
+            .collect();
+        if tainted.is_empty() {
+            return 0;
+        }
+        loop {
+            let grown: HashSet<u32> = state
+                .nodes
+                .values()
+                .filter(|n| !tainted.contains(&n.id))
+                .filter(|n| n.depends_on.keys().any(|d| tainted.contains(d)))
+                .map(|n| n.id)
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            tainted.extend(grown);
+        }
+        state.nodes.retain(|id, _| !tainted.contains(id));
+        state.because_of.retain(|e| !tainted.contains(&e.from) && !tainted.contains(&e.to));
+        state.contradicts.retain(|e| !tainted.contains(&e.from) && !tainted.contains(&e.to));
+        for ids in state.dictionary.values_mut() {
+            ids.retain(|i| !tainted.contains(i));
+        }
+        state.dictionary.retain(|_, ids| !ids.is_empty());
+        tainted.len()
+    }
+
     pub fn import_state(
         &mut self,
         mut source_state: GraphState,
@@ -3779,6 +3821,15 @@ impl Braim {
             }
             node.domains = remapped_domains;
         }
+
+        // Quarantine, enforced here rather than left to the writer's discipline.
+        // A what-if output is unverifiable by construction — no source can prove
+        // that removing a constraint would improve an outcome — so it can never
+        // leave `unproven`, and an unproven node that crosses into a shared graph
+        // is indistinguishable from a finding nobody got round to verifying
+        // (braim ID:322). The closure goes too: a statement resting on a
+        // hypothesis is a hypothesis.
+        let counterfactuals_refused = Self::strip_counterfactuals(&mut source_state);
 
         let mut id_mappings: HashMap<u32, u32> = HashMap::new();
         let mut duplicates: Vec<DuplicateRecord> = Vec::new();
@@ -4185,6 +4236,7 @@ impl Braim {
             imported_count,
             deduplicated_count,
             skipped_count,
+            counterfactuals_refused,
             id_mappings,
             duplicates,
         })
@@ -4564,6 +4616,39 @@ mod defect_tests {
         deps.insert(c, 0.4);
         let s = b.add_statement("alpha relates to beta", vec!["t".into()], vec!["narrative:claim".into()], deps, true).unwrap();
         (a, c, s)
+    }
+
+    #[test]
+    fn a_counterfactual_and_its_dependents_never_leave_the_local_graph() {
+        let mut src = temp_braim("cf_quarantine_src");
+        let (a, c, base) = two_concepts_and_claim(&mut src);
+        let mut deps = HashMap::new();
+        deps.insert(a, 0.7);
+        deps.insert(c, 0.3);
+        let hypo = src.add_statement("what if the constraint were lifted", vec!["t".into()],
+            vec!["narrative:dream".into()], deps, true).unwrap();
+        src.set_meta(hypo, "counterfactual", "true").unwrap();
+        // A statement resting on a hypothesis is a hypothesis, however it is
+        // sourced — the taint travels through depends_on.
+        let mut deps2 = HashMap::new();
+        deps2.insert(hypo, 0.8);
+        deps2.insert(base, 0.2);
+        let downstream = src.add_statement("and therefore this would follow", vec!["t".into()],
+            vec!["code:a.rs:1".into(), "doc:b.md".into()], deps2, true).unwrap();
+        src.why_add(downstream, hypo, Some("narrative:w".into())).unwrap();
+
+        let mut target = temp_braim("cf_quarantine_dst");
+        let manifest = target.import_state(src.state.clone(), None, None, HashMap::new(), true).unwrap();
+
+        assert_eq!(manifest.counterfactuals_refused, 2, "the hypothesis and its dependent");
+        let landed: Vec<&str> = target.state.nodes.values().map(|n| n.label.as_str()).collect();
+        assert!(!landed.iter().any(|l| l.contains("what if the constraint")),
+            "a hypothesis must not reach a shared graph");
+        assert!(!landed.iter().any(|l| l.contains("and therefore this would follow")),
+            "nor anything resting on one, even with PRIMARY sources of its own");
+        assert!(landed.iter().any(|l| l.contains("alpha relates to beta")),
+            "ordinary statements still publish");
+        assert!(target.state.because_of.is_empty(), "edges into quarantine go too");
     }
 
     #[test]

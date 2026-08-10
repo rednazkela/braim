@@ -253,18 +253,15 @@ impl ConstraintRanking {
     }
 }
 
-/// Rank causes by leverage. Pure read — computes nothing an LLM is needed for.
-pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> ConstraintRanking {
-    let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
-
-    // because_of runs consequent -> cause, so invert it to walk a cause's blast
-    // radius outward.
+/// Invert because_of: cause -> the consequents resting on it.
+///
+/// A refuted causal link (`why-test` failed) is dropped: the consequent no
+/// longer rests on that cause, even though both statements stay valid.
+/// Graph::because_of_active_outgoing and the perspective walk both skip these
+/// edges, and everything built on this map must agree with them.
+fn consequent_map(braim: &Braim, elig: &HashSet<u32>) -> HashMap<u32, Vec<u32>> {
     let mut consequents: HashMap<u32, Vec<u32>> = HashMap::new();
     for e in &braim.state.because_of {
-        // A refuted causal link (`why-test` failed) is not leverage: the
-        // consequent no longer rests on this cause, even though both statements
-        // are still valid. Graph::because_of_active_outgoing and the perspective
-        // walk both skip these edges; leverage must agree with them.
         if e.invalid {
             continue;
         }
@@ -276,6 +273,14 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Constr
         v.sort();
         v.dedup();
     }
+    consequents
+}
+
+/// Rank causes by leverage. Pure read — computes nothing an LLM is needed for.
+pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> ConstraintRanking {
+    let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
+
+    let consequents = consequent_map(braim, &elig);
 
     // Breadth-first over the consequent tree. The visited set makes this
     // cycle-safe: a causal loop is a graph defect, not a reason to hang.
@@ -364,6 +369,356 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Constr
     let ranked = out.len();
     out.truncate(limit);
     ConstraintRanking { ranked, shown: out }
+}
+
+/// One node on a causal chain, with its distance from the constraint.
+#[derive(Serialize, Clone, Debug)]
+pub struct ChainLink {
+    pub id: u32,
+    pub label: String,
+    pub verification: String,
+    /// Links away from the constraint. 1 = cites it directly.
+    pub depth: usize,
+}
+
+/// A statement that may already have overtaken the constraint.
+///
+/// This is the verifiable half of what-if dreaming (braim ID:324). Whether
+/// relaxing a constraint would improve anything is unprovable, but whether the
+/// constraint still holds is an ordinary question about current sources — and a
+/// wrong answer is an ordinary contradiction the existing lifecycle resolves.
+#[derive(Serialize, Clone, Debug)]
+pub struct StaleSignal {
+    pub id: u32,
+    pub label: String,
+    pub verification: String,
+    /// The source path both statements cite. Path, not line: line anchors drift
+    /// (braim ID:277/281), so the file is the durable key.
+    pub shared_path: String,
+    /// Distinctive words both labels use, rarest first. This is what separates a
+    /// real superseder from the dozens of statements that merely cite the same
+    /// hub file.
+    pub shared_terms: Vec<String>,
+    pub created_at: String,
+    pub score: f32,
+    pub why: String,
+}
+
+/// Words too common in any graph to distinguish two statements.
+const STOPWORDS: [&str; 24] = [
+    "that", "this", "with", "from", "which", "when", "then", "than", "into",
+    "each", "every", "same", "both", "only", "also", "over", "under", "after",
+    "before", "because", "while", "what", "does", "have",
+];
+
+/// Label → distinctive lowercase terms. Short words carry no discrimination and
+/// stopwords carry none at all, so both are dropped before scoring.
+fn terms(label: &str) -> HashSet<String> {
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .map(|w| w.to_lowercase())
+        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// One constraint, walked in both directions, with the frame the LLM works from.
+#[derive(Serialize, Clone, Debug)]
+pub struct Counterfactual {
+    pub id: u32,
+    pub label: String,
+    pub verification: String,
+    pub domains: Vec<String>,
+    pub sources: Vec<String>,
+    /// What rests on the constraint, nearest first. Relaxing it puts these in play.
+    pub rests_on: Vec<ChainLink>,
+    /// The constraint's own cause chain, ending at the root it serves.
+    pub serves: Vec<ChainLink>,
+    /// The end of that chain: the goal this constraint ultimately answers to.
+    pub root: Option<ChainLink>,
+    /// Statements that may already have overtaken it.
+    pub stale_signals: Vec<StaleSignal>,
+    /// The relaxation frame handed to the LLM.
+    pub frame: String,
+}
+
+/// Source path without the line anchor: `code:src/graph.rs:2909` → `src/graph.rs`.
+/// PRIMARY sources only — a shared narrative tag says two statements were written
+/// in the same session, not that they describe the same artifact.
+fn primary_path(source: &str) -> Option<String> {
+    let (ty, location) = Braim::parse_source(source);
+    if ty.tier() != "PRIMARY" {
+        return None;
+    }
+    // Trim a trailing `:12`, `:12-40`, or `:some_fn` anchor. Only the last
+    // segment, and only when the path has one to spare.
+    let path = match location.rsplit_once(':') {
+        Some((head, _)) if !head.is_empty() => head.to_string(),
+        _ => location,
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Walk one constraint: what rests on it, what it serves, and whether current
+/// evidence has already overtaken it.
+///
+/// Read-only, like every other dream command. In particular it never raises the
+/// contradiction a stale signal suggests: a contradiction is a deliberate claim
+/// that needs a reason and a source, and braim has no business asserting one on
+/// a lexical hint (braim ID:324).
+pub fn counterfactual(
+    braim: &Braim,
+    id: u32,
+    include_scratch: bool,
+    max_signals: usize,
+) -> Result<Counterfactual, String> {
+    let node = braim
+        .state
+        .nodes
+        .get(&id)
+        .ok_or_else(|| format!("Error: node ID:{} does not exist", id))?;
+    if !node.node_type.is_statement_family() {
+        return Err(format!(
+            "Error: ID:{} is a concept. A counterfactual relaxes a claim about the \
+             world, and a concept asserts nothing to relax — pass a statement.",
+            id
+        ));
+    }
+    if node.invalid || node.verification_status == VerificationStatus::Invalid {
+        return Err(format!(
+            "Error: ID:{} is already refuted. There is nothing to imagine away.",
+            id
+        ));
+    }
+
+    let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
+    let consequents = consequent_map(braim, &elig);
+    let link = |i: u32, depth: usize| -> Option<ChainLink> {
+        let n = braim.state.nodes.get(&i)?;
+        Some(ChainLink {
+            id: i,
+            label: n.label.clone(),
+            verification: n.verification_status.label().to_string(),
+            depth,
+        })
+    };
+
+    // Downstream: everything resting on the constraint, breadth-first so depth
+    // is the true distance. The visited set makes a cyclic graph terminate.
+    let mut rests_on: Vec<ChainLink> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut frontier = vec![id];
+    let mut depth = 0usize;
+    while !frontier.is_empty() {
+        depth += 1;
+        let mut next = Vec::new();
+        for cur in frontier {
+            for c in consequents.get(&cur).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if *c != id && seen.insert(*c) {
+                    if let Some(l) = link(*c, depth) {
+                        rests_on.push(l);
+                    }
+                    next.push(*c);
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    // Upstream: the constraint's own causes, to the root it serves. One active
+    // cause per statement, so this is a walk rather than a search.
+    let mut serves: Vec<ChainLink> = Vec::new();
+    let mut up_seen: HashSet<u32> = HashSet::new();
+    up_seen.insert(id);
+    let mut cur = id;
+    let mut up = 0usize;
+    while let Some(e) = braim
+        .state
+        .because_of
+        .iter()
+        .find(|e| e.from == cur && !e.invalid)
+    {
+        if !up_seen.insert(e.to) {
+            break;
+        }
+        up += 1;
+        if let Some(l) = link(e.to, up) {
+            serves.push(l);
+        }
+        cur = e.to;
+    }
+    let root = serves.last().cloned();
+
+    // Staleness: statements citing the same PRIMARY source path, written later,
+    // at least as well evidenced, and not already linked by a contradiction.
+    // That last exclusion is the point — a pair braim has already reconciled is
+    // not news; ID:186 and ID:189 are exactly the unreconciled shape.
+    let my_paths: HashSet<String> = node.sources.iter().filter_map(|s| primary_path(s)).collect();
+    let contradicted: HashSet<u32> = braim
+        .state
+        .contradicts
+        .iter()
+        .filter(|e| !e.resolved && (e.from == id || e.to == id))
+        .map(|e| if e.from == id { e.to } else { e.from })
+        .collect();
+    // Anything already on the constraint's own causal chain is excluded: a
+    // consequent rests ON the constraint, so it corroborates rather than
+    // supersedes, and listing it as staleness buries the signal that matters.
+    let related: HashSet<u32> = rests_on
+        .iter()
+        .chain(serves.iter())
+        .map(|l| l.id)
+        .collect();
+
+    let mut stale: Vec<StaleSignal> = Vec::new();
+    if !my_paths.is_empty() {
+        // Rarity is what makes a shared signal informative. src/graph.rs is cited
+        // by dozens of statements here, so "shares a file" alone ranks a hub's
+        // whole neighbourhood; "shares a file AND the words nobody else uses" is
+        // what actually points at a superseder. Both halves are scored by inverse
+        // document frequency over the eligible statements — the same rarity
+        // weighting the pair generator applies to hub sources.
+        let statements: Vec<&crate::graph::Node> = braim
+            .state
+            .nodes
+            .values()
+            .filter(|n| elig.contains(&n.id) && n.node_type.is_statement_family())
+            .collect();
+        let n_docs = statements.len().max(1) as f32;
+        let mut df: HashMap<String, usize> = HashMap::new();
+        let mut path_df: HashMap<String, usize> = HashMap::new();
+        for st in &statements {
+            for t in terms(&st.label) {
+                *df.entry(t).or_insert(0) += 1;
+            }
+            let paths: HashSet<String> = st.sources.iter().filter_map(|x| primary_path(x)).collect();
+            for pth in paths {
+                *path_df.entry(pth).or_insert(0) += 1;
+            }
+        }
+        let idf = |count: usize| -> f32 { (n_docs / count.max(1) as f32).ln().max(0.0) };
+        let my_terms = terms(&node.label);
+
+        for other in statements.iter().copied() {
+            // "Written later" breaks ties on id: created_at has second
+            // resolution, so two statements added in the same second compare
+            // equal, and ids are monotonic.
+            let later = (other.created_at.as_str(), other.id) > (node.created_at.as_str(), node.id);
+            if other.id == id
+                || related.contains(&other.id)
+                || contradicted.contains(&other.id)
+                || !later
+                || other.verification_status.rank() < node.verification_status.rank()
+            {
+                continue;
+            }
+            let shared_paths: Vec<String> = other
+                .sources
+                .iter()
+                .filter_map(|x| primary_path(x))
+                .filter(|pth| my_paths.contains(pth))
+                .collect();
+            // A shared artifact is the entry ticket: two statements about the same
+            // file can supersede one another, two statements about different files
+            // are just both true (the lookup-by-source-path discipline).
+            let path = match shared_paths.first() {
+                Some(pth) => pth.clone(),
+                None => continue,
+            };
+            let mut shared_terms: Vec<(String, f32)> = terms(&other.label)
+                .intersection(&my_terms)
+                .map(|t| (t.clone(), idf(df.get(t).copied().unwrap_or(1))))
+                .collect();
+            shared_terms.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            });
+            let term_score: f32 = shared_terms.iter().map(|(_, w)| w).sum();
+            let path_score: f32 = shared_paths
+                .iter()
+                .map(|pth| idf(path_df.get(pth).copied().unwrap_or(1)))
+                .fold(0.0, f32::max);
+            // The shared artifact is the entry ticket; the rarity score only
+            // orders what got in. No cutoff: on a small graph every word is
+            // common enough to score zero, and dropping those would make the
+            // probe silent exactly where the graph is easiest to check by hand.
+            let score = term_score + path_score;
+            let top: Vec<String> = shared_terms.iter().take(4).map(|(t, _)| t.clone()).collect();
+            stale.push(StaleSignal {
+                id: other.id,
+                label: other.label.clone(),
+                verification: other.verification_status.label().to_string(),
+                shared_path: path,
+                created_at: other.created_at.clone(),
+                score,
+                why: if top.is_empty() {
+                    format!("cites the same file, written later, stands at {}", other.verification_status.label())
+                } else {
+                    format!(
+                        "cites the same file and shares {}; written later, stands at {}",
+                        top.join(", "),
+                        other.verification_status.label()
+                    )
+                },
+                shared_terms: top,
+            });
+        }
+    }
+    // Strongest overlap first; ties broken by recency, then id, so the order is
+    // stable across runs.
+    stale.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.created_at.cmp(&a.created_at))
+            .then(a.id.cmp(&b.id))
+    });
+    stale.truncate(max_signals);
+
+    let root_clause = match &root {
+        Some(r) => format!(" and the chain ends at ID:{} — \"{}\"", r.id, r.label),
+        None => " and nothing records what it ultimately serves".to_string(),
+    };
+    let frame = format!(
+        "Assume ID:{} no longer holds: \"{}\".\n\
+         It stands at {} on {}. {} statement(s) rest on it{}.\n\n\
+         1. Check the staleness signals FIRST. If current sources already refute the \
+         constraint, that is an ordinary contradiction — raise it with \
+         `braim statement contradict` and stop. There is no counterfactual to write.\n\
+         2. Otherwise, for each statement resting on it, say what it becomes once the \
+         constraint is lifted: unchanged, weaker, or void.\n\
+         3. Name the single change that would most move {}.\n\
+         4. Anything you write from step 2 or 3 is a hypothesis, not a finding. Tag it \
+         `braim meta <id> --set counterfactual=true`; export refuses those by design, \
+         because no source can prove that removing a constraint would improve an \
+         outcome (braim ID:322).",
+        id,
+        node.label,
+        node.verification_status.label(),
+        if node.sources.is_empty() { "no sources".to_string() } else { node.sources.join(", ") },
+        rests_on.len(),
+        root_clause,
+        match &root {
+            Some(r) => format!("ID:{}", r.id),
+            None => "the goal this serves".to_string(),
+        },
+    );
+
+    Ok(Counterfactual {
+        id,
+        label: node.label.clone(),
+        verification: node.verification_status.label().to_string(),
+        domains: node.domains.clone(),
+        sources: node.sources.clone(),
+        rests_on,
+        serves,
+        root,
+        stale_signals: stale,
+        frame,
+    })
 }
 
 /// Nodes eligible to be dreamed about: active concepts and statements that are
@@ -465,7 +820,7 @@ pub fn candidates(
 
     // (score, strategy, rationale) accumulated per pair.
     let mut acc: HashMap<(u32, u32), (f32, Vec<&'static str>, Vec<String>)> = HashMap::new();
-    let mut add = |acc: &mut HashMap<(u32, u32), (f32, Vec<&'static str>, Vec<String>)>,
+    let add = |acc: &mut HashMap<(u32, u32), (f32, Vec<&'static str>, Vec<String>)>,
                    a: u32,
                    b: u32,
                    score: f32,
@@ -756,6 +1111,102 @@ mod tests {
         let out = constraints(&b, 10, false).shown;   // must return, not hang
         assert!(!out.iter().any(|c| c.id == dead), "a refuted cause is already dead, not a constraint");
         assert!(out.iter().any(|c| c.id == p || c.id == q), "cyclic causes still rank");
+    }
+
+    #[test]
+    fn the_walk_goes_both_ways_from_the_constraint() {
+        let mut b = temp("whatif_walk");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let goal = stmt(&mut b, "the root goal being served", (x, y), vec!["code:g.rs:1".into()]);
+        let cons = stmt(&mut b, "the constraint under test", (x, y), vec!["code:c.rs:1".into()]);
+        let near = stmt(&mut b, "a consequent one hop out", (x, y), vec!["code:n.rs:1".into()]);
+        let far = stmt(&mut b, "a consequent two hops out", (x, y), vec!["code:f.rs:1".into()]);
+        b.why_add(cons, goal, Some("narrative:w".into())).unwrap();
+        b.why_add(near, cons, Some("narrative:w".into())).unwrap();
+        b.why_add(far, near, Some("narrative:w".into())).unwrap();
+
+        let cf = counterfactual(&b, cons, false, 5).unwrap();
+        assert_eq!(cf.rests_on.len(), 2, "both hops come into play if the constraint lifts");
+        assert_eq!(cf.rests_on[0].id, near);
+        assert_eq!(cf.rests_on[0].depth, 1);
+        assert_eq!(cf.rests_on[1].id, far);
+        assert_eq!(cf.rests_on[1].depth, 2, "depth is distance, not discovery order");
+        assert_eq!(cf.root.as_ref().map(|r| r.id), Some(goal), "the walk up ends at what it serves");
+        assert!(cf.frame.contains(&format!("ID:{}", goal)), "the frame names the goal to move");
+    }
+
+    #[test]
+    fn a_concept_has_nothing_to_relax() {
+        let mut b = temp("whatif_concept");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let err = counterfactual(&b, x, false, 5).unwrap_err();
+        assert!(err.contains("concept"), "got: {}", err);
+        let missing = counterfactual(&b, 9999, false, 5).unwrap_err();
+        assert!(missing.contains("does not exist"), "got: {}", missing);
+    }
+
+    #[test]
+    fn staleness_needs_a_shared_artifact_and_ranks_by_rare_words() {
+        let mut b = temp("whatif_stale");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cons = stmt(&mut b, "invalidate cascades irreversibly and exposes no inverse command",
+            (x, y), vec!["code:src/graph.rs:2909".into()]);
+        // Same file, and the rare words the constraint itself uses.
+        let superseder = stmt(&mut b, "revalidate reverses invalidate and supplies the inverse command",
+            (x, y), vec!["code:src/graph.rs:2930".into()]);
+        // Same file, unrelated words: the hub-neighbour case that must rank below.
+        let neighbour = stmt(&mut b, "version save writes per domain snapshot pins",
+            (x, y), vec!["code:src/graph.rs:88".into()]);
+        // Rare words in common, but a different artifact: not a superseder.
+        let elsewhere = stmt(&mut b, "invalidate cascades irreversibly in the exported copy",
+            (x, y), vec!["code:src/other.rs:1".into()]);
+
+        let cf = counterfactual(&b, cons, false, 5).unwrap();
+        let ids: Vec<u32> = cf.stale_signals.iter().map(|sg| sg.id).collect();
+        assert!(ids.contains(&superseder), "the same-file superseder must surface");
+        assert!(!ids.contains(&elsewhere), "a different file is not a superseder, however alike it reads");
+        assert_eq!(ids[0], superseder, "shared rare words outrank a bare shared file");
+        assert!(ids.iter().position(|i| *i == neighbour).map_or(true, |p| p > 0));
+        assert!(cf.stale_signals[0].shared_terms.iter().any(|t| t == "invalidate"));
+    }
+
+    #[test]
+    fn a_consequent_is_corroboration_not_staleness() {
+        let mut b = temp("whatif_consequent");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cons = stmt(&mut b, "invalidate cascades irreversibly and exposes no inverse command",
+            (x, y), vec!["code:src/graph.rs:2909".into()]);
+        let effect = stmt(&mut b, "invalidate therefore needs an inverse command urgently",
+            (x, y), vec!["code:src/graph.rs:2930".into()]);
+        assert!(counterfactual(&b, cons, false, 5).unwrap()
+            .stale_signals.iter().any(|sg| sg.id == effect), "unlinked, it reads as a superseder");
+
+        b.why_add(effect, cons, Some("narrative:w".into())).unwrap();
+        let cf = counterfactual(&b, cons, false, 5).unwrap();
+        assert!(cf.rests_on.iter().any(|l| l.id == effect), "it rests on the constraint");
+        assert!(!cf.stale_signals.iter().any(|sg| sg.id == effect),
+            "so it corroborates the constraint rather than superseding it");
+    }
+
+    #[test]
+    fn an_already_contradicted_pair_is_not_news() {
+        let mut b = temp("whatif_contradicted");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cons = stmt(&mut b, "invalidate cascades irreversibly and exposes no inverse command",
+            (x, y), vec!["code:src/graph.rs:2909".into()]);
+        let other = stmt(&mut b, "revalidate reverses invalidate and supplies the inverse command",
+            (x, y), vec!["code:src/graph.rs:2930".into()]);
+        assert!(counterfactual(&b, cons, false, 5).unwrap()
+            .stale_signals.iter().any(|sg| sg.id == other));
+
+        b.contradict_statements(cons, other, "already reconciled", None).unwrap();
+        let cf = counterfactual(&b, cons, false, 5).unwrap();
+        assert!(!cf.stale_signals.iter().any(|sg| sg.id == other),
+            "a pair braim has already reconciled is not a staleness signal");
     }
 
     #[test]
