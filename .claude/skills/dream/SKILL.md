@@ -1,6 +1,6 @@
 ---
 name: dream
-description: Run one overnight dreaming session over a local braim graph — adjudicate candidate node pairs for missing relations, duplicates, and contradictions, writing every verdict back under a skeptical evidence protocol. Use when the user asks to dream, run a dream session, or consolidate a graph overnight.
+description: Run one overnight dreaming session over a local braim graph — adjudicate candidate node pairs for missing relations, duplicates, and contradictions, and relax load-bearing constraints to find the ones the graph has already outgrown, writing every verdict back under a skeptical evidence protocol. Use when the user asks to dream, run a dream session, ask what-if, or consolidate a graph overnight.
 ---
 
 # Dreaming: adjudicate candidate pairs
@@ -209,6 +209,93 @@ braim dream seen <a> <b> --verdict <verdict> --note "<one line>"
 ```
 This is what stops the next session re-treading the same pair.
 
+## What-if: relax a constraint
+
+Pairs are one half of a session. The other is asking what the graph would look
+like if one of its load-bearing statements stopped being true — the technique a
+dream applies to a life, applied to a knowledge graph.
+
+Run this **after** the pairs, or instead of them when the user asks for what-if
+directly. Two or three constraints is a session; there are never many worth
+walking.
+
+```bash
+braim dream constraints --limit 10     # rank causes by what rests on them
+braim dream whatif <id>                # walk the one you picked
+```
+
+`constraints` ranks by blast radius scaled by evidence — it cannot tell a
+constraint from any other cause, and does not pretend to. Limitation vocabulary
+matched 61 of 161 statements on a real graph, mostly false positives, so
+`reads_as_limitation` is annotation, never ranking. **You** decide which of the
+top entries is actually a constraint someone could lift. Skip the ones that are
+just facts about how things are.
+
+### Staleness first — this is the part that produces findings
+
+`whatif` prints staleness signals before anything else. Work them first and be
+willing to stop there.
+
+A signal is a statement citing the same PRIMARY source **file** as the
+constraint, written later, evidenced at least as well, with no contradiction
+linking the pair yet. Ranking is by shared rare wording, not by the file alone —
+on a 5000-line hub file the file by itself ranks the whole neighbourhood (braim
+ID:332). The constraint's own consequents are excluded, so anything listed is
+genuinely off its chain.
+
+Open the sources on both sides. If current evidence supersedes the constraint:
+
+```bash
+braim statement contradict <constraint> <superseder> --reason "<what specifically changed>"
+braim dream seen <constraint> <superseder> --verdict contradiction --note "<one line>"
+```
+
+**Then stop.** There is no counterfactual to imagine about a constraint that no
+longer holds — you found an obsolete fact being served as a current one, which is
+the whole yield of this mode (braim ID:324). ID:186 and ID:189 sat in this graph
+in exactly that state, both `partial`, unlinked, for weeks.
+
+A ranked signal is a lead, not a verdict. Most will be statements that merely
+touch the same file.
+
+### If the constraint still holds
+
+Then, and only then, relax it. `whatif` gives you the two things the walk is for:
+what **rests on** the constraint (nearest first — those are the statements that
+come into play) and what it **serves** (the root goal the chain ends at).
+
+For each statement resting on it, say what it becomes once the constraint is
+lifted: **unchanged**, **weaker**, or **void**. Most are unchanged; say so. Then
+name the single change that would most move the root goal — one, not a list.
+
+Write at most one statement per constraint, and tag it:
+
+```bash
+braim statement add "<what becomes possible, in one sentence>" \
+  --domains "<domain>" --sources "narrative:whatif-<YYYY-MM-DD>" \
+  --depends "<constraint>:0.7,<the-statement-it-unblocks>:0.3" --assume
+braim meta <new-id> --set counterfactual=true
+braim meta <new-id> --set scope=dream
+braim why-add <new-id> --because <constraint> --source "narrative:whatif-<YYYY-MM-DD>"
+```
+
+`counterfactual=true` is load-bearing. Export strips those nodes **and everything
+depending on them** at the import boundary, and reports the count — a what-if is
+unverifiable by construction, since no source can prove that removing a
+constraint would improve an outcome (braim ID:322, ID:333). Never remove the tag
+to publish one, and never cite a PRIMARY source on a counterfactual: the sources
+would be real and the claim still would not be.
+
+Mark the constraint so the next session moves on:
+
+```bash
+braim meta <constraint> --set whatif_walked=true
+braim meta <constraint> --set whatif_walked_at=<YYYY-MM-DD>
+```
+
+The dream ledger is keyed on pairs, so it cannot hold a single-node walk. Check
+`braim list --meta whatif_walked=true` before picking targets.
+
 ## Rules that keep the graph sound
 
 - Weights in `--depends` must sum to 1.0 and should be **asymmetric** — equal
@@ -220,6 +307,9 @@ This is what stops the next session re-treading the same pair.
   duplicates; it does not rewrite established knowledge.
 - Everything you create carries `scope=dream` so a human can review the whole
   session with `braim list --meta scope=dream`.
+- A what-if output additionally carries `counterfactual=true`, and nothing else
+  ever does. Tagging an ordinary finding that way quarantines it for good;
+  leaving it off a hypothesis lets a hypothesis publish as a finding.
 
 ## Report
 
@@ -231,7 +321,12 @@ Finish with a short prose summary the user can read at breakfast:
 - every `verified` and `duplicate` with its node ids, since those changed the graph
 - anything that looked like a contradiction you were not confident enough to raise
 - the relation rate, flagged if it exceeded ~40%
-- what to review: `braim list --meta scope=dream`
+- constraints walked: which ones, whether each turned out stale, and for the ones
+  that held, the single change you named — separate the stale findings from the
+  counterfactuals, because only the first kind is a finding
+- what to review: `braim list --meta scope=dream`, and
+  `braim list --meta counterfactual=true` for the hypotheses, which never leave
+  this graph
 
 State plainly if the session found nothing. A night that produces no relations is
 a correct outcome, not a failed run.
