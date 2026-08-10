@@ -350,13 +350,15 @@ enum Commands {
         #[arg(long, help = "Dedup intent: raise the default score floor to 0.8 and flag likely duplicates")]
         dedup: bool,
     },
-    #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
+    #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n  braim meta 6318 --unset scope             # remove a key entirely\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
     Meta {
         id: u32,
-        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow)")]
+        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow)", conflicts_with_all = ["inc", "unset"])]
         set: Option<String>,
-        #[arg(long, help = "Increment a numeric key (e.g. recurrence)")]
+        #[arg(long, help = "Increment a numeric key (e.g. recurrence)", conflicts_with = "unset")]
         inc: Option<String>,
+        #[arg(long, help = "Remove a key entirely (e.g. terminal_cause)")]
+        unset: Option<String>,
     },
 
     #[command(name = "why-add", about = "Add a because_of causal edge (Five Whys)", long_about = "Why Add: record that one statement occurs because_of another (consequent → cause).\n\nUsage:\n  braim why-add 42 --because 17\n  braim why-add 42 --because 17 --source \"narrative:investigation_2026-06-19\"\n\nRules:\n  • Both endpoints must be STATEMENTS (not concepts).\n  • One outgoing because_of per statement (single cardinality). If a second cause\n    is suspected, model the competition with 'braim statement contradict'.\n  • Unweighted: each link asserts the principal cause.\n  • Cycles are rejected. Chain depth >= 7 warns; > 10 is rejected.\n  • --source must carry a typed prefix (code:|doc:|...|narrative:).\n\nThis edge is isolated from depends_on: perspective/proximity/query are unaffected.\nWalk the chain with 'braim why <id>'; validate a link with 'braim why-test <id>'.")]
@@ -1749,8 +1751,34 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
 
             Ok(())
         }
-        Commands::Meta { id, set, inc } => {
-            if let Some(kv) = set {
+        Commands::Meta { id, set, inc, unset } => {
+            if let Some(k) = unset {
+                // Loud on a key that was not there: a silent success makes a
+                // typo indistinguishable from a removal.
+                match braim.unset_meta(id, &k)? {
+                    true => println!("unset {}.metadata[{}]", id, k),
+                    false => {
+                        let node = braim.state.nodes.get(&id);
+                        let keys: Vec<&str> = node
+                            .map(|n| {
+                                let mut ks: Vec<&str> = n.metadata.keys().map(|s| s.as_str()).collect();
+                                ks.sort();
+                                ks
+                            })
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "Error: node {} has no metadata key '{}'{}",
+                            id,
+                            k,
+                            if keys.is_empty() {
+                                " (it has none at all)".to_string()
+                            } else {
+                                format!(" — it has: {}", keys.join(", "))
+                            }
+                        ));
+                    }
+                }
+            } else if let Some(kv) = set {
                 match kv.split_once('=') {
                     Some((k, v)) => match braim.set_meta(id, k, v) {
                         Ok(_) => println!("set {}.metadata[{}] = {}", id, k, v),

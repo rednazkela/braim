@@ -2733,6 +2733,22 @@ impl Braim {
         Ok(())
     }
 
+    /// Remove a metadata key. Returns whether it was there.
+    ///
+    /// A key exists or it does not — `--set k=false` leaves a tombstone that
+    /// `list --meta k=true` no longer matches but every reader still has to
+    /// interpret, which is how a stale `terminal_cause=false` outlives the
+    /// reason it was written.
+    pub fn unset_meta(&mut self, node_id: u32, key: &str) -> Result<bool, String> {
+        let node = self.state.nodes.get_mut(&node_id)
+            .ok_or_else(|| format!("Error: Node ID {} does not exist", node_id))?;
+        if node.metadata.remove(key).is_none() {
+            return Ok(false);
+        }
+        self.flush()?;
+        Ok(true)
+    }
+
     /// Increment a numeric metadata key (absent/non-numeric treated as 0).
     /// Returns the new value. The clean recurrence_count increment (braim 6336).
     pub fn inc_meta(&mut self, node_id: u32, key: &str) -> Result<i64, String> {
@@ -4616,6 +4632,27 @@ mod defect_tests {
         deps.insert(c, 0.4);
         let s = b.add_statement("alpha relates to beta", vec!["t".into()], vec!["narrative:claim".into()], deps, true).unwrap();
         (a, c, s)
+    }
+
+    #[test]
+    fn unset_meta_removes_the_key_rather_than_falsifying_it() {
+        let mut b = temp_braim("unset_meta");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        b.set_meta(s, "terminal_cause", "true").unwrap();
+        b.set_meta(s, "scope", "dream").unwrap();
+
+        assert!(b.unset_meta(s, "terminal_cause").unwrap(), "it was there");
+        let meta = &b.state.nodes[&s].metadata;
+        assert!(!meta.contains_key("terminal_cause"), "the key is gone, not set to false");
+        assert_eq!(meta.get("scope").map(|v| v.as_str()), Some("dream"), "siblings survive");
+
+        assert!(!b.unset_meta(s, "terminal_cause").unwrap(), "removing it twice reports absence");
+        assert!(!b.unset_meta(s, "never_set").unwrap());
+        assert!(b.unset_meta(9999, "scope").is_err(), "a missing node is an error, not an absence");
+
+        // The removal is durable, not just in memory.
+        let reloaded = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        assert!(!reloaded.state.nodes[&s].metadata.contains_key("terminal_cause"));
     }
 
     #[test]
