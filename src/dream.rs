@@ -442,24 +442,36 @@ pub struct Counterfactual {
     pub frame: String,
 }
 
-/// Source path without the line anchor: `code:src/graph.rs:2909` → `src/graph.rs`.
-/// PRIMARY sources only — a shared narrative tag says two statements were written
+/// The artifact a PRIMARY source names, with any anchor into it removed:
+/// `code:src/graph.rs:2909` → `src/graph.rs`, and
+/// `transcript:2026-06-02-ps-meeting@0:12:20` → `2026-06-02-ps-meeting`.
+///
+/// The `@` cut matters as much as the colon one. Trimming a single trailing
+/// segment leaves a transcript keyed on `…@0:12` — the minute, not the meeting —
+/// so two statements from the same call at different timestamps never match,
+/// which is how a walk of profserv's heaviest constraint reported no signal at
+/// all (braim ID:335).
+///
+/// PRIMARY sources only: a shared narrative tag says two statements were written
 /// in the same session, not that they describe the same artifact.
 fn primary_path(source: &str) -> Option<String> {
     let (ty, location) = Braim::parse_source(source);
     if ty.tier() != "PRIMARY" {
         return None;
     }
-    // Trim a trailing `:12`, `:12-40`, or `:some_fn` anchor. Only the last
-    // segment, and only when the path has one to spare.
-    let path = match location.rsplit_once(':') {
-        Some((head, _)) if !head.is_empty() => head.to_string(),
-        _ => location,
+    // An `@` opens an anchor INTO the artifact (a timestamp, a doc section), and
+    // everything after it — colons included — belongs to that anchor.
+    let head = location.split('@').next().unwrap_or(&location);
+    // Otherwise trim one trailing `:12`, `:12-40`, or `:some_fn`.
+    let path = match head.rsplit_once(':') {
+        Some((h, _)) if !h.is_empty() => h,
+        _ => head,
     };
+    let path = path.trim_end_matches('/').trim();
     if path.is_empty() {
         None
     } else {
-        Some(path)
+        Some(path.to_string())
     }
 }
 
@@ -647,6 +659,7 @@ pub fn counterfactual(
             // probe silent exactly where the graph is easiest to check by hand.
             let score = term_score + path_score;
             let top: Vec<String> = shared_terms.iter().take(4).map(|(t, _)| t.clone()).collect();
+            let path_for_why = path.clone();
             stale.push(StaleSignal {
                 id: other.id,
                 label: other.label.clone(),
@@ -654,11 +667,19 @@ pub fn counterfactual(
                 shared_path: path,
                 created_at: other.created_at.clone(),
                 score,
+                // Name the artifact rather than saying "the same file": a
+                // transcript key is a meeting, and seeing which one is what
+                // tells a reader whether a signal is a hub's whole neighbourhood.
                 why: if top.is_empty() {
-                    format!("cites the same file, written later, stands at {}", other.verification_status.label())
+                    format!(
+                        "also cites {}; written later, stands at {}",
+                        path_for_why,
+                        other.verification_status.label()
+                    )
                 } else {
                     format!(
-                        "cites the same file and shares {}; written later, stands at {}",
+                        "also cites {} and shares {}; written later, stands at {}",
+                        path_for_why,
                         top.join(", "),
                         other.verification_status.label()
                     )
@@ -1111,6 +1132,28 @@ mod tests {
         let out = constraints(&b, 10, false).shown;   // must return, not hang
         assert!(!out.iter().any(|c| c.id == dead), "a refuted cause is already dead, not a constraint");
         assert!(out.iter().any(|c| c.id == p || c.id == q), "cyclic causes still rank");
+    }
+
+    #[test]
+    fn a_source_keys_on_its_artifact_not_on_an_anchor_into_it() {
+        // Code: the line, the range, and the symbol are all anchors.
+        assert_eq!(primary_path("code:src/graph.rs:2909").as_deref(), Some("src/graph.rs"));
+        assert_eq!(primary_path("code:src/dream.rs:186-320").as_deref(), Some("src/dream.rs"));
+        assert_eq!(primary_path("code:src/graph.rs:revalidate_statement").as_deref(), Some("src/graph.rs"));
+        assert_eq!(primary_path("code:src/graph.rs").as_deref(), Some("src/graph.rs"));
+        // Transcripts anchor with `@`, and the anchor carries its own colons.
+        // Trimming one segment used to leave the MINUTE as the key (ID:335).
+        assert_eq!(primary_path("transcript:2026-06-02-ps-meeting@0:12:20").as_deref(),
+            Some("2026-06-02-ps-meeting"));
+        assert_eq!(primary_path("transcript:80828363@07:29").as_deref(), Some("80828363"));
+        assert_eq!(primary_path("transcript:transcripts/2026-08-06-caleb.md:11").as_deref(),
+            Some("transcripts/2026-08-06-caleb.md"));
+        // Two moments in one meeting must land on the same key.
+        assert_eq!(primary_path("transcript:2026-06-02-ps-meeting@0:12:20"),
+            primary_path("transcript:2026-06-02-ps-meeting@0:47:03"));
+        // Non-PRIMARY carries no artifact identity.
+        assert_eq!(primary_path("narrative:dream-2026-08-10"), None);
+        assert_eq!(primary_path("inference:leverage-computable"), None);
     }
 
     #[test]
