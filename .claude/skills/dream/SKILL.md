@@ -326,8 +326,13 @@ lives on the node.
 - Everything you create carries `scope=dream` so a human can review the whole
   session with `braim list --meta scope=dream`.
 - A what-if output additionally carries `counterfactual=true`, and nothing else
-  ever does. Tagging an ordinary finding that way quarantines it for good;
-  leaving it off a hypothesis lets a hypothesis publish as a finding.
+  ever does. Tagging an ordinary finding that way removes it from dreaming and
+  from export for good; leaving it off a hypothesis lets a hypothesis publish as
+  a finding, and lets the next night pair against it as though it were true.
+- `counterfactual=true` takes a node — and everything depending on it — out of
+  the dreaming pool entirely. It will not be offered as a pair, will not count
+  toward any constraint's leverage, and cannot itself be walked. That is what
+  stops a session from compounding its own hypotheses.
 
 ## Report
 

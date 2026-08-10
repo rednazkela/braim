@@ -626,6 +626,13 @@ pub fn counterfactual(
             id
         ));
     }
+    if node.metadata.get("counterfactual").map(|v| v == "true").unwrap_or(false) {
+        return Err(format!(
+            "Error: ID:{} is itself a what-if. Relaxing a hypothesis compounds it — walk the \
+             constraint it was written about instead.",
+            id
+        ));
+    }
 
     let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
     let consequents = consequent_map(braim, &elig);
@@ -904,18 +911,60 @@ pub fn counterfactual(
     })
 }
 
+/// True when a node is a what-if hypothesis, or rests on one.
+///
+/// The taint travels through `depends_on` by fixpoint, exactly as the export
+/// boundary computes it (`Braim::strip_counterfactuals`): a statement resting on
+/// a hypothesis is a hypothesis, however it is sourced.
+fn counterfactual_closure(braim: &Braim) -> HashSet<u32> {
+    let mut tainted: HashSet<u32> = braim
+        .state
+        .nodes
+        .values()
+        .filter(|n| n.metadata.get("counterfactual").map(|v| v == "true").unwrap_or(false))
+        .map(|n| n.id)
+        .collect();
+    if tainted.is_empty() {
+        return tainted;
+    }
+    loop {
+        let grown: HashSet<u32> = braim
+            .state
+            .nodes
+            .values()
+            .filter(|n| !tainted.contains(&n.id))
+            .filter(|n| n.depends_on.keys().any(|d| tainted.contains(d)))
+            .map(|n| n.id)
+            .collect();
+        if grown.is_empty() {
+            return tainted;
+        }
+        tainted.extend(grown);
+    }
+}
+
 /// Nodes eligible to be dreamed about: active concepts and statements that are
 /// neither invalid nor transient agent scratch. Source entities are excluded —
 /// they are provenance, not knowledge.
+///
+/// Counterfactuals are excluded too, and that exclusion does two jobs at once.
+/// A hypothesis must not be offered as a pair candidate, or a night's
+/// adjudication ends up verifying a relation whose endpoint was never true
+/// (braim ID:342). And because the skill attaches each what-if to the constraint
+/// it questions with `why-add`, leaving them in would let dreaming about a
+/// constraint raise that constraint's own leverage — measured, ID:157 went from
+/// 20 consequents to 21 because of a hypothesis written about it (braim ID:341).
 fn eligible(braim: &Braim, include_scratch: bool) -> Vec<u32> {
+    let hypothetical = counterfactual_closure(braim);
     let mut ids: Vec<u32> = braim
         .state
         .nodes
         .iter()
-        .filter(|(_, n)| {
+        .filter(|(id, n)| {
             n.node_type != NodeType::Source
                 && !n.invalid
                 && n.verification_status != VerificationStatus::Invalid
+                && !hypothetical.contains(id)
                 && (include_scratch
                     || n.metadata.get("scope").map(|s| s != "agent_scratch").unwrap_or(true))
         })
@@ -1445,6 +1494,46 @@ mod tests {
         let cf = counterfactual(&b, cons, false, 5).unwrap();
         assert!(!cf.stale_signals.iter().any(|sg| sg.id == other),
             "a pair braim has already reconciled is not a staleness signal");
+    }
+
+    #[test]
+    fn a_counterfactual_is_not_knowledge_to_dream_about() {
+        let mut b = temp("cf_not_knowledge");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        let cons = stmt(&mut b, "the constraint under test", (x, y), vec!["code:c.rs:1".into()]);
+        let real = stmt(&mut b, "a real consequent resting on it", (x, y), vec!["code:r.rs:1".into()]);
+        b.why_add(real, cons, Some("narrative:w".into())).unwrap();
+        let before = constraints(&b, 10, false, false).shown;
+        let impact_before = before.iter().find(|c| c.id == cons).unwrap().impact;
+
+        // The skill attaches a what-if to the constraint it questions, and a
+        // statement built on that what-if inherits its status.
+        let hypo = stmt(&mut b, "what becomes possible if it were lifted", (x, y), vec!["narrative:whatif".into()]);
+        b.set_meta(hypo, "counterfactual", "true").unwrap();
+        b.why_add(hypo, cons, Some("narrative:whatif".into())).unwrap();
+        let mut deps = HashMap::new();
+        deps.insert(hypo, 0.7);
+        deps.insert(x, 0.3);
+        let downstream = b.add_statement("and therefore this would follow", vec!["t".into()],
+            vec!["code:d.rs:1".into()], deps, true).unwrap();
+
+        // Leverage must not count the dream: dreaming about a constraint cannot
+        // be what makes it worth dreaming about (braim ID:341).
+        let after = constraints(&b, 10, false, false).shown;
+        assert_eq!(after.iter().find(|c| c.id == cons).unwrap().impact, impact_before,
+            "a hypothesis is not blast radius");
+
+        // Nor may it come back as a pair to adjudicate (braim ID:342).
+        let pairs = candidates(&b, &opts(vec![Strategy::SharedSource, Strategy::TwoHop]), &[]);
+        assert!(!pairs.iter().any(|p| p.a == hypo || p.b == hypo),
+            "a hypothesis must not be offered as a pair");
+        assert!(!pairs.iter().any(|p| p.a == downstream || p.b == downstream),
+            "nor anything resting on one — the taint travels through depends_on");
+
+        // And it is not a constraint to relax in its own right.
+        let err = counterfactual(&b, hypo, false, 5).unwrap_err();
+        assert!(err.contains("itself a what-if"), "got: {}", err);
     }
 
     #[test]
