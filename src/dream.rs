@@ -392,9 +392,10 @@ pub struct StaleSignal {
     pub id: u32,
     pub label: String,
     pub verification: String,
-    /// The source path both statements cite. Path, not line: line anchors drift
-    /// (braim ID:277/281), so the file is the durable key.
-    pub shared_path: String,
+    /// The artifact both statements cite, when they share one. `None` means the
+    /// signal was admitted on wording alone — the only route open when a
+    /// transcript claim is superseded by later code evidence.
+    pub shared_path: Option<String>,
     /// Distinctive words both labels use, rarest first. This is what separates a
     /// real superseder from the dozens of statements that merely cite the same
     /// hub file.
@@ -411,15 +412,55 @@ const STOPWORDS: [&str; 24] = [
     "before", "because", "while", "what", "does", "have",
 ];
 
-/// Label → distinctive lowercase terms. Short words carry no discrimination and
-/// stopwords carry none at all, so both are dropped before scoring.
-fn terms(label: &str) -> HashSet<String> {
-    label
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 4)
-        .map(|w| w.to_lowercase())
-        .filter(|w| !STOPWORDS.contains(&w.as_str()))
-        .collect()
+/// Collapse a word to its stem so inflections of one idea compare equal.
+///
+/// Deliberately shallow — strip one suffix, then undo a doubled final consonant.
+/// It exists because word-form variation was enough on its own to hide a real
+/// pair: `overlapping`/`overlap` and `tools`/`tooling` share no token at all,
+/// and two statements about the same duplication had exactly one word in common
+/// without it (braim ID:335).
+fn stem(word: &str) -> String {
+    let w = word;
+    let cut = |suffix: &str, min_rest: usize| -> Option<String> {
+        let rest = w.strip_suffix(suffix)?;
+        if rest.len() >= min_rest {
+            Some(rest.to_string())
+        } else {
+            None
+        }
+    };
+    let base = cut("ies", 3)
+        .map(|r| format!("{}y", r))
+        .or_else(|| cut("ing", 4))
+        .or_else(|| cut("ion", 4))
+        .or_else(|| cut("ed", 4))
+        .or_else(|| cut("es", 4))
+        .or_else(|| cut("s", 4))
+        .unwrap_or_else(|| w.to_string());
+    // `overlapping` → `overlapp` → `overlap`.
+    let b = base.as_bytes();
+    if b.len() >= 4 && b[b.len() - 1] == b[b.len() - 2] && (b[b.len() - 1] as char).is_alphabetic() {
+        return base[..base.len() - 1].to_string();
+    }
+    base
+}
+
+/// Label → distinctive stems, each mapped to the surface word it came from so
+/// the reason line can report words a human recognises. Short words carry no
+/// discrimination and stopwords carry none at all, so both are dropped.
+fn terms(label: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for w in label.split(|c: char| !c.is_alphanumeric()) {
+        if w.len() < 4 {
+            continue;
+        }
+        let lower = w.to_lowercase();
+        if STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        out.entry(stem(&lower)).or_insert(lower);
+    }
+    out
 }
 
 /// One constraint, walked in both directions, with the frame the LLM works from.
@@ -586,107 +627,149 @@ pub fn counterfactual(
         .map(|l| l.id)
         .collect();
 
-    let mut stale: Vec<StaleSignal> = Vec::new();
-    if !my_paths.is_empty() {
-        // Rarity is what makes a shared signal informative. src/graph.rs is cited
-        // by dozens of statements here, so "shares a file" alone ranks a hub's
-        // whole neighbourhood; "shares a file AND the words nobody else uses" is
-        // what actually points at a superseder. Both halves are scored by inverse
-        // document frequency over the eligible statements — the same rarity
-        // weighting the pair generator applies to hub sources.
-        let statements: Vec<&crate::graph::Node> = braim
-            .state
-            .nodes
-            .values()
-            .filter(|n| elig.contains(&n.id) && n.node_type.is_statement_family())
-            .collect();
-        let n_docs = statements.len().max(1) as f32;
-        let mut df: HashMap<String, usize> = HashMap::new();
-        let mut path_df: HashMap<String, usize> = HashMap::new();
-        for st in &statements {
-            for t in terms(&st.label) {
-                *df.entry(t).or_insert(0) += 1;
-            }
-            let paths: HashSet<String> = st.sources.iter().filter_map(|x| primary_path(x)).collect();
-            for pth in paths {
-                *path_df.entry(pth).or_insert(0) += 1;
-            }
+    // Two admission routes. A shared artifact is the strong one: statements
+    // about the same file or the same meeting can supersede one another. But an
+    // artifact key can never match ACROSS types — a meeting id and a file path
+    // are not comparable — and supersession across artifacts is exactly what a
+    // transcript claim overturned by later code evidence looks like, so wording
+    // is a second route (braim ID:335).
+    let statements: Vec<&crate::graph::Node> = braim
+        .state
+        .nodes
+        .values()
+        .filter(|n| elig.contains(&n.id) && n.node_type.is_statement_family())
+        .collect();
+    let n_docs = statements.len().max(1) as f32;
+    let mut df: HashMap<String, usize> = HashMap::new();
+    let mut path_df: HashMap<String, usize> = HashMap::new();
+    for st in &statements {
+        for t in terms(&st.label).into_keys() {
+            *df.entry(t).or_insert(0) += 1;
         }
-        let idf = |count: usize| -> f32 { (n_docs / count.max(1) as f32).ln().max(0.0) };
-        let my_terms = terms(&node.label);
+        let paths: HashSet<String> = st.sources.iter().filter_map(|x| primary_path(x)).collect();
+        for pth in paths {
+            *path_df.entry(pth).or_insert(0) += 1;
+        }
+    }
+    // Rarity is what makes a shared signal informative. src/graph.rs is cited by
+    // dozens of statements here, so "shares a file" alone ranks a hub's whole
+    // neighbourhood; "shares a file AND the words nobody else uses" is what
+    // points at a superseder. Both halves score by inverse document frequency —
+    // the same rarity weighting the pair generator applies to hub sources.
+    let idf = |count: usize| -> f32 { (n_docs / count.max(1) as f32).ln().max(0.0) };
+    let my_terms = terms(&node.label);
 
-        for other in statements.iter().copied() {
-            // "Written later" breaks ties on id: created_at has second
-            // resolution, so two statements added in the same second compare
-            // equal, and ids are monotonic.
-            let later = (other.created_at.as_str(), other.id) > (node.created_at.as_str(), node.id);
-            if other.id == id
-                || related.contains(&other.id)
-                || contradicted.contains(&other.id)
-                || !later
-                || other.verification_status.rank() < node.verification_status.rank()
-            {
-                continue;
-            }
-            let shared_paths: Vec<String> = other
-                .sources
-                .iter()
-                .filter_map(|x| primary_path(x))
-                .filter(|pth| my_paths.contains(pth))
-                .collect();
-            // A shared artifact is the entry ticket: two statements about the same
-            // file can supersede one another, two statements about different files
-            // are just both true (the lookup-by-source-path discipline).
-            let path = match shared_paths.first() {
-                Some(pth) => pth.clone(),
-                None => continue,
-            };
-            let mut shared_terms: Vec<(String, f32)> = terms(&other.label)
-                .intersection(&my_terms)
-                .map(|t| (t.clone(), idf(df.get(t).copied().unwrap_or(1))))
-                .collect();
-            shared_terms.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
-            });
-            let term_score: f32 = shared_terms.iter().map(|(_, w)| w).sum();
-            let path_score: f32 = shared_paths
-                .iter()
-                .map(|pth| idf(path_df.get(pth).copied().unwrap_or(1)))
-                .fold(0.0, f32::max);
-            // The shared artifact is the entry ticket; the rarity score only
-            // orders what got in. No cutoff: on a small graph every word is
-            // common enough to score zero, and dropping those would make the
-            // probe silent exactly where the graph is easiest to check by hand.
-            let score = term_score + path_score;
-            let top: Vec<String> = shared_terms.iter().take(4).map(|(t, _)| t.clone()).collect();
-            let path_for_why = path.clone();
-            stale.push(StaleSignal {
-                id: other.id,
-                label: other.label.clone(),
-                verification: other.verification_status.label().to_string(),
-                shared_path: path,
-                created_at: other.created_at.clone(),
-                score,
-                // Name the artifact rather than saying "the same file": a
-                // transcript key is a meeting, and seeing which one is what
-                // tells a reader whether a signal is a hub's whole neighbourhood.
-                why: if top.is_empty() {
-                    format!(
-                        "also cites {}; written later, stands at {}",
-                        path_for_why,
-                        other.verification_status.label()
-                    )
-                } else {
-                    format!(
-                        "also cites {} and shares {}; written later, stands at {}",
-                        path_for_why,
-                        top.join(", "),
-                        other.verification_status.label()
-                    )
-                },
-                shared_terms: top,
-            });
+    struct Cand<'a> {
+        node: &'a crate::graph::Node,
+        path: Option<String>,
+        top: Vec<String>,
+        shared: usize,
+        term_score: f32,
+        score: f32,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for other in statements.iter().copied() {
+        // "Written later" breaks ties on id: created_at has second resolution,
+        // so two statements added in the same second compare equal, and ids are
+        // monotonic.
+        let later = (other.created_at.as_str(), other.id) > (node.created_at.as_str(), node.id);
+        if other.id == id
+            || related.contains(&other.id)
+            || contradicted.contains(&other.id)
+            || !later
+            || other.verification_status.rank() < node.verification_status.rank()
+        {
+            continue;
         }
+        let shared_paths: Vec<String> = other
+            .sources
+            .iter()
+            .filter_map(|x| primary_path(x))
+            .filter(|pth| my_paths.contains(pth))
+            .collect();
+        let other_terms = terms(&other.label);
+        let mut shared_terms: Vec<(String, String, f32)> = other_terms
+            .iter()
+            .filter(|(stem, _)| my_terms.contains_key(*stem))
+            .map(|(stem, word)| (stem.clone(), word.clone(), idf(df.get(stem).copied().unwrap_or(1))))
+            .collect();
+        shared_terms.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+        });
+        let term_score: f32 = shared_terms.iter().map(|(_, _, w)| w).sum();
+        let path_score: f32 = shared_paths
+            .iter()
+            .map(|pth| idf(path_df.get(pth).copied().unwrap_or(1)))
+            .fold(0.0, f32::max);
+        if shared_paths.is_empty() && shared_terms.len() < 2 {
+            // One word in common across two different artifacts is coincidence.
+            continue;
+        }
+        cands.push(Cand {
+            node: other,
+            path: shared_paths.first().cloned(),
+            top: shared_terms.iter().take(4).map(|(_, w, _)| w.clone()).collect(),
+            shared: shared_terms.len(),
+            term_score,
+            score: term_score + path_score,
+        });
+    }
+
+    // Wording-only candidates need a bar, and the bar comes from the graph rather
+    // than from a constant: admit the ones whose overlap is notably above what a
+    // typical pair on this graph shows. Without it a large graph offers hundreds
+    // of two-word coincidences; with a fixed threshold the bar would be wrong for
+    // every graph but the one it was tuned on.
+    let wordy: Vec<f32> = cands
+        .iter()
+        .filter(|c| c.path.is_none())
+        .map(|c| c.term_score)
+        .collect();
+    let bar = if wordy.len() < 2 {
+        0.0
+    } else {
+        let mean = wordy.iter().sum::<f32>() / wordy.len() as f32;
+        let var = wordy.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / wordy.len() as f32;
+        mean + var.sqrt()
+    };
+
+    let mut stale: Vec<StaleSignal> = Vec::new();
+    for c in cands {
+        if c.path.is_none() && c.term_score < bar {
+            continue;
+        }
+        let via = match &c.path {
+            Some(p) => format!("also cites {}", p),
+            None => "a different artifact".to_string(),
+        };
+        let words = if c.top.is_empty() {
+            String::new()
+        } else {
+            format!(" and shares {}", c.top.join(", "))
+        };
+        stale.push(StaleSignal {
+            id: c.node.id,
+            label: c.node.label.clone(),
+            verification: c.node.verification_status.label().to_string(),
+            // Name the artifact rather than saying "the same file": a transcript
+            // key is a meeting, and seeing which one tells a reader whether a
+            // signal is a hub's whole neighbourhood.
+            shared_path: c.path.clone(),
+            created_at: c.node.created_at.clone(),
+            score: c.score,
+            why: format!(
+                "{}{}; written later, stands at {}{}",
+                via,
+                words,
+                c.node.verification_status.label(),
+                if c.path.is_none() {
+                    format!(" — wording only, {} shared terms", c.shared)
+                } else {
+                    String::new()
+                }
+            ),
+            shared_terms: c.top,
+        });
     }
     // Strongest overlap first; ties broken by recency, then id, so the order is
     // stable across runs.
@@ -1190,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn staleness_needs_a_shared_artifact_and_ranks_by_rare_words() {
+    fn a_shared_artifact_outranks_a_shared_vocabulary() {
         let mut b = temp("whatif_stale");
         let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
         let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
@@ -1202,17 +1285,50 @@ mod tests {
         // Same file, unrelated words: the hub-neighbour case that must rank below.
         let neighbour = stmt(&mut b, "version save writes per domain snapshot pins",
             (x, y), vec!["code:src/graph.rs:88".into()]);
-        // Rare words in common, but a different artifact: not a superseder.
+        // A different artifact, but the same rare wording. Admissible on wording
+        // alone — a transcript claim overturned by code evidence looks like this
+        // — and it must rank below the same-file match.
         let elsewhere = stmt(&mut b, "invalidate cascades irreversibly in the exported copy",
             (x, y), vec!["code:src/other.rs:1".into()]);
 
         let cf = counterfactual(&b, cons, false, 5).unwrap();
         let ids: Vec<u32> = cf.stale_signals.iter().map(|sg| sg.id).collect();
-        assert!(ids.contains(&superseder), "the same-file superseder must surface");
-        assert!(!ids.contains(&elsewhere), "a different file is not a superseder, however alike it reads");
-        assert_eq!(ids[0], superseder, "shared rare words outrank a bare shared file");
-        assert!(ids.iter().position(|i| *i == neighbour).map_or(true, |p| p > 0));
+        assert_eq!(ids[0], superseder, "shared artifact plus shared rare words leads");
+        assert!(ids.contains(&elsewhere), "a different artifact can still supersede, on wording");
+        let e = cf.stale_signals.iter().find(|sg| sg.id == elsewhere).unwrap();
+        assert!(e.shared_path.is_none(), "and it is reported as wording-only");
+        assert!(e.why.contains("wording only"), "got: {}", e.why);
+        assert!(cf.stale_signals.iter().position(|sg| sg.id == elsewhere).unwrap()
+            > cf.stale_signals.iter().position(|sg| sg.id == superseder).unwrap(),
+            "the artifact match outranks the vocabulary match");
+        assert!(cf.stale_signals.iter().position(|sg| sg.id == neighbour).map_or(true, |p| p > 0));
         assert!(cf.stale_signals[0].shared_terms.iter().any(|t| t == "invalidate"));
+    }
+
+    #[test]
+    fn one_word_across_two_artifacts_is_coincidence() {
+        let mut b = temp("whatif_onewordonly");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cons = stmt(&mut b, "invalidate cascades irreversibly through every dependent",
+            (x, y), vec!["code:src/graph.rs:2909".into()]);
+        let unrelated = stmt(&mut b, "the exporter writes every column of the template",
+            (x, y), vec!["code:src/other.rs:1".into()]);
+        let cf = counterfactual(&b, cons, false, 5).unwrap();
+        assert!(!cf.stale_signals.iter().any(|sg| sg.id == unrelated),
+            "one word in common across two files is not a signal");
+    }
+
+    #[test]
+    fn inflections_of_one_idea_compare_equal() {
+        assert_eq!(stem("tools"), stem("tool"));
+        assert_eq!(stem("tooling"), stem("tool"));
+        assert_eq!(stem("overlapping"), stem("overlap"));
+        assert_eq!(stem("entities"), stem("entity"));
+        assert_eq!(stem("consolidating"), stem("consolidation"));
+        // Shallow on purpose: it must not collapse distinct words.
+        assert_ne!(stem("invalidate"), stem("revalidate"));
+        assert_ne!(stem("codebase"), stem("code"));
     }
 
     #[test]
