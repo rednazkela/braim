@@ -543,6 +543,15 @@ enum DreamCommands {
         #[arg(long, help = "Emit JSON for an agent loop to consume")]
         json: bool,
     },
+    #[command(about = "Rank load-bearing causes by how much rests on them", long_about = "Dream Constraints: rank causes by leverage — how many statements would need re-examining if this one stopped being true.\n\nUsage:\n  braim dream constraints --limit 10\n  braim dream constraints --json\n\nbraim cannot tell a constraint from any other cause — that is a judgement about\nmeaning. What it computes is the blast radius: the transitive set of statements\nreaching a cause through because_of, scaled by how well evidenced that cause is.\nAn unproven cause is discounted (relaxing an opinion is meaningless) but still\nlisted, since a high-impact assumption may be the one worth testing.\n\nThe LLM then decides which of the top entries are actually constraints and\nwhether they can be relaxed. Same split as pair-dreaming: braim picks the\ntarget deterministically, the model supplies judgement (braim ID:323).\n\nreads_as_limitation is an ADVISORY annotation only. Limitation vocabulary\nmatched 61 of 161 statements on a real graph, mostly false positives, so it is\nreported to the reader and contributes nothing to the ranking.\n\nRead-only, and refused on graphs marked .braim.central like the rest of dream.")]
+    Constraints {
+        #[arg(long, default_value = "15", help = "Maximum causes to emit")]
+        limit: usize,
+        #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
+        include_scratch: bool,
+        #[arg(long, help = "Emit JSON for an agent loop to consume")]
+        json: bool,
+    },
     #[command(about = "Record a dream verdict so the pair is not re-examined", long_about = "Dream Seen: write a pair's adjudication into the dream ledger (dreams.json).\n\nUsage:\n  braim dream seen 42 99 --verdict no-relation\n  braim dream seen 42 99 --verdict proposed --note \"statement ID:150 added\"\n\nVerdicts:\n  no-relation    examined, nothing there — never offer this pair again\n  proposed       a relation was recorded as an unproven claim for review\n  verified       a relation was recorded WITH re-grounded PRIMARY sources\n  contradiction  the two nodes actually disagree; a contradicts edge was raised\n\nThe ledger is what lets successive nights advance instead of re-treading the\nsame pairs.")]
     Seen {
         a: u32,
@@ -673,6 +682,7 @@ fn is_read_only(cmd: &Commands) -> bool {
             | Commands::Why { .. }
             | Commands::Export { .. }
             | Commands::Dream(DreamCommands::Candidates { .. })
+            | Commands::Dream(DreamCommands::Constraints { .. })
             | Commands::Policy { .. }
             | Commands::Init { .. }
             | Commands::Statement(StatementCommands::VerifySuggest { .. })
@@ -2005,6 +2015,32 @@ fn main() {
             };
             let found = dream::candidates(&braim, &opts, &semantic_pairs);
             print_candidates(&found, json, limit);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Constraints { limit, include_scratch, json }) => {
+            if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            let found = dream::constraints(&braim, limit, include_scratch);
+            if json {
+                match serde_json::to_string_pretty(&found) {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => eprintln!("Failed to serialize constraints: {}", e),
+                }
+            } else if found.is_empty() {
+                println!("No load-bearing causes — the graph has no because_of chains to rank.");
+            } else {
+                println!("Load-bearing causes ({} of max {}):\n", found.len(), limit);
+                for c in &found {
+                    println!("  {:.2}  ID:{}  [{}]{}", c.score, c.id, c.verification,
+                        if c.reads_as_limitation { "  reads-as-limitation" } else { "" });
+                    println!("        {}", c.label);
+                    println!("        why: {}\n", c.rationale);
+                }
+                println!("Leverage only — whether these are constraints, and whether they can be");
+                println!("relaxed, is the judgement call. Read each one before acting on it.");
+            }
             Ok(())
         }
         Commands::Dream(DreamCommands::Seen { a, b, verdict, note }) => {

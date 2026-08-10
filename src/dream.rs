@@ -176,6 +176,164 @@ pub fn refuse_if_central(data_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A load-bearing cause, ranked by how much of the graph rests on it.
+///
+/// braim cannot tell a *constraint* from any other cause — that is a judgement
+/// about meaning. What it can compute is **leverage**: how many statements would
+/// need re-examining if this one stopped being true. Ranking by leverage and
+/// letting the LLM decide which of the top entries are actually relaxable keeps
+/// the same split that makes pair-dreaming work (braim ID:323).
+#[derive(Serialize, Clone, Debug)]
+pub struct ConstraintCandidate {
+    pub id: u32,
+    pub label: String,
+    pub domains: Vec<String>,
+    pub verification: String,
+    /// Statements that reach this one through because_of, transitively. The
+    /// blast radius if the constraint were lifted.
+    pub impact: usize,
+    /// Consequents citing it directly.
+    pub direct: usize,
+    /// Longest causal chain hanging off it.
+    pub depth: usize,
+    /// Label uses limitation vocabulary. **Advisory annotation, never a filter** —
+    /// on this graph the same lexicon matched 61 of 161 statements, most of them
+    /// false positives ("Invoice Payment *must* be recorded"), so it informs the
+    /// reader and contributes nothing to the score.
+    pub reads_as_limitation: bool,
+    pub score: f32,
+    pub rationale: String,
+}
+
+/// How much a constraint's own evidence should count. An unproven cause is an
+/// opinion — relaxing it is meaningless — so it is discounted but still listed;
+/// a measured one is worth acting on. Never zero: impact alone is informative.
+fn evidence_weight(status: VerificationStatus) -> f32 {
+    match status {
+        VerificationStatus::ProvenStrong => 1.0,
+        VerificationStatus::Proven => 0.85,
+        VerificationStatus::Partial => 0.6,
+        VerificationStatus::Contested => 0.25,
+        VerificationStatus::Unproven => 0.0,
+        VerificationStatus::Invalid => 0.0,
+    }
+}
+
+/// Vocabulary that *reads* like a limitation. Annotation only — see the field doc.
+fn reads_as_limitation(label: &str) -> bool {
+    const WORDS: [&str; 14] = [
+        "cannot", "can not", "no inverse", "not supported", "unsupported",
+        "blocked", "blocker", "limitation", "prevents", "impossible",
+        "lacks", "missing", "forbidden", "refuses",
+    ];
+    let lower = label.to_lowercase();
+    WORDS.iter().any(|w| lower.contains(w))
+}
+
+/// Rank causes by leverage. Pure read — computes nothing an LLM is needed for.
+pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Vec<ConstraintCandidate> {
+    let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
+
+    // because_of runs consequent -> cause, so invert it to walk a cause's blast
+    // radius outward.
+    let mut consequents: HashMap<u32, Vec<u32>> = HashMap::new();
+    for e in &braim.state.because_of {
+        if elig.contains(&e.from) && elig.contains(&e.to) {
+            consequents.entry(e.to).or_default().push(e.from);
+        }
+    }
+    for v in consequents.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+
+    // Breadth-first over the consequent tree. The visited set makes this
+    // cycle-safe: a causal loop is a graph defect, not a reason to hang.
+    let reach = |root: u32| -> (usize, usize) {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut frontier = vec![root];
+        let mut depth = 0usize;
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for id in frontier {
+                for c in consequents.get(&id).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if *c != root && seen.insert(*c) {
+                        next.push(*c);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            depth += 1;
+            frontier = next;
+        }
+        (seen.len(), depth)
+    };
+
+    let mut causes: Vec<u32> = consequents.keys().copied().collect();
+    causes.sort();
+
+    let mut out: Vec<ConstraintCandidate> = causes
+        .into_iter()
+        .filter_map(|id| {
+            let node = braim.state.nodes.get(&id)?;
+            // Only statements carry causal meaning, and a refuted node is not a
+            // constraint worth relaxing — it is already dead.
+            if !node.node_type.is_statement_family()
+                || node.invalid
+                || node.verification_status == VerificationStatus::Invalid
+            {
+                return None;
+            }
+            let (impact, depth) = reach(id);
+            if impact == 0 {
+                return None;
+            }
+            Some(ConstraintCandidate {
+                id,
+                label: node.label.clone(),
+                domains: node.domains.clone(),
+                verification: node.verification_status.label().to_string(),
+                impact,
+                direct: consequents.get(&id).map(|v| v.len()).unwrap_or(0),
+                depth,
+                reads_as_limitation: reads_as_limitation(&node.label),
+                score: 0.0,
+                rationale: String::new(),
+            })
+        })
+        .collect();
+
+    let max_impact = out.iter().map(|c| c.impact).max().unwrap_or(1) as f32;
+    for c in out.iter_mut() {
+        let node = &braim.state.nodes[&c.id];
+        let ev = evidence_weight(node.verification_status);
+        // Impact sets the ceiling; evidence scales it. The 0.4 floor keeps a
+        // high-impact unproven cause visible rather than buried — it may be the
+        // very assumption worth testing.
+        c.score = ((c.impact as f32 / max_impact) * (0.4 + 0.6 * ev)).min(1.0);
+        c.rationale = format!(
+            "{} statement(s) rest on this ({} directly, {} level(s) deep); it is {}{}",
+            c.impact,
+            c.direct,
+            c.depth,
+            c.verification,
+            if c.reads_as_limitation { ", and its wording reads as a limitation" } else { "" },
+        );
+    }
+
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.impact.cmp(&a.impact))
+            .then(a.id.cmp(&b.id))
+    });
+    out.truncate(limit);
+    out
+}
+
 /// Nodes eligible to be dreamed about: active concepts and statements that are
 /// neither invalid nor transient agent scratch. Source entities are excluded —
 /// they are provenance, not knowledge.
@@ -480,6 +638,92 @@ mod tests {
             include_scratch: false,
             replay: false,
         }
+    }
+
+    /// A statement with real evidence, so verification can be varied on purpose.
+    fn stmt(b: &mut Braim, text: &str, deps: (u32, u32), sources: Vec<String>) -> u32 {
+        b.add_statement(text, vec!["t".into()], sources,
+            Map::from([(deps.0, 0.6), (deps.1, 0.4)]), true).unwrap()
+    }
+
+    #[test]
+    fn leverage_counts_transitive_impact_not_just_direct() {
+        let mut b = temp("leverage_transitive");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+
+        // deep: root <- mid <- leaf   (root has 1 direct, 2 transitive)
+        let deep_root = stmt(&mut b, "deep root", (x, y), vec!["code:a.rs:1".into()]);
+        let mid = stmt(&mut b, "mid", (x, y), vec!["code:b.rs:1".into()]);
+        let leaf = stmt(&mut b, "leaf", (x, y), vec!["code:c.rs:1".into()]);
+        b.why_add(mid, deep_root, Some("narrative:w".into())).unwrap();
+        b.why_add(leaf, mid, Some("narrative:w".into())).unwrap();
+
+        // wide: root <- one consequent only
+        let wide_root = stmt(&mut b, "wide root", (x, y), vec!["code:d.rs:1".into()]);
+        let only = stmt(&mut b, "only consequent", (x, y), vec!["code:e.rs:1".into()]);
+        b.why_add(only, wide_root, Some("narrative:w".into())).unwrap();
+
+        let out = constraints(&b, 10, false);
+        let deep = out.iter().find(|c| c.id == deep_root).expect("deep root ranked");
+        let wide = out.iter().find(|c| c.id == wide_root).expect("wide root ranked");
+
+        assert_eq!(deep.impact, 2, "impact is transitive, not just direct consequents");
+        assert_eq!(deep.direct, 1);
+        assert_eq!(deep.depth, 2);
+        assert_eq!(wide.impact, 1);
+        assert!(deep.score > wide.score, "more of the graph rests on the deeper chain");
+        assert_eq!(out[0].id, deep_root, "ranked best-first");
+        // A leaf carries nothing and is not a candidate at all.
+        assert!(!out.iter().any(|c| c.id == leaf), "a cause with no consequents is not load-bearing");
+    }
+
+    #[test]
+    fn evidence_discounts_an_unproven_cause_at_equal_impact() {
+        let mut b = temp("leverage_evidence");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+
+        // Identical shape; only the cause's own evidence differs.
+        let measured = stmt(&mut b, "measured cause", (x, y),
+            vec!["code:a.rs:1".into(), "doc:a.md:1".into()]);   // proven
+        let opinion = stmt(&mut b, "opinion cause", (x, y),
+            vec!["narrative:hunch".into()]);                     // unproven
+        let c1 = stmt(&mut b, "consequent one", (x, y), vec!["code:c.rs:1".into()]);
+        let c2 = stmt(&mut b, "consequent two", (x, y), vec!["code:d.rs:1".into()]);
+        b.why_add(c1, measured, Some("narrative:w".into())).unwrap();
+        b.why_add(c2, opinion, Some("narrative:w".into())).unwrap();
+
+        let out = constraints(&b, 10, false);
+        let m = out.iter().find(|c| c.id == measured).unwrap();
+        let o = out.iter().find(|c| c.id == opinion).unwrap();
+        assert_eq!(m.impact, o.impact, "same blast radius by construction");
+        assert!(m.score > o.score, "a measured constraint outranks an equally load-bearing opinion");
+        assert!(o.score > 0.0, "but the opinion stays visible — it may be the assumption worth testing");
+    }
+
+    #[test]
+    fn refuted_causes_are_excluded_and_cycles_terminate() {
+        let mut b = temp("leverage_edges");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let dead = stmt(&mut b, "refuted cause", (x, y), vec!["code:a.rs:1".into()]);
+        let live = stmt(&mut b, "live consequent", (x, y), vec!["code:b.rs:1".into()]);
+        b.why_add(live, dead, Some("narrative:w".into())).unwrap();
+
+        // A causal loop is a graph defect; ranking must terminate regardless.
+        let p = stmt(&mut b, "loop p", (x, y), vec!["code:p.rs:1".into()]);
+        let q = stmt(&mut b, "loop q", (x, y), vec!["code:q.rs:1".into()]);
+        b.why_add(p, q, Some("narrative:w".into())).unwrap();
+        b.state.because_of.push(crate::graph::BecauseOfEdge {
+            from: q, to: p, source: None, created_at: String::new(),
+            test_source: None, invalid: false, invalid_reason: None,
+        });
+
+        b.invalidate_statement(dead, "refuted").unwrap();
+        let out = constraints(&b, 10, false);   // must return, not hang
+        assert!(!out.iter().any(|c| c.id == dead), "a refuted cause is already dead, not a constraint");
+        assert!(out.iter().any(|c| c.id == p || c.id == q), "cyclic causes still rank");
     }
 
     #[test]
