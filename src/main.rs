@@ -2013,15 +2013,18 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 let text = serde_json::to_string_pretty(&found)
                     .map_err(|e| format!("Failed to serialize constraints: {}", e))?;
                 println!("{}", text);
-            } else if found.is_empty() {
+            } else if found.shown.is_empty() {
                 println!("No load-bearing causes — the graph has no because_of chains to rank.");
             } else {
-                println!("Load-bearing causes ({} of max {}):\n", found.len(), limit);
-                for c in &found {
+                println!("Load-bearing causes ({} of {} ranked):\n", found.shown.len(), found.ranked);
+                for c in &found.shown {
                     println!("  {:.2}  ID:{}  [{}]{}", c.score, c.id, c.verification,
                         if c.reads_as_limitation { "  reads-as-limitation" } else { "" });
                     println!("        {}", c.label);
                     println!("        why: {}\n", c.rationale);
+                }
+                if found.dropped() > 0 {
+                    println!("{} more ranked below the cut — raise --limit to see them.\n", found.dropped());
                 }
                 println!("Leverage only — whether these are constraints, and whether they can be");
                 println!("relaxed, is the judgement call. Read each one before acting on it.");

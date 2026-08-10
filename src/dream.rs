@@ -235,8 +235,26 @@ fn reads_as_limitation(label: &str) -> bool {
     WORDS.iter().any(|w| lower.contains(w))
 }
 
+/// A ranking plus what the limit hid. A cap that reports nothing reads as
+/// "that was everything", which is the one thing a leverage ranking must not
+/// imply — the caller decides whether to look further.
+#[derive(Serialize, Clone, Debug)]
+pub struct ConstraintRanking {
+    /// Causes that scored, before `limit` was applied.
+    pub ranked: usize,
+    /// The top `limit` of them.
+    pub shown: Vec<ConstraintCandidate>,
+}
+
+impl ConstraintRanking {
+    /// Causes the limit cut off.
+    pub fn dropped(&self) -> usize {
+        self.ranked.saturating_sub(self.shown.len())
+    }
+}
+
 /// Rank causes by leverage. Pure read — computes nothing an LLM is needed for.
-pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Vec<ConstraintCandidate> {
+pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> ConstraintRanking {
     let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
 
     // because_of runs consequent -> cause, so invert it to walk a cause's blast
@@ -343,8 +361,9 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Vec<Co
             .then(b.impact.cmp(&a.impact))
             .then(a.id.cmp(&b.id))
     });
+    let ranked = out.len();
     out.truncate(limit);
-    out
+    ConstraintRanking { ranked, shown: out }
 }
 
 /// Nodes eligible to be dreamed about: active concepts and statements that are
@@ -677,7 +696,7 @@ mod tests {
         let only = stmt(&mut b, "only consequent", (x, y), vec!["code:e.rs:1".into()]);
         b.why_add(only, wide_root, Some("narrative:w".into())).unwrap();
 
-        let out = constraints(&b, 10, false);
+        let out = constraints(&b, 10, false).shown;
         let deep = out.iter().find(|c| c.id == deep_root).expect("deep root ranked");
         let wide = out.iter().find(|c| c.id == wide_root).expect("wide root ranked");
 
@@ -707,7 +726,7 @@ mod tests {
         b.why_add(c1, measured, Some("narrative:w".into())).unwrap();
         b.why_add(c2, opinion, Some("narrative:w".into())).unwrap();
 
-        let out = constraints(&b, 10, false);
+        let out = constraints(&b, 10, false).shown;
         let m = out.iter().find(|c| c.id == measured).unwrap();
         let o = out.iter().find(|c| c.id == opinion).unwrap();
         assert_eq!(m.impact, o.impact, "same blast radius by construction");
@@ -734,9 +753,29 @@ mod tests {
         });
 
         b.invalidate_statement(dead, "refuted").unwrap();
-        let out = constraints(&b, 10, false);   // must return, not hang
+        let out = constraints(&b, 10, false).shown;   // must return, not hang
         assert!(!out.iter().any(|c| c.id == dead), "a refuted cause is already dead, not a constraint");
         assert!(out.iter().any(|c| c.id == p || c.id == q), "cyclic causes still rank");
+    }
+
+    #[test]
+    fn the_limit_reports_what_it_hid() {
+        let mut b = temp("leverage_limit");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        for i in 0..3 {
+            let cause = stmt(&mut b, &format!("cause number {}", i), (x, y), vec![format!("code:c{}.rs:1", i)]);
+            let effect = stmt(&mut b, &format!("effect number {}", i), (x, y), vec![format!("code:e{}.rs:1", i)]);
+            b.why_add(effect, cause, Some("narrative:w".into())).unwrap();
+        }
+
+        let r = constraints(&b, 1, false);
+        assert_eq!(r.shown.len(), 1, "the limit is honoured");
+        assert_eq!(r.ranked, 3, "but the full count is reported");
+        assert_eq!(r.dropped(), 2, "so a cap never reads as completeness");
+
+        let all = constraints(&b, 10, false);
+        assert_eq!(all.dropped(), 0, "nothing hidden when the limit exceeds the ranking");
     }
 
     #[test]
@@ -756,7 +795,7 @@ mod tests {
             invalid_reason: Some("inverse test failed".into()),
         });
 
-        let out = constraints(&b, 10, false);
+        let out = constraints(&b, 10, false).shown;
         let c = out.iter().find(|c| c.id == cause).expect("the live link still makes it a cause");
         assert_eq!(c.impact, 1, "a disproved link must not inflate the blast radius");
         assert_eq!(c.direct, 1, "nor the direct count");
