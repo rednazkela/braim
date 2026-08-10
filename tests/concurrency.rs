@@ -845,3 +845,51 @@ fn mixed_readers_and_writers_leave_central_sound() {
     assert_eq!(failures, 0, "{} concurrent operations failed outright", failures);
     assert_graph_integrity(&central, "after mixed workload");
 }
+
+/// A rejected command must not strand the write lock.
+///
+/// `open_for_write` takes the cross-process lock before dispatch and releases it
+/// only through Drop, but every argument-validation branch used to
+/// `std::process::exit(1)`, which skips destructors — as did main's own error
+/// handler, since `braim` was still in scope there. One missing `--domains` left
+/// `.braim.lock` behind, and the next writer waited the full 30s timeout and
+/// then failed outright (braim ID:326). Both shapes are covered here: a CLI
+/// rejection before the graph is touched, and an error raised by the graph
+/// itself.
+#[test]
+fn a_rejected_command_releases_the_write_lock() {
+    let scratch = Scratch::new("lockleak");
+    let dir = scratch.sub("central");
+    seed_central(&dir, 5);
+    let lock = Path::new(&dir).join(".braim.lock");
+
+    // (1) argument validation: --sources given, --domains missing.
+    let (ok, out) = braim(
+        &dir,
+        &["statement", "add", "Seed1 and Seed2 share an origin", "--sources", "code:a.rs:1", "--depends", "1:0.6,2:0.4"],
+    );
+    assert!(!ok, "expected the malformed command to be rejected: {}", out);
+    assert!(!lock.exists(), "write lock survived a rejected command");
+
+    // (2) an error from the graph, not the parser: dependency 999 does not exist.
+    let (ok, out) = braim(
+        &dir,
+        &["statement", "add", "Seed1 rests on a node that is not there", "--domains", "a,b", "--sources", "code:a.rs:1,doc:b.md", "--depends", "1:0.6,999:0.4"],
+    );
+    assert!(!ok, "expected the dangling dependency to be rejected: {}", out);
+    assert!(!lock.exists(), "write lock survived a graph-level error");
+
+    // The next writer must proceed immediately — not sit out the stale window.
+    let started = std::time::Instant::now();
+    let (ok, out) = braim(
+        &dir,
+        &["statement", "add", "Seed1 and Seed2 are both baseline concepts", "--domains", "a,b", "--sources", "code:a.rs:1,doc:b.md", "--depends", "1:0.6,2:0.4"],
+    );
+    assert!(ok, "follow-up write failed: {}", out);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "follow-up write took {:?} — it waited on a leaked lock",
+        started.elapsed()
+    );
+    assert_graph_integrity(&dir, "after rejected commands");
+}

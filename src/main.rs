@@ -698,7 +698,7 @@ fn main() {
     } else {
         Braim::open_for_write(&cli.data_dir)
     };
-    let mut braim = match open {
+    let braim = match open {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{}", e);
@@ -706,7 +706,23 @@ fn main() {
         }
     };
 
-    let result = match cli.command {
+    // `run` OWNS the graph, so the cross-process write lock is released by Drop
+    // when it returns — on the error paths too. Exiting the process from inside
+    // a command handler skips that Drop and strands .braim.lock for the full
+    // stale window, which one missing --domains used to do (braim ID:326).
+    let result = run(cli, braim);
+
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Dispatch one command. Fails by returning `Err`, never by exiting: an early
+/// `std::process::exit` here would skip `Braim`'s Drop and leak the write lock
+/// (braim ID:326).
+fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
+    match cli.command {
         Commands::Concept(ConceptCommands::Add {
             term,
             domains,
@@ -725,8 +741,7 @@ fn main() {
             let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
             if has_dup_sources {
                 if strict_sources {
-                    eprintln!("Error: duplicate source entries detected");
-                    std::process::exit(1);
+                    return Err("Error: duplicate source entries detected".to_string());
                 } else {
                     tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
                 }
@@ -735,8 +750,7 @@ fn main() {
             // Validate PRIMARY+TERTIARY mix
             if Braim::validate_primary_tertiary_mix(&sources_list) {
                 if strict_sources {
-                    eprintln!("Error: PRIMARY and TERTIARY sources mixed on same statement");
-                    std::process::exit(1);
+                    return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
                 } else {
                     tips::emit_tip_primary_tertiary_mix(cli.quiet);
                 }
@@ -746,8 +760,7 @@ fn main() {
                 Some(d) => Some(match parse_depends(&d) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
+                        return Err(format!("{}", e));
                     }
                 }),
                 None => None,
@@ -805,8 +818,7 @@ fn main() {
         }
         Commands::Concept(ConceptCommands::Delete { id, force }) => {
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Concept ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Concept ID {} not found", id));
             }
 
             // Find dependents
@@ -823,8 +835,7 @@ fn main() {
                     eprintln!("  - ID:{}  {}", dep_id, dep_label);
                 }
                 eprintln!("");
-                eprintln!("Delete anyway? Use --force to confirm.");
-                std::process::exit(1);
+                return Err("Delete anyway? Use --force to confirm.".to_string());
             }
 
             match braim.delete_node(id) {
@@ -842,14 +853,12 @@ fn main() {
             let new_weights = match parse_depends(&weights) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             };
 
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Concept ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Concept ID {} not found", id));
             }
 
             match braim.update_weights(id, new_weights.clone()) {
@@ -859,15 +868,14 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
         Commands::Concept(ConceptCommands::UpdateDeps { id, add, remove, set }) => {
             let add_map = match add.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             let remove_ids: Option<Vec<u32>> = match remove.as_deref() {
@@ -875,19 +883,18 @@ fn main() {
                     let parsed: Result<Vec<u32>, _> = s.split(',').map(|x| x.trim().parse::<u32>()).collect();
                     match parsed {
                         Ok(v) => Some(v),
-                        Err(_) => { eprintln!("Error: --remove must be comma-separated IDs (e.g. \"3,7\")"); std::process::exit(1); }
+                        Err(_) => { return Err("Error: --remove must be comma-separated IDs (e.g. \"3,7\")".to_string()); }
                     }
                 }
                 None => None,
             };
             let set_map = match set.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             if add_map.is_none() && remove_ids.is_none() && set_map.is_none() {
-                eprintln!("Error: provide at least one of --add, --remove, or --set");
-                std::process::exit(1);
+                return Err("Error: provide at least one of --add, --remove, or --set".to_string());
             }
             match braim.update_deps(id, add_map, remove_ids, set_map) {
                 Ok(new_deps) => {
@@ -896,8 +903,7 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
@@ -917,24 +923,21 @@ fn main() {
             }
             // Validation: inferred flag is mutually exclusive with explicit sources
             if inferred && sources.is_some() {
-                eprintln!("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.");
-                std::process::exit(1);
+                return Err("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.".to_string());
             }
 
             // Validation: reject manual "inferred" as a source value
             if !inferred && sources.is_some() {
                 let sources_str = sources.as_ref().unwrap();
                 if sources_str.contains("inferred") {
-                    eprintln!("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.");
-                    std::process::exit(1);
+                    return Err("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.".to_string());
                 }
             }
 
             let depends_map = match parse_depends(&depends) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             };
 
@@ -949,8 +952,7 @@ fn main() {
                 (doms, sources_vec)
             } else {
                 if domains.is_none() || sources.is_none() {
-                    eprintln!("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.");
-                    std::process::exit(1);
+                    return Err("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.".to_string());
                 }
                 (parse_list(domains.as_ref().unwrap()), parse_list(sources.as_ref().unwrap()))
             };
@@ -960,8 +962,7 @@ fn main() {
                 let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
                 if has_dup_sources {
                     if strict_sources {
-                        eprintln!("Error: duplicate source entries detected");
-                        std::process::exit(1);
+                        return Err("Error: duplicate source entries detected".to_string());
                     } else {
                         tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
                     }
@@ -970,8 +971,7 @@ fn main() {
                 // Validate PRIMARY+TERTIARY mix (Issue 2)
                 if Braim::validate_primary_tertiary_mix(&sources_list) {
                     if strict_sources {
-                        eprintln!("Error: PRIMARY and TERTIARY sources mixed on same statement");
-                        std::process::exit(1);
+                        return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
                     } else {
                         tips::emit_tip_primary_tertiary_mix(cli.quiet);
                     }
@@ -982,8 +982,7 @@ fn main() {
             let (has_dup_domains, dup_domain_counts) = Braim::validate_duplicate_domains(&domains_list);
             if has_dup_domains {
                 if strict_domains {
-                    eprintln!("Error: duplicate domain entries detected");
-                    std::process::exit(1);
+                    return Err("Error: duplicate domain entries detected".to_string());
                 } else if braim.distinct_domain_count() > 1 {
                     // Suppress in single-domain graphs — uniform repetition is expected
                     tips::emit_tip_duplicate_domains(&dup_domain_counts, cli.quiet);
@@ -1037,8 +1036,7 @@ fn main() {
         }
         Commands::Statement(StatementCommands::Delete { id, force }) => {
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Statement ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Statement ID {} not found", id));
             }
 
             // Find dependents
@@ -1055,8 +1053,7 @@ fn main() {
                     eprintln!("  - ID:{}  {}", dep_id, dep_label);
                 }
                 eprintln!("");
-                eprintln!("Delete anyway? Use --force to confirm.");
-                std::process::exit(1);
+                return Err("Delete anyway? Use --force to confirm.".to_string());
             }
 
             match braim.delete_node(id) {
@@ -1146,14 +1143,12 @@ fn main() {
             let new_weights = match parse_depends(&weights) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             };
 
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Statement ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Statement ID {} not found", id));
             }
 
             match braim.update_weights(id, new_weights.clone()) {
@@ -1163,15 +1158,14 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
         Commands::Statement(StatementCommands::UpdateDeps { id, add, remove, set }) => {
             let add_map = match add.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             let remove_ids: Option<Vec<u32>> = match remove.as_deref() {
@@ -1179,19 +1173,18 @@ fn main() {
                     let parsed: Result<Vec<u32>, _> = s.split(',').map(|x| x.trim().parse::<u32>()).collect();
                     match parsed {
                         Ok(v) => Some(v),
-                        Err(_) => { eprintln!("Error: --remove must be comma-separated IDs (e.g. \"3,7\")"); std::process::exit(1); }
+                        Err(_) => { return Err("Error: --remove must be comma-separated IDs (e.g. \"3,7\")".to_string()); }
                     }
                 }
                 None => None,
             };
             let set_map = match set.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             if add_map.is_none() && remove_ids.is_none() && set_map.is_none() {
-                eprintln!("Error: provide at least one of --add, --remove, or --set");
-                std::process::exit(1);
+                return Err("Error: provide at least one of --add, --remove, or --set".to_string());
             }
             match braim.update_statement_deps(id, add_map, remove_ids, set_map) {
                 Ok(new_deps) => {
@@ -1202,8 +1195,7 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
@@ -1696,8 +1688,7 @@ fn main() {
                         nodes.retain(|n| ids.contains(&n.id));
                     }
                     None => {
-                        eprintln!("--meta must be key=value (e.g. scope=cognitivex_flow)");
-                        std::process::exit(1);
+                        return Err("--meta must be key=value (e.g. scope=cognitivex_flow)".to_string());
                     }
                 }
             }
@@ -1749,14 +1740,14 @@ fn main() {
                 match kv.split_once('=') {
                     Some((k, v)) => match braim.set_meta(id, k, v) {
                         Ok(_) => println!("set {}.metadata[{}] = {}", id, k, v),
-                        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                        Err(e) => { return Err(format!("{}", e)); }
                     },
-                    None => { eprintln!("--set must be key=value"); std::process::exit(1); }
+                    None => { return Err("--set must be key=value".to_string()); }
                 }
             } else if let Some(k) = inc {
                 match braim.inc_meta(id, &k) {
                     Ok(n) => println!("{}.metadata[{}] = {}", id, k, n),
-                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                    Err(e) => { return Err(format!("{}", e)); }
                 }
             } else {
                 match braim.state.nodes.get(&id) {
@@ -1766,7 +1757,7 @@ fn main() {
                         keys.sort();
                         for k in keys { println!("  {} = {}", k, node.metadata[k]); }
                     }
-                    None => { eprintln!("Error: Node ID {} does not exist", id); std::process::exit(1); }
+                    None => { return Err(format!("Error: Node ID {} does not exist", id)); }
                 }
             }
             Ok(())
@@ -1790,8 +1781,7 @@ fn main() {
                 for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
                     let parts: Vec<&str> = pair.split(':').collect();
                     if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
-                        eprintln!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair);
-                        std::process::exit(1);
+                        return Err(format!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair));
                     }
                     domain_mappings.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
                 }
@@ -1845,8 +1835,7 @@ fn main() {
                     label, label.rfind(':').map(|i| &label[..i]).unwrap_or(&label)
                 );
                 if strict_sources {
-                    eprintln!("Error: {}", msg);
-                    std::process::exit(1);
+                    return Err(format!("Error: {}", msg));
                 } else {
                     eprintln!("⚠ {}", msg);
                 }
@@ -1920,9 +1909,8 @@ fn main() {
             let to = match to.or_else(|| bootstrap::read_central_pointer(&braim.data_dir)) {
                 Some(t) => t,
                 None => {
-                    eprintln!("Error: no target. Pass --to <dir>, or record one once with \
-                               `braim init --team --central <dir>`.");
-                    std::process::exit(1);
+                    return Err(format!("Error: no target. Pass --to <dir>, or record one once with \
+                               `braim init --team --central <dir>`."));
                 }
             };
             let mut domain_mappings = HashMap::new();
@@ -1930,8 +1918,7 @@ fn main() {
                 for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
                     let parts: Vec<&str> = pair.split(':').collect();
                     if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
-                        eprintln!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair);
-                        std::process::exit(1);
+                        return Err(format!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair));
                     }
                     domain_mappings.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
                 }
@@ -1980,8 +1967,7 @@ fn main() {
             json,
         }) => {
             if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
-                eprintln!("{}", e);
-                std::process::exit(1);
+                return Err(format!("{}", e));
             }
             // Default set omits `semantic`: it needs the embedding index, which
             // costs a model load and a full pass. Ask for it explicitly.
@@ -1993,8 +1979,7 @@ fn main() {
                         match Strategy::parse(part) {
                             Ok(s) => out.push(s),
                             Err(e) => {
-                                eprintln!("{}", e);
-                                std::process::exit(1);
+                                return Err(format!("{}", e));
                             }
                         }
                     }
@@ -2019,8 +2004,7 @@ fn main() {
         }
         Commands::Dream(DreamCommands::Constraints { limit, include_scratch, json }) => {
             if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
-                eprintln!("{}", e);
-                std::process::exit(1);
+                return Err(format!("{}", e));
             }
             let found = dream::constraints(&braim, limit, include_scratch);
             if json {
@@ -2045,8 +2029,7 @@ fn main() {
         }
         Commands::Dream(DreamCommands::Seen { a, b, verdict, note }) => {
             if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
-                eprintln!("{}", e);
-                std::process::exit(1);
+                return Err(format!("{}", e));
             }
             match dream::record_ledger(&braim.data_dir, a, b, &verdict, note) {
                 Ok(()) => {
@@ -2067,8 +2050,7 @@ fn main() {
         }
         Commands::Init { team, central, settings } => {
             if !team {
-                eprintln!("Error: pass --team (the only mode today). See `braim init --help`.");
-                std::process::exit(1);
+                return Err("Error: pass --team (the only mode today). See `braim init --help`.".to_string());
             }
             let settings_path = std::path::PathBuf::from(
                 settings.unwrap_or_else(|| ".claude/settings.json".to_string()),
@@ -2234,11 +2216,6 @@ fn main() {
         Commands::Similar { text, top, min_score, rebuild, dedup } => {
             run_similar(&braim, &cli.data_dir, &text, top, min_score, rebuild, dedup)
         }
-    };
-
-    if let Err(e) = result {
-        eprintln!("{}", e);
-        std::process::exit(1);
     }
 }
 
