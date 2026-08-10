@@ -549,6 +549,8 @@ enum DreamCommands {
         limit: usize,
         #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
         include_scratch: bool,
+        #[arg(long, help = "Include constraints already walked, even with nothing new since")]
+        include_walked: bool,
         #[arg(long, help = "Emit JSON for an agent loop to consume")]
         json: bool,
     },
@@ -2022,11 +2024,11 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             print_candidates(&found, json, limit);
             Ok(())
         }
-        Commands::Dream(DreamCommands::Constraints { limit, include_scratch, json }) => {
+        Commands::Dream(DreamCommands::Constraints { limit, include_scratch, include_walked, json }) => {
             if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
                 return Err(format!("{}", e));
             }
-            let found = dream::constraints(&braim, limit, include_scratch);
+            let found = dream::constraints(&braim, limit, include_scratch, include_walked);
             if json {
                 // Fail loudly: a consumer piping --json into a tool must not
                 // read empty stdout plus exit 0 as "no constraints".
@@ -2034,17 +2036,32 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                     .map_err(|e| format!("Failed to serialize constraints: {}", e))?;
                 println!("{}", text);
             } else if found.shown.is_empty() {
-                println!("No load-bearing causes — the graph has no because_of chains to rank.");
+                if found.walked_hidden > 0 {
+                    println!("Nothing new: all {} load-bearing cause(s) have been walked and no \
+                              statement has arrived since. --include-walked to walk one again.",
+                        found.walked_hidden);
+                } else {
+                    println!("No load-bearing causes — the graph has no because_of chains to rank.");
+                }
             } else {
                 println!("Load-bearing causes ({} of {} ranked):\n", found.shown.len(), found.ranked);
                 for c in &found.shown {
-                    println!("  {:.2}  ID:{}  [{}]{}", c.score, c.id, c.verification,
-                        if c.reads_as_limitation { "  reads-as-limitation" } else { "" });
+                    println!("  {:.2}  ID:{}  [{}]{}{}", c.score, c.id, c.verification,
+                        if c.reads_as_limitation { "  reads-as-limitation" } else { "" },
+                        if c.reopened.is_some() { "  REOPENED" } else { "" });
                     println!("        {}", c.label);
-                    println!("        why: {}\n", c.rationale);
+                    println!("        why: {}", c.rationale);
+                    if let Some(r) = &c.reopened {
+                        println!("        reopened: {}", r);
+                    }
+                    println!();
                 }
                 if found.dropped() > 0 {
                     println!("{} more ranked below the cut — raise --limit to see them.\n", found.dropped());
+                }
+                if found.walked_hidden > 0 {
+                    println!("{} already walked with nothing new since — --include-walked to see them.\n",
+                        found.walked_hidden);
                 }
                 println!("Leverage only — whether these are constraints, and whether they can be");
                 println!("relaxed, is the judgement call. Read each one before acting on it.");

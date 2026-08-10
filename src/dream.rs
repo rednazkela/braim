@@ -203,6 +203,11 @@ pub struct ConstraintCandidate {
     pub reads_as_limitation: bool,
     pub score: f32,
     pub rationale: String,
+    /// Date of the last walk (`whatif_walked_at`), when there was one.
+    pub walked: Option<String>,
+    /// Why a walked constraint is being offered again: what arrived since.
+    /// `None` on a constraint that was never walked.
+    pub reopened: Option<String>,
 }
 
 /// Share of its impact an unproven cause keeps. Evidence scales leverage but
@@ -244,6 +249,10 @@ pub struct ConstraintRanking {
     pub ranked: usize,
     /// The top `limit` of them.
     pub shown: Vec<ConstraintCandidate>,
+    /// Walked constraints withheld because nothing has arrived to reopen them.
+    /// Reported rather than dropped in silence — a loop that quietly stops
+    /// offering something looks identical to a loop that ran out of work.
+    pub walked_hidden: usize,
 }
 
 impl ConstraintRanking {
@@ -277,7 +286,12 @@ fn consequent_map(braim: &Braim, elig: &HashSet<u32>) -> HashMap<u32, Vec<u32>> 
 }
 
 /// Rank causes by leverage. Pure read — computes nothing an LLM is needed for.
-pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> ConstraintRanking {
+pub fn constraints(
+    braim: &Braim,
+    limit: usize,
+    include_scratch: bool,
+    include_walked: bool,
+) -> ConstraintRanking {
     let elig: HashSet<u32> = eligible(braim, include_scratch).into_iter().collect();
 
     let consequents = consequent_map(braim, &elig);
@@ -336,6 +350,8 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Constr
                 reads_as_limitation: reads_as_limitation(&node.label),
                 score: 0.0,
                 rationale: String::new(),
+                walked: node.metadata.get("whatif_walked_at").cloned(),
+                reopened: None,
             })
         })
         .collect();
@@ -359,6 +375,69 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Constr
         );
     }
 
+    // Iteration state, enforced here rather than left to the reader's memory.
+    // A constraint already walked is not work — until something arrives that the
+    // walk could not have seen, which is the staleness probe pointed at the walk
+    // itself (braim ID:339).
+    let mut walked_hidden = 0usize;
+    if !include_walked {
+        let walked_ids: Vec<u32> = out
+            .iter()
+            .filter(|c| {
+                braim.state.nodes[&c.id]
+                    .metadata
+                    .get("whatif_walked")
+                    .map(|v| v == "true")
+                    .unwrap_or(false)
+            })
+            .map(|c| c.id)
+            .collect();
+        let mut reopen: HashMap<u32, Option<String>> = HashMap::new();
+        for wid in walked_ids {
+            let since = match braim.state.nodes[&wid].metadata.get("whatif_walked_at") {
+                Some(d) => d.clone(),
+                // Undated walk: nothing to compare against, so it stays closed.
+                // `braim meta <id> --set whatif_walked_at=<date>` reopens it.
+                None => {
+                    reopen.insert(wid, None);
+                    continue;
+                }
+            };
+            let fresh = counterfactual(braim, wid, include_scratch, usize::MAX)
+                .map(|cf| {
+                    cf.stale_signals
+                        .into_iter()
+                        .filter(|sg| sg.created_at.as_str() > since.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            reopen.insert(
+                wid,
+                fresh.first().map(|sg| {
+                    format!(
+                        "walked {}; {} statement(s) have arrived since that the walk could not have seen — nearest is ID:{} [{}]",
+                        since,
+                        fresh.len(),
+                        sg.id,
+                        sg.verification
+                    )
+                }),
+            );
+        }
+        out.retain(|c| match reopen.get(&c.id) {
+            Some(None) => {
+                walked_hidden += 1;
+                false
+            }
+            _ => true,
+        });
+        for c in out.iter_mut() {
+            if let Some(Some(why)) = reopen.get(&c.id) {
+                c.reopened = Some(why.clone());
+            }
+        }
+    }
+
     out.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -368,7 +447,7 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Constr
     });
     let ranked = out.len();
     out.truncate(limit);
-    ConstraintRanking { ranked, shown: out }
+    ConstraintRanking { ranked, shown: out, walked_hidden }
 }
 
 /// One node on a causal chain, with its distance from the constraint.
@@ -1155,7 +1234,7 @@ mod tests {
         let only = stmt(&mut b, "only consequent", (x, y), vec!["code:e.rs:1".into()]);
         b.why_add(only, wide_root, Some("narrative:w".into())).unwrap();
 
-        let out = constraints(&b, 10, false).shown;
+        let out = constraints(&b, 10, false, false).shown;
         let deep = out.iter().find(|c| c.id == deep_root).expect("deep root ranked");
         let wide = out.iter().find(|c| c.id == wide_root).expect("wide root ranked");
 
@@ -1185,7 +1264,7 @@ mod tests {
         b.why_add(c1, measured, Some("narrative:w".into())).unwrap();
         b.why_add(c2, opinion, Some("narrative:w".into())).unwrap();
 
-        let out = constraints(&b, 10, false).shown;
+        let out = constraints(&b, 10, false, false).shown;
         let m = out.iter().find(|c| c.id == measured).unwrap();
         let o = out.iter().find(|c| c.id == opinion).unwrap();
         assert_eq!(m.impact, o.impact, "same blast radius by construction");
@@ -1212,7 +1291,7 @@ mod tests {
         });
 
         b.invalidate_statement(dead, "refuted").unwrap();
-        let out = constraints(&b, 10, false).shown;   // must return, not hang
+        let out = constraints(&b, 10, false, false).shown;   // must return, not hang
         assert!(!out.iter().any(|c| c.id == dead), "a refuted cause is already dead, not a constraint");
         assert!(out.iter().any(|c| c.id == p || c.id == q), "cyclic causes still rank");
     }
@@ -1369,6 +1448,53 @@ mod tests {
     }
 
     #[test]
+    fn a_walked_constraint_stays_closed_until_something_new_arrives() {
+        let mut b = temp("leverage_walked");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cause = stmt(&mut b, "invalidate cascades irreversibly and exposes no inverse command",
+            (x, y), vec!["code:src/graph.rs:2909".into()]);
+        let effect = stmt(&mut b, "a consequent resting on it", (x, y), vec!["code:e.rs:1".into()]);
+        b.why_add(effect, cause, Some("narrative:w".into())).unwrap();
+        assert!(constraints(&b, 10, false, false).shown.iter().any(|c| c.id == cause));
+
+        // Walked, with nothing since: not work any more.
+        b.set_meta(cause, "whatif_walked", "true").unwrap();
+        b.set_meta(cause, "whatif_walked_at", "2020-01-01").unwrap();
+        let r = constraints(&b, 10, false, false);
+        assert!(!r.shown.iter().any(|c| c.id == cause), "a walked constraint is not offered again");
+        assert_eq!(r.walked_hidden, 1, "and the loop says so rather than going quiet");
+        assert!(constraints(&b, 10, false, true).shown.iter().any(|c| c.id == cause),
+            "--include-walked is the way back in");
+
+        // Evidence the walk could not have seen: back on the list, with a reason.
+        let superseder = stmt(&mut b, "revalidate reverses invalidate and supplies the inverse command",
+            (x, y), vec!["code:src/graph.rs:2930".into()]);
+        let r = constraints(&b, 10, false, false);
+        let c = r.shown.iter().find(|c| c.id == cause).expect("new evidence reopens it");
+        assert_eq!(r.walked_hidden, 0);
+        assert_eq!(c.walked.as_deref(), Some("2020-01-01"));
+        let why = c.reopened.as_deref().expect("and says what arrived");
+        assert!(why.contains(&format!("ID:{}", superseder)), "got: {}", why);
+    }
+
+    #[test]
+    fn an_undated_walk_stays_closed_and_is_counted() {
+        let mut b = temp("leverage_walked_undated");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cause = stmt(&mut b, "the walked cause", (x, y), vec!["code:c.rs:1".into()]);
+        let effect = stmt(&mut b, "its consequent", (x, y), vec!["code:e.rs:1".into()]);
+        b.why_add(effect, cause, Some("narrative:w".into())).unwrap();
+        b.set_meta(cause, "whatif_walked", "true").unwrap();
+        // No whatif_walked_at: nothing to compare against, so nothing can reopen it.
+        let _ = stmt(&mut b, "something written afterwards", (x, y), vec!["code:c.rs:9".into()]);
+        let r = constraints(&b, 10, false, false);
+        assert!(!r.shown.iter().any(|c| c.id == cause));
+        assert_eq!(r.walked_hidden, 1, "counted, not silently dropped");
+    }
+
+    #[test]
     fn the_limit_reports_what_it_hid() {
         let mut b = temp("leverage_limit");
         let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
@@ -1379,12 +1505,12 @@ mod tests {
             b.why_add(effect, cause, Some("narrative:w".into())).unwrap();
         }
 
-        let r = constraints(&b, 1, false);
+        let r = constraints(&b, 1, false, false);
         assert_eq!(r.shown.len(), 1, "the limit is honoured");
         assert_eq!(r.ranked, 3, "but the full count is reported");
         assert_eq!(r.dropped(), 2, "so a cap never reads as completeness");
 
-        let all = constraints(&b, 10, false);
+        let all = constraints(&b, 10, false, false);
         assert_eq!(all.dropped(), 0, "nothing hidden when the limit exceeds the ranking");
     }
 
@@ -1405,7 +1531,7 @@ mod tests {
             invalid_reason: Some("inverse test failed".into()),
         });
 
-        let out = constraints(&b, 10, false).shown;
+        let out = constraints(&b, 10, false, false).shown;
         let c = out.iter().find(|c| c.id == cause).expect("the live link still makes it a cause");
         assert_eq!(c.impact, 1, "a disproved link must not inflate the blast radius");
         assert_eq!(c.direct, 1, "nor the direct count");

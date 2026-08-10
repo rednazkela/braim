@@ -224,6 +224,10 @@ braim dream constraints --limit 10     # rank causes by what rests on them
 braim dream whatif <id>                # walk the one you picked
 ```
 
+Constraints already walked are withheld, so a nightly loop advances instead of
+re-offering last night's list. Anything marked `REOPENED` has new evidence
+behind it and should be walked first — that is the whole point of the marker.
+
 `constraints` ranks by blast radius scaled by evidence — it cannot tell a
 constraint from any other cause, and does not pretend to. Limitation vocabulary
 matched 61 of 161 statements on a real graph, mostly false positives, so
@@ -286,15 +290,29 @@ constraint would improve an outcome (braim ID:322, ID:333). Never remove the tag
 to publish one, and never cite a PRIMARY source on a counterfactual: the sources
 would be real and the claim still would not be.
 
-Mark the constraint so the next session moves on:
+### Close the walk
+
+Mark the constraint, **whether or not** it produced anything. A walk that found
+nothing is a result:
 
 ```bash
 braim meta <constraint> --set whatif_walked=true
 braim meta <constraint> --set whatif_walked_at=<YYYY-MM-DD>
 ```
 
-The dream ledger is keyed on pairs, so it cannot hold a single-node walk. Check
-`braim list --meta whatif_walked=true` before picking targets.
+`constraints` reads both. A walked constraint drops off the list and is reported
+as withheld, not silently omitted — and it comes back on its own, flagged
+`REOPENED`, once a statement arrives that the walk could not have seen. That is
+the staleness probe pointed at the walk itself, so it reopens on the same
+evidence a fresh walk would find.
+
+**Set the date.** Without `whatif_walked_at` there is nothing to compare against
+and the constraint stays closed permanently — it will show in the withheld count
+and never reopen.
+
+`--include-walked` is the way back in when you want one anyway. The dream ledger
+is keyed on pairs and cannot hold a single-node walk, which is why the marker
+lives on the node.
 
 ## Rules that keep the graph sound
 
