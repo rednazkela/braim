@@ -205,6 +205,11 @@ pub struct ConstraintCandidate {
     pub rationale: String,
 }
 
+/// Share of its impact an unproven cause keeps. Evidence scales leverage but
+/// must not erase it: a high-impact assumption is exactly the thing worth
+/// testing, so it stays visible instead of sinking below well-evidenced trivia.
+const UNPROVEN_FLOOR: f32 = 0.4;
+
 /// How much a constraint's own evidence should count. An unproven cause is an
 /// opinion — relaxing it is meaningless — so it is discounted but still listed;
 /// a measured one is worth acting on. Never zero: impact alone is informative.
@@ -238,6 +243,13 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Vec<Co
     // radius outward.
     let mut consequents: HashMap<u32, Vec<u32>> = HashMap::new();
     for e in &braim.state.because_of {
+        // A refuted causal link (`why-test` failed) is not leverage: the
+        // consequent no longer rests on this cause, even though both statements
+        // are still valid. Graph::because_of_active_outgoing and the perspective
+        // walk both skip these edges; leverage must agree with them.
+        if e.invalid {
+            continue;
+        }
         if elig.contains(&e.from) && elig.contains(&e.to) {
             consequents.entry(e.to).or_default().push(e.from);
         }
@@ -309,10 +321,11 @@ pub fn constraints(braim: &Braim, limit: usize, include_scratch: bool) -> Vec<Co
     for c in out.iter_mut() {
         let node = &braim.state.nodes[&c.id];
         let ev = evidence_weight(node.verification_status);
-        // Impact sets the ceiling; evidence scales it. The 0.4 floor keeps a
-        // high-impact unproven cause visible rather than buried — it may be the
-        // very assumption worth testing.
-        c.score = ((c.impact as f32 / max_impact) * (0.4 + 0.6 * ev)).min(1.0);
+        // Impact sets the ceiling, evidence scales it. Both factors are <= 1 by
+        // construction (impact <= max_impact, and the floor plus its complement
+        // is exactly 1), so the product needs no clamp.
+        c.score =
+            (c.impact as f32 / max_impact) * (UNPROVEN_FLOOR + (1.0 - UNPROVEN_FLOOR) * ev);
         c.rationale = format!(
             "{} statement(s) rest on this ({} directly, {} level(s) deep); it is {}{}",
             c.impact,
@@ -724,6 +737,29 @@ mod tests {
         let out = constraints(&b, 10, false);   // must return, not hang
         assert!(!out.iter().any(|c| c.id == dead), "a refuted cause is already dead, not a constraint");
         assert!(out.iter().any(|c| c.id == p || c.id == q), "cyclic causes still rank");
+    }
+
+    #[test]
+    fn a_refuted_causal_edge_carries_no_leverage() {
+        let mut b = temp("leverage_refuted_edge");
+        let x = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let y = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let cause = stmt(&mut b, "the load-bearing cause", (x, y), vec!["code:c.rs:1".into()]);
+        let live = stmt(&mut b, "a consequent that still holds", (x, y), vec!["code:l.rs:1".into()]);
+        let refuted = stmt(&mut b, "a consequent whose link was disproved", (x, y), vec!["code:r.rs:1".into()]);
+        b.why_add(live, cause, Some("narrative:w".into())).unwrap();
+        // why_add refuses a second cause per consequent, so the refuted edge is
+        // placed directly — the shape `why-test` leaves behind on failure.
+        b.state.because_of.push(crate::graph::BecauseOfEdge {
+            from: refuted, to: cause, source: None, created_at: String::new(),
+            test_source: None, invalid: true,
+            invalid_reason: Some("inverse test failed".into()),
+        });
+
+        let out = constraints(&b, 10, false);
+        let c = out.iter().find(|c| c.id == cause).expect("the live link still makes it a cause");
+        assert_eq!(c.impact, 1, "a disproved link must not inflate the blast radius");
+        assert_eq!(c.direct, 1, "nor the direct count");
     }
 
     #[test]

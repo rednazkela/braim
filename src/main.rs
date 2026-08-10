@@ -2008,10 +2008,11 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             }
             let found = dream::constraints(&braim, limit, include_scratch);
             if json {
-                match serde_json::to_string_pretty(&found) {
-                    Ok(s) => println!("{}", s),
-                    Err(e) => eprintln!("Failed to serialize constraints: {}", e),
-                }
+                // Fail loudly: a consumer piping --json into a tool must not
+                // read empty stdout plus exit 0 as "no constraints".
+                let text = serde_json::to_string_pretty(&found)
+                    .map_err(|e| format!("Failed to serialize constraints: {}", e))?;
+                println!("{}", text);
             } else if found.is_empty() {
                 println!("No load-bearing causes — the graph has no because_of chains to rank.");
             } else {
