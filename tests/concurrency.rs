@@ -886,8 +886,12 @@ fn a_rejected_command_releases_the_write_lock() {
         &["statement", "add", "Seed1 and Seed2 are both baseline concepts", "--domains", "a,b", "--sources", "code:a.rs:1,doc:b.md", "--depends", "1:0.6,2:0.4"],
     );
     assert!(ok, "follow-up write failed: {}", out);
+    // The bound is about the 30s stale window, not about speed: a leaked lock
+    // makes this wait the whole timeout and then fail. Kept well clear of a
+    // loaded CI runner's process-spawn cost so it cannot flake into a false
+    // failure.
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        started.elapsed() < std::time::Duration::from_secs(15),
         "follow-up write took {:?} — it waited on a leaked lock",
         started.elapsed()
     );

@@ -314,6 +314,52 @@ and never reopen.
 is keyed on pairs and cannot hold a single-node walk, which is why the marker
 lives on the node.
 
+## Anything a human must see goes in the review queue
+
+The closing report lives in the model's context and does not survive
+compaction, so anything that exists only there is lost by morning. A night run
+unattended must leave its review items on disk:
+
+```bash
+braim dream flag "<what a human should look at>" --kind <k> --nodes <ids>
+```
+
+`--kind` is one of `merge`, `unraised`, `duplicate`, `rate`, `note`.
+
+**Flag it the moment it happens**, not at the end. These are the cases — every
+one of them used to be report-only:
+
+- `merge-nodes` warned about dependencies only the loser carried. Never wire
+  them in yourself; flag them with both ids.
+- A merge destroyed a label that held detail the winner lacks. Flag what was
+  lost.
+- Something looked like a contradiction and you could not ground it well enough
+  to raise. Flag it rather than dropping it — being unsure is the point.
+- The relation rate exceeded ~40%, or a graph looks exhausted for a mode.
+- Any judgement call you would want a second opinion on.
+
+Nodes need no flag: they are already findable with `braim list --meta
+scope=dream`. Flag the things that are **not** nodes.
+
+Reading the queue back, on any later session or after any compaction:
+
+```bash
+braim dream review                    # pending, oldest first
+braim dream review --all              # including what was already signed off
+braim dream reviewed <id> --note "<what you did>"
+```
+
+Cleared items are kept rather than deleted — what a human decided is itself
+worth keeping.
+
+The pair verdicts are durable too, and now readable:
+
+```bash
+braim dream log --limit 20            # newest first, with the adjudicator's note
+braim dream log --since 2026-08-10
+braim dream log --verdict verified
+```
+
 ## Rules that keep the graph sound
 
 - Weights in `--depends` must sum to 1.0 and should be **asymmetric** — equal
@@ -336,7 +382,9 @@ lives on the node.
 
 ## Report
 
-Finish with a short prose summary the user can read at breakfast:
+Finish with a short prose summary the user can read at breakfast. It is a
+convenience, **not** the record — everything below that matters must already be
+in the graph, the ledger, or the review queue before you write a word of it:
 
 - the pre-pass: which nodes you measured, the command and result for each, and
   whether the measurement confirmed or refuted the label
@@ -347,9 +395,10 @@ Finish with a short prose summary the user can read at breakfast:
 - constraints walked: which ones, whether each turned out stale, and for the ones
   that held, the single change you named — separate the stale findings from the
   counterfactuals, because only the first kind is a finding
-- what to review: `braim list --meta scope=dream`, and
-  `braim list --meta counterfactual=true` for the hypotheses, which never leave
-  this graph
+- what to review: `braim dream review` first — it is the only place the
+  report-only observations live — then `braim list --meta scope=dream` for the
+  nodes, and `braim list --meta counterfactual=true` for the hypotheses, which
+  never leave this graph
 
 State plainly if the session found nothing. A night that produces no relations is
 a correct outcome, not a failed run.

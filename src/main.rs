@@ -567,6 +567,40 @@ enum DreamCommands {
         #[arg(long, help = "Emit JSON for an agent loop to consume")]
         json: bool,
     },
+    #[command(about = "Raise something for a human to look at", long_about = "Dream Flag: put an observation in the review queue, where it survives the session.\n\nUsage:\n  braim dream flag \"merge 412 warned about deps only the loser had\" --kind merge --nodes 412,88\n  braim dream flag \"looked like a contradiction but I could not ground it\" --kind unraised\n\nA night's most review-worthy output is often not a node: a merge warning, detail\ndestroyed with a loser's label, a contradiction the adjudicator could not ground.\nThose used to go in the closing report, which lives in the model's context and\ndoes not survive compaction — so the part of the night that most needed eyes was\nthe part that evaporated (braim ID:347).\n\nThe queue lives in reviews.json beside the graph. Read it with `braim dream\nreview`, sign an item off with `braim dream reviewed <id>`.")]
+    Flag {
+        #[arg(help = "What a human should look at")]
+        note: String,
+        #[arg(long, default_value = "note", help = "merge | unraised | duplicate | rate | note")]
+        kind: String,
+        #[arg(long, help = "Node ids this concerns, comma-separated")]
+        nodes: Option<String>,
+    },
+    #[command(about = "List what a night left for a human", long_about = "Dream Review: the queue of items raised by `braim dream flag`, pending first.\n\nUsage:\n  braim dream review\n  braim dream review --all      # include items already signed off\n  braim dream review --json\n\nThis is what to read after an unattended night. It survives context compaction\nbecause it is a file beside the graph, not prose in a report.\n\nSee also: `braim list --meta scope=dream` for the nodes a session created, and\n`braim dream log` for the pair verdicts.")]
+    Review {
+        #[arg(long, help = "Include items already signed off")]
+        all: bool,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Sign a review item off", long_about = "Dream Reviewed: mark a queue item as handled.\n\nUsage:\n  braim dream reviewed 3\n  braim dream reviewed 3 --note \"wired the dependency by hand\"\n\nCleared items are kept, not deleted: what a human decided is itself worth\nkeeping, and a queue that forgets its own history cannot be audited. See them\nwith `braim dream review --all`.")]
+    Reviewed {
+        #[arg(help = "Review item id from `braim dream review`")]
+        id: u32,
+        #[arg(long, help = "What you did about it")]
+        note: Option<String>,
+    },
+    #[command(about = "Read back the pair verdicts a night recorded", long_about = "Dream Log: the adjudication ledger (dreams.json), newest first.\n\nUsage:\n  braim dream log --limit 20\n  braim dream log --since 2026-08-10\n  braim dream log --verdict verified\n  braim dream log --json\n\nThe ledger records every pair a session judged, with the note the adjudicator\nwrote. It was previously write-only from the CLI — `dream seen` put entries in\nand only the candidate generator read them back, so the reasoning behind 1939\nverdicts was reachable only with jq (braim ID:347).")]
+    Log {
+        #[arg(long, help = "Only entries recorded on or after this date (YYYY-MM-DD)")]
+        since: Option<String>,
+        #[arg(long, help = "no-relation | proposed | verified | contradiction | duplicate")]
+        verdict: Option<String>,
+        #[arg(long, default_value = "25", help = "Maximum entries to show")]
+        limit: usize,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
     #[command(about = "Record a dream verdict so the pair is not re-examined", long_about = "Dream Seen: write a pair's adjudication into the dream ledger (dreams.json).\n\nUsage:\n  braim dream seen 42 99 --verdict no-relation\n  braim dream seen 42 99 --verdict proposed --note \"statement ID:150 added\"\n\nVerdicts:\n  no-relation    examined, nothing there — never offer this pair again\n  proposed       a relation was recorded as an unproven claim for review\n  verified       a relation was recorded WITH re-grounded PRIMARY sources\n  contradiction  the two nodes actually disagree; a contradicts edge was raised\n\nThe ledger is what lets successive nights advance instead of re-treading the\nsame pairs.")]
     Seen {
         a: u32,
@@ -699,6 +733,8 @@ fn is_read_only(cmd: &Commands) -> bool {
             | Commands::Dream(DreamCommands::Candidates { .. })
             | Commands::Dream(DreamCommands::Constraints { .. })
             | Commands::Dream(DreamCommands::Whatif { .. })
+            | Commands::Dream(DreamCommands::Review { .. })
+            | Commands::Dream(DreamCommands::Log { .. })
             | Commands::Policy { .. }
             | Commands::Init { .. }
             | Commands::Statement(StatementCommands::VerifySuggest { .. })
@@ -2144,6 +2180,113 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             }
 
             println!("Frame:\n{}", cf.frame);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Flag { note, kind, nodes }) => {
+            let ids = match nodes.as_deref() {
+                Some(list) => {
+                    let parsed: Result<Vec<u32>, _> =
+                        list.split(',').map(|x| x.trim().parse::<u32>()).collect();
+                    match parsed {
+                        Ok(v) => v,
+                        Err(_) => return Err("Error: --nodes must be comma-separated ids (e.g. \"412,88\")".to_string()),
+                    }
+                }
+                None => Vec::new(),
+            };
+            for id in &ids {
+                if !braim.state.nodes.contains_key(id) {
+                    return Err(format!("Error: node ID:{} does not exist — flag what is there", id));
+                }
+            }
+            let item = dream::flag(&braim.data_dir, &kind, &note, ids)?;
+            println!("✓ review item {} raised [{}]", item.id, item.kind);
+            println!("  {}", item.note);
+            if !item.nodes.is_empty() {
+                println!("  nodes: {}", item.nodes.iter().map(|i| format!("ID:{}", i))
+                    .collect::<Vec<_>>().join(", "));
+            }
+            println!("\nRead the queue: braim dream review");
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Review { all, json }) => {
+            let items = dream::pending(&braim.data_dir, all);
+            if json {
+                let text = serde_json::to_string_pretty(&items)
+                    .map_err(|e| format!("Failed to serialize the review queue: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            let open = items.iter().filter(|i| i.cleared_at.is_none()).count();
+            if items.is_empty() {
+                println!("Review queue empty — nothing a night flagged is waiting.");
+            } else {
+                println!("Review queue ({} pending{}):\n", open,
+                    if all { format!(", {} cleared", items.len() - open) } else { String::new() });
+                for i in &items {
+                    let mark = match &i.cleared_at {
+                        Some(at) => format!("  ✓ cleared {}", at),
+                        None => String::new(),
+                    };
+                    println!("  [{}] {}  raised {}{}", i.id, i.kind, i.raised_at, mark);
+                    println!("      {}", i.note);
+                    if !i.nodes.is_empty() {
+                        println!("      nodes: {}", i.nodes.iter().map(|n| format!("ID:{}", n))
+                            .collect::<Vec<_>>().join(", "));
+                    }
+                    if let Some(n) = &i.cleared_note {
+                        println!("      resolution: {}", n);
+                    }
+                    println!();
+                }
+                if open > 0 {
+                    println!("Sign one off: braim dream reviewed <id> --note \"<what you did>\"");
+                }
+            }
+            // The queue holds what has no other home; nodes have one, so point at
+            // it rather than duplicating them here.
+            let created = braim.state.nodes.values()
+                .filter(|n| n.metadata.get("scope").map(|s| s == "dream").unwrap_or(false))
+                .count();
+            if created > 0 {
+                println!("{} node(s) carry scope=dream — braim list --meta scope=dream", created);
+            }
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Reviewed { id, note }) => {
+            let item = dream::clear(&braim.data_dir, id, note)?;
+            println!("✓ review item {} signed off", item.id);
+            println!("  {}", item.note);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Log { since, verdict, limit, json }) => {
+            if let Some(v) = &verdict {
+                const VERDICTS: [&str; 5] =
+                    ["no-relation", "proposed", "verified", "contradiction", "duplicate"];
+                if !VERDICTS.contains(&v.as_str()) {
+                    return Err(format!("Error: --verdict must be one of {} (got '{}')",
+                        VERDICTS.join(", "), v));
+                }
+            }
+            let entries = dream::log(&braim.data_dir, since.as_deref(), verdict.as_deref(), limit);
+            if json {
+                let text = serde_json::to_string_pretty(&entries)
+                    .map_err(|e| format!("Failed to serialize the ledger: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            let total = dream::load_ledger(&braim.data_dir).len();
+            if entries.is_empty() {
+                println!("No ledger entries match ({} recorded in total).", total);
+                return Ok(());
+            }
+            println!("Dream ledger ({} shown of {} recorded):\n", entries.len(), total);
+            for e in &entries {
+                println!("  {}  ID:{} ↔ ID:{}  [{}]", e.recorded_at, e.a, e.b, e.verdict);
+                if let Some(n) = &e.note {
+                    println!("      {}", n);
+                }
+            }
             Ok(())
         }
         Commands::Dream(DreamCommands::Seen { a, b, verdict, note }) => {

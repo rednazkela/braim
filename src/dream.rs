@@ -159,6 +159,135 @@ pub fn record_ledger(
         .map_err(|e| format!("Failed to write dream ledger: {}", e))
 }
 
+/// Items a night raised for a human, kept beside the graph rather than in it.
+///
+/// A dream session's most review-worthy output is often NOT a node: a merge that
+/// warned about dependencies only the loser carried, a label destroyed with
+/// detail the winner lacks, a contradiction the adjudicator was not confident
+/// enough to raise. The skill routed all of those to the closing report, which
+/// lives in the model's context and does not survive compaction — so the part of
+/// the night that most needed eyes was the part that evaporated (braim ID:347).
+pub const REVIEW_QUEUE: &str = "reviews.json";
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ReviewItem {
+    pub id: u32,
+    /// What kind of attention this wants. Free-form, but the skill uses a small
+    /// set so a queue can be read at a glance.
+    pub kind: String,
+    pub note: String,
+    /// Nodes the item concerns, if any.
+    pub nodes: Vec<u32>,
+    pub raised_at: String,
+    /// Set when a human signs it off. `None` means pending.
+    pub cleared_at: Option<String>,
+    pub cleared_note: Option<String>,
+}
+
+pub fn review_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(REVIEW_QUEUE)
+}
+
+pub fn load_reviews(data_dir: &std::path::Path) -> Vec<ReviewItem> {
+    std::fs::read_to_string(review_path(data_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_reviews(data_dir: &std::path::Path, items: &[ReviewItem]) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(items)
+        .map_err(|e| format!("Failed to serialize the review queue: {}", e))?;
+    std::fs::write(review_path(data_dir), text)
+        .map_err(|e| format!("Failed to write the review queue: {}", e))
+}
+
+/// Raise an item for review. Returns the item as recorded.
+pub fn flag(
+    data_dir: &std::path::Path,
+    kind: &str,
+    note: &str,
+    nodes: Vec<u32>,
+) -> Result<ReviewItem, String> {
+    if note.trim().is_empty() {
+        return Err("Error: a review item needs a note — what should a human look at?".to_string());
+    }
+    let mut items = load_reviews(data_dir);
+    let item = ReviewItem {
+        id: items.iter().map(|i| i.id).max().unwrap_or(0) + 1,
+        kind: kind.trim().to_string(),
+        note: note.trim().to_string(),
+        nodes,
+        raised_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        cleared_at: None,
+        cleared_note: None,
+    };
+    items.push(item.clone());
+    save_reviews(data_dir, &items)?;
+    Ok(item)
+}
+
+/// Sign an item off. Cleared items are kept, not deleted: what a human decided
+/// is itself worth keeping, and a queue that forgets its own history cannot be
+/// audited.
+pub fn clear(
+    data_dir: &std::path::Path,
+    id: u32,
+    note: Option<String>,
+) -> Result<ReviewItem, String> {
+    let mut items = load_reviews(data_dir);
+    let idx = items
+        .iter()
+        .position(|i| i.id == id)
+        .ok_or_else(|| match items.iter().filter(|i| i.cleared_at.is_none()).count() {
+            0 => format!("Error: no review item {} (the queue has nothing pending)", id),
+            n => format!("Error: no review item {} ({} pending — `braim dream review` lists them)", id, n),
+        })?;
+    if let Some(at) = &items[idx].cleared_at {
+        return Err(format!("Error: review item {} was already cleared at {}", id, at));
+    }
+    items[idx].cleared_at =
+        Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    items[idx].cleared_note = note;
+    let item = items[idx].clone();
+    save_reviews(data_dir, &items)?;
+    Ok(item)
+}
+
+/// The queue as a human should see it: pending first, oldest first, so the thing
+/// waiting longest reads at the top.
+pub fn pending(data_dir: &std::path::Path, all: bool) -> Vec<ReviewItem> {
+    let mut items: Vec<ReviewItem> = load_reviews(data_dir)
+        .into_iter()
+        .filter(|i| all || i.cleared_at.is_none())
+        .collect();
+    items.sort_by(|a, b| {
+        a.cleared_at
+            .is_some()
+            .cmp(&b.cleared_at.is_some())
+            .then(a.raised_at.cmp(&b.raised_at))
+            .then(a.id.cmp(&b.id))
+    });
+    items
+}
+
+/// Ledger entries, newest first, filtered for reading back a night's work.
+pub fn log(
+    data_dir: &std::path::Path,
+    since: Option<&str>,
+    verdict: Option<&str>,
+    limit: usize,
+) -> Vec<LedgerEntry> {
+    let mut out: Vec<LedgerEntry> = load_ledger(data_dir)
+        .into_iter()
+        .filter(|e| since.map_or(true, |s| e.recorded_at.as_str() >= s))
+        .filter(|e| verdict.map_or(true, |v| e.verdict == v))
+        .collect();
+    out.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at).then(b.a.cmp(&a.a)));
+    out.truncate(limit);
+    out
+}
+
 /// Refuse to dream on a shared/central graph — a dream is a hypothesis awaiting
 /// review, and nobody reviews an unattended central.
 pub fn refuse_if_central(data_dir: &std::path::Path) -> Result<(), String> {
@@ -1494,6 +1623,53 @@ mod tests {
         let cf = counterfactual(&b, cons, false, 5).unwrap();
         assert!(!cf.stale_signals.iter().any(|sg| sg.id == other),
             "a pair braim has already reconciled is not a staleness signal");
+    }
+
+    #[test]
+    fn the_review_queue_outlives_the_session() {
+        let dir = std::env::temp_dir().join(format!("braim_review_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(pending(&dir, false).is_empty(), "an unused queue is empty, not an error");
+        let a = flag(&dir, "merge", "412 warned about deps only the loser had", vec![412, 88]).unwrap();
+        let b = flag(&dir, "unraised", "looked like a contradiction, could not ground it", vec![]).unwrap();
+        assert_eq!((a.id, b.id), (1, 2), "ids are stable and sequential");
+        assert!(flag(&dir, "note", "   ", vec![]).is_err(), "an empty note is not a review item");
+
+        // A fresh read is the point: the queue is a file, not context.
+        let open = pending(&dir, false);
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].nodes, vec![412, 88], "it remembers what it was about");
+
+        let cleared = clear(&dir, 1, Some("wired it by hand".into())).unwrap();
+        assert!(cleared.cleared_at.is_some());
+        assert_eq!(pending(&dir, false).len(), 1, "signed-off items leave the queue");
+        assert_eq!(pending(&dir, true).len(), 2, "but are kept for audit");
+        assert_eq!(pending(&dir, true)[1].cleared_note.as_deref(), Some("wired it by hand"));
+
+        assert!(clear(&dir, 1, None).is_err(), "clearing twice is an error, not a silent no-op");
+        assert!(clear(&dir, 99, None).is_err(), "and so is clearing what does not exist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ledger_reads_back_filtered() {
+        let dir = std::env::temp_dir().join(format!("braim_log_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        record_ledger(&dir, 1, 2, "no-relation", Some("nothing there".into())).unwrap();
+        record_ledger(&dir, 3, 4, "verified", Some("read both sources".into())).unwrap();
+        record_ledger(&dir, 5, 6, "duplicate", None).unwrap();
+
+        assert_eq!(log(&dir, None, None, 10).len(), 3);
+        assert_eq!(log(&dir, None, Some("verified"), 10).len(), 1, "filtered by verdict");
+        assert_eq!(log(&dir, None, Some("verified"), 10)[0].a, 3);
+        assert_eq!(log(&dir, None, None, 2).len(), 2, "and capped");
+        assert_eq!(log(&dir, Some("2099-01-01"), None, 10).len(), 0, "nothing after the future");
+        assert_eq!(log(&dir, Some("2000-01-01"), None, 10).len(), 3, "everything after the past");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
