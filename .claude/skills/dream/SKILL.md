@@ -297,8 +297,13 @@ nothing is a result:
 
 ```bash
 braim meta <constraint> --set whatif_walked=true
-braim meta <constraint> --set whatif_walked_at=<YYYY-MM-DD>
+braim meta <constraint> --set whatif_walked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
+
+Use the full timestamp, not a bare date. The reopen check compares lexically
+against each candidate's `created_at`, and `2026-08-11T09:00:00Z` sorts ABOVE
+`2026-08-11` — so a date-only mark reopens on everything written that same day,
+including what you just read (braim ID:353).
 
 `constraints` reads both. A walked constraint drops off the list and is reported
 as withheld, not silently omitted — and it comes back on its own, flagged
