@@ -376,6 +376,15 @@ braim dream log --verdict verified
   duplicates; it does not rewrite established knowledge.
 - Everything you create carries `scope=dream` so a human can review the whole
   session with `braim list --meta scope=dream`.
+- **Bookkeeping about the session itself carries `scope=agent_scratch` instead** —
+  a note that you merged two nodes, rewired a dependency or resolved a
+  contradiction. It is a record of what you did, not a finding about the domain.
+  Untagged, it becomes an ordinary statement: give it a `why-add` and it starts
+  ranking as a load-bearing cause, so the session's own housekeeping competes
+  with real constraints. Three such nodes made up 3 of 11 ranked causes on
+  profserv before they were tagged (braim ID:354). `eligible()` already excludes
+  `agent_scratch`; the tag is the whole mechanism, so the only failure mode is
+  forgetting it.
 - A what-if output additionally carries `counterfactual=true`, and nothing else
   ever does. Tagging an ordinary finding that way removes it from dreaming and
   from export for good; leaving it off a hypothesis lets a hypothesis publish as
