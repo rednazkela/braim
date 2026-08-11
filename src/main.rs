@@ -301,6 +301,14 @@ enum Commands {
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
+
+    #[command(name = "migrate-refutation", about = "Undo the pre-3.3 refutation cascade (dry by default)", long_about = "Migrate Refutation: repair nodes the OLD cascade marked invalid as collateral.\n\nUsage:\n  braim migrate-refutation           # report what would change, touch nothing\n  braim migrate-refutation --apply   # write the repair\n\nBefore BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3, invalidating a statement cascaded\n`Invalid` to every transitive dependent. Those nodes were never refuted on their\nown evidence — they were collateral, and they carry `invalid_reason:\ndepends_on_invalidated:<id>` to say so. §3.3 replaced that rule: a refuted\ndependency now leaves the cap set, and the dependent settles at whatever its own\nsources support. This command applies the new rule to nodes refuted under the\nold one.\n\nThe reason string is fully re-derivable, so nothing is lost by recomputing it\naway. Each repaired node is stamped `support_withdrawn_by` so the affected set\nstays a reviewable worklist rather than a silent verdict.\n\nDRY BY DEFAULT. Repairing hundreds of nodes without saying so would be\nindistinguishable from corrupting them (§4.5). Read the report, then --apply.\n\nIdempotent: a second run selects nothing. Checkpoint first — `braim version\nsave` — as with any bulk change.")]
+    MigrateRefutation {
+        #[arg(long, help = "Write the repair (default: report only)")]
+        apply: bool,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
     #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • floor at PARTIAL: a statement needs at least one PRIMARY source to publish,\n    so evidence-free claims stay home while single-source findings can reach\n    central and corroborate there (braim ID:253). --include-unproven removes\n    the floor entirely.\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
     Export {
         domain: String,
@@ -1970,6 +1978,47 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 }
                 Err(e) => Err(e),
             }
+        }
+        Commands::MigrateRefutation { apply, json } => {
+            let repairs = braim.migrate_refutation_cascade(apply)?;
+            if json {
+                let payload: Vec<_> = repairs.iter().map(|r| serde_json::json!({
+                    "id": r.id,
+                    "refuted_by": r.refuted_by,
+                    "label": r.label,
+                    "restored": r.restored.label(),
+                    "cause_recovered": r.cause_recovered,
+                })).collect();
+                let text = serde_json::to_string_pretty(&serde_json::json!({
+                    "applied": apply,
+                    "count": repairs.len(),
+                    "repairs": payload,
+                })).map_err(|e| format!("Failed to serialize the migration report: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            if repairs.is_empty() {
+                println!("Nothing to migrate — no node carries a depends_on_invalidated reason.");
+                return Ok(());
+            }
+            println!("{} node(s) were refuted as collateral by the pre-3.3 cascade{}:\n",
+                repairs.len(), if apply { ", now repaired" } else { " (dry run)" });
+            let mut by_status: std::collections::BTreeMap<&str, usize> = Default::default();
+            for r in &repairs {
+                *by_status.entry(r.restored.label()).or_insert(0) += 1;
+                println!("  ID:{}  invalid → {}{}", r.id, r.restored.label(),
+                    if r.cause_recovered { "   (cause ID:".to_string() + &r.refuted_by.to_string() + " is no longer refuted)" } else { String::new() });
+                println!("        {}", r.label.chars().take(110).collect::<String>());
+            }
+            println!("\nRestored to: {}", by_status.iter()
+                .map(|(k, v)| format!("{} {}", v, k)).collect::<Vec<_>>().join(", "));
+            println!("Each carries support_withdrawn_by — review with: braim list --meta support_withdrawn_by=<cause>");
+            if apply {
+                println!("\nWritten. Checkpoint: braim version save \"refutation cascade migrated\"");
+            } else {
+                println!("\nNothing was written. Checkpoint first, then: braim migrate-refutation --apply");
+            }
+            Ok(())
         }
         Commands::MigrateNodeTypes => {
             match braim.migrate_node_types() {

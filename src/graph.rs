@@ -4721,6 +4721,109 @@ mod because_of_tests {
     }
 }
 
+/// One node the pre-§3.3 cascade refuted, and what it becomes once its support
+/// is recomputed instead.
+#[derive(Debug, Clone)]
+pub struct RefutationRepair {
+    pub id: u32,
+    /// The refuted ancestor named in `depends_on_invalidated:<id>`.
+    pub refuted_by: u32,
+    pub label: String,
+    pub restored: VerificationStatus,
+    /// The named ancestor is no longer refuted — the reason outlived its cause.
+    pub cause_recovered: bool,
+}
+
+impl Braim {
+/// BRAIM_DEPENDENCY_INHERITANCE_SPEC §4 — undo the pre-§3.3 refutation
+    /// cascade.
+    ///
+    /// Nodes carrying `invalid_reason: depends_on_invalidated:<id>` were never
+    /// refuted on their own evidence; they were collateral of an ancestor's
+    /// refutation, under the rule §3.3 replaced. The reason string is fully
+    /// re-derivable, so nothing is lost by recomputing it away.
+    ///
+    /// Dry by default. `apply == false` restores the graph before returning, so
+    /// the report costs a clone and changes nothing — repairing hundreds of
+    /// nodes silently would be indistinguishable from corrupting them (§4.5).
+    ///
+    /// Two passes, not a fixpoint: every selected node is cleared before any is
+    /// recomputed, so a repaired node is already out of its dependents' cap set
+    /// by the time they are recomputed. Within pass two each node is computed
+    /// once, in id order, which matches braim's own rule that verification is
+    /// computed at a point in time and does not propagate — the same reason
+    /// §3.3.3 recomputes direct dependents only.
+    ///
+    /// Idempotent: a second run selects nothing.
+    pub fn migrate_refutation_cascade(
+        &mut self,
+        apply: bool,
+    ) -> Result<Vec<RefutationRepair>, String> {
+        const MARKER: &str = "depends_on_invalidated:";
+
+        let mut selected: Vec<(u32, u32)> = Vec::new();
+        for node in self.state.nodes.values() {
+            let Some(reason) = node.invalid_reason.as_deref() else { continue };
+            let Some(rest) = reason.strip_prefix(MARKER) else { continue };
+            // A malformed reason is left alone rather than guessed at: the
+            // repair is only sound when the cause is identifiable.
+            let Ok(cause) = rest.trim().parse::<u32>() else { continue };
+            selected.push((node.id, cause));
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        selected.sort_unstable();
+
+        let snapshot = if apply { None } else { Some(self.state.clone()) };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        // Pass 1 — clear the collateral refutation on every selected node. The
+        // provisional Unproven is what "unsupported" means and is also what lets
+        // recompute_statement_status run at all: it refuses Invalid nodes.
+        for (id, _) in &selected {
+            if let Some(node) = self.state.nodes.get_mut(id) {
+                node.invalid = false;
+                node.invalid_reason = None;
+                node.invalidated_at = None;
+                node.verification_status = VerificationStatus::Unproven;
+                node.node_type = NodeType::from_verification_status(VerificationStatus::Unproven);
+            }
+        }
+
+        // Pass 2 — recompute under §3.3.2 and record the withdrawn support.
+        let mut repairs = Vec::new();
+        for (id, cause) in &selected {
+            self.recompute_statement_status(*id);
+            let cause_recovered = self
+                .state
+                .nodes
+                .get(cause)
+                .map(|c| !(c.invalid || c.verification_status.is_refuted()))
+                .unwrap_or(true);
+            if let Some(node) = self.state.nodes.get_mut(id) {
+                // §3.3.4 — the affected set stays a reviewable worklist.
+                Self::append_csv_meta(node, "support_withdrawn_by", *cause);
+                node.metadata
+                    .insert("support_withdrawn_at".to_string(), now.clone());
+                repairs.push(RefutationRepair {
+                    id: *id,
+                    refuted_by: *cause,
+                    label: node.label.clone(),
+                    restored: node.verification_status,
+                    cause_recovered,
+                });
+            }
+        }
+
+        match snapshot {
+            Some(state) => self.state = state,
+            None => self.flush()?,
+        }
+        Ok(repairs)
+    }
+}
+
 #[cfg(test)]
 mod defect_tests {
     use super::*;
@@ -5297,6 +5400,61 @@ mod defect_tests {
     }
 
     // ---- BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3 regressions ----------------
+
+    /// §4 — the migration undoes collateral refutation, reports before it
+    /// writes, and selects nothing on a second run.
+    #[test]
+    fn migrating_the_old_cascade_repairs_only_collateral() {
+        let mut b = temp_braim("migrate_refutation");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let parent = b.add_statement("the parent", vec!["t".into()],
+            vec!["code:p.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let well_sourced = b.add_statement("collateral with two primary types", vec!["t".into()],
+            vec!["code:w.rs:1".into(), "doc:w.md:1".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+        let weak = b.add_statement("collateral with nothing of its own", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+        let direct = b.add_statement("refuted on its own evidence", vec!["t".into()],
+            vec!["code:d.rs:1".into()], HashMap::from([(a, 0.7), (c, 0.3)]), true).unwrap();
+
+        // Fabricate the pre-3.3 world: the cascade refuted both dependents.
+        b.invalidate_statement(parent, "retired").unwrap();
+        b.invalidate_statement(direct, "disproved").unwrap();
+        for id in [well_sourced, weak] {
+            let n = b.state.nodes.get_mut(&id).unwrap();
+            n.invalid = true;
+            n.invalid_reason = Some(format!("depends_on_invalidated:{}", parent));
+            n.verification_status = VerificationStatus::Invalid;
+            n.node_type = NodeType::InvalidStatement;
+        }
+
+        // Dry run reports and changes nothing.
+        let dry = b.migrate_refutation_cascade(false).unwrap();
+        assert_eq!(dry.len(), 2, "both collateral nodes, and only those");
+        assert!(b.get_node(well_sourced).unwrap().invalid, "a dry run must not write");
+        assert!(dry.iter().all(|r| r.refuted_by == parent));
+
+        let applied = b.migrate_refutation_cascade(true).unwrap();
+        assert_eq!(applied.len(), 2);
+        let w = b.get_node(well_sourced).unwrap();
+        assert!(!w.invalid);
+        assert_eq!(w.verification_status, VerificationStatus::Proven,
+            "its own two PRIMARY types stand once the refuted parent leaves the cap set");
+        assert_eq!(w.metadata.get("support_withdrawn_by").map(String::as_str),
+            Some(parent.to_string().as_str()));
+        assert_eq!(b.get_node(weak).unwrap().verification_status, VerificationStatus::Unproven,
+            "unsupported, not false");
+
+        // Nodes refuted on their OWN evidence are untouched, both of them.
+        assert!(b.get_node(parent).unwrap().invalid, "the cause stays refuted");
+        assert!(b.get_node(direct).unwrap().invalid, "and so does a directly refuted node");
+
+        assert!(b.migrate_refutation_cascade(true).unwrap().is_empty(), "idempotent");
+
+        // Durable, not just in memory.
+        let reloaded = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        assert!(!reloaded.get_node(well_sourced).unwrap().invalid);
+    }
 
     /// §6.1 — the winner of a contradiction resolution must survive the cascade
     /// of its own resolution, even when it transitively depends on the loser.
