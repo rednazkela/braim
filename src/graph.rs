@@ -236,8 +236,19 @@ impl VerificationStatus {
         }
     }
 
-    /// Canonical rank for inheritance capping per
-    /// BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.1.
+    /// Canonical rank per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.1.
+    ///
+    /// This is a *total ordering* over statuses, used for comparisons like
+    /// "is this at least Proven". It is NOT a support ladder: `Invalid` means
+    /// refuted (evidence contradicts the statement) while `Unproven` means
+    /// unsupported (nothing establishes it yet). Those are different claims on
+    /// different axes, and only the second is a support level.
+    ///
+    /// Consequence: `Invalid` MUST NOT participate in dependency capping. A
+    /// refuted dependency is excluded from the cap set (§3.3.2), never floored
+    /// into it — otherwise `min` yields rank 0 and a dependent that merely lost
+    /// support is recorded as refuted. Cap sites use `from_cap_rank`, which
+    /// cannot return `Invalid`.
     pub fn rank(&self) -> u8 {
         match self {
             VerificationStatus::Invalid => 0,
@@ -260,6 +271,26 @@ impl VerificationStatus {
             4 => VerificationStatus::Proven,
             _ => VerificationStatus::ProvenStrong,
         }
+    }
+
+    /// `from_rank` for dependency-cap results, per §3.1 and §3.3.2.
+    ///
+    /// Refutation is direct-evidence-only and never inherited, so a cap can
+    /// never produce `Invalid`. Rank 0 clamps to `Unproven`: a statement whose
+    /// support was withdrawn is unsupported, not false. This is the single
+    /// enforcement point for that invariant — cap sites call this, never
+    /// `from_rank`.
+    pub fn from_cap_rank(rank: u8) -> VerificationStatus {
+        match Self::from_rank(rank) {
+            VerificationStatus::Invalid => VerificationStatus::Unproven,
+            s => s,
+        }
+    }
+
+    /// True when this status records refutation by direct evidence, as opposed
+    /// to any level of (missing) support.
+    pub fn is_refuted(&self) -> bool {
+        matches!(self, VerificationStatus::Invalid)
     }
 }
 
@@ -930,12 +961,17 @@ impl Braim {
                         if !dep.node_type.is_statement_family() {
                             continue;
                         }
+                        // §3.3.2 — refuted deps are excluded from the cap set,
+                        // never floored into it.
+                        if dep.invalid || dep.verification_status.is_refuted() {
+                            continue;
+                        }
                         let r = dep.verification_status.rank();
                         cap = Some(cap.map_or(r, |p: u8| p.min(r)));
                     }
                 }
                 match cap {
-                    Some(c) if source_derived.rank() > c => VerificationStatus::from_rank(c),
+                    Some(c) if source_derived.rank() > c => VerificationStatus::from_cap_rank(c),
                     _ => source_derived,
                 }
             };
@@ -1310,22 +1346,10 @@ impl Braim {
                         edge.resolution_winner = Some(statement_id);
                         edge.resolution_source = Some(source_id);
                     }
-                    let cascade_ids: Vec<u32> = self.find_cascade_nodes(other_id)
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect();
-                    for dep_id in cascade_ids {
-                        if let Some(dep) = self.state.nodes.get_mut(&dep_id) {
-                            if dep.invalid || dep.verification_status == VerificationStatus::Invalid {
-                                continue;
-                            }
-                            dep.invalid = true;
-                            dep.invalid_reason = Some(format!("depends_on_invalidated:{}", other_id));
-                            dep.invalidated_at = Some(now.clone());
-                            dep.verification_status = VerificationStatus::Invalid;
-                            dep.node_type = NodeType::InvalidStatement;
-                        }
-                    }
+                    // §3.3.3 — recompute the loser's dependents; never refute
+                    // them. Runs after the winner is promoted above, and cannot
+                    // undo that promotion (§3.3.5).
+                    self.recompute_after_refutation(other_id, &now);
                     self.flush()?;
                     return Ok(AddSourceResult {
                         auto_resolved: true,
@@ -1458,23 +1482,11 @@ impl Braim {
         edge.resolution_winner = Some(winner_id);
         edge.resolution_source = source_id;
 
-        // Cascade-invalidate loser dependents
-        let cascade_ids: Vec<u32> = self.find_cascade_nodes(loser_id)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        for dep_id in cascade_ids {
-            if let Some(dep_node) = self.state.nodes.get_mut(&dep_id) {
-                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
-                    continue;
-                }
-                dep_node.invalid = true;
-                dep_node.invalid_reason = Some(format!("depends_on_invalidated:{}", loser_id));
-                dep_node.invalidated_at = Some(now.clone());
-                dep_node.verification_status = VerificationStatus::Invalid;
-                dep_node.node_type = NodeType::InvalidStatement;
-            }
-        }
+        // §3.3.3 — recompute the loser's dependents rather than refuting them.
+        // The winner was promoted above and this pass cannot undo it (§3.3.5),
+        // which is the ID:1016 regression: the winner transitively depended on
+        // the loser and the old cascade invalidated its own resolution.
+        self.recompute_after_refutation(loser_id, &now);
 
         self.flush()?;
         Ok(())
@@ -2592,18 +2604,20 @@ impl Braim {
 
         // Dependency inheritance per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.2:
         // Only statement-typed deps participate; concept deps are skipped.
-        // Invalid deps propagate fully (mark the new node invalid).
-        // Otherwise cap source_derived to the weakest statement dep.
-        let mut invalid_from_dep: Option<u32> = None;
+        // Refuted deps are EXCLUDED from the cap set (§3.3.2) and recorded as
+        // withdrawn support — they no longer mark the new node invalid, because
+        // refutation is direct-evidence-only and never inherited (§3.3.1).
+        // Otherwise cap source_derived to the weakest surviving statement dep.
+        let mut refuted_deps: Vec<u32> = Vec::new();
         let mut dep_cap: Option<u8> = None;
         for dep_id in depends_on.keys() {
             if let Some(dep_node) = self.state.nodes.get(dep_id) {
                 if !dep_node.node_type.is_statement_family() {
                     continue;
                 }
-                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
-                    invalid_from_dep = Some(*dep_id);
-                    break;
+                if dep_node.invalid || dep_node.verification_status.is_refuted() {
+                    refuted_deps.push(*dep_id);
+                    continue;
                 }
                 let r = dep_node.verification_status.rank();
                 dep_cap = Some(match dep_cap {
@@ -2612,28 +2626,36 @@ impl Braim {
                 });
             }
         }
+        refuted_deps.sort_unstable();
 
-        let (verification_status, invalid_flag, invalid_reason, invalidated_at) =
-            if let Some(dep_id) = invalid_from_dep {
-                (
-                    VerificationStatus::Invalid,
-                    true,
-                    Some(format!("depends_on_invalidated:{}", dep_id)),
-                    Some(now.clone()),
-                )
-            } else {
-                let final_status = match dep_cap {
-                    None => source_derived,
-                    Some(cap) => {
-                        if source_derived.rank() <= cap {
-                            source_derived
-                        } else {
-                            VerificationStatus::from_rank(cap)
-                        }
-                    }
-                };
-                (final_status, false, None, None)
-            };
+        // A statement resting only on refuted deps has an empty cap set, so its
+        // status is source_derived alone — the same treatment as a statement
+        // with no statement deps. Unsupported, not false.
+        let verification_status = match dep_cap {
+            None => source_derived,
+            Some(cap) => {
+                if source_derived.rank() <= cap {
+                    source_derived
+                } else {
+                    VerificationStatus::from_cap_rank(cap)
+                }
+            }
+        };
+
+        // §3.3.4 — withdrawn support is recorded on the node so the affected
+        // set is a reviewable worklist, not a silent verdict.
+        let mut initial_metadata: HashMap<String, String> = HashMap::new();
+        if !refuted_deps.is_empty() {
+            initial_metadata.insert(
+                "support_withdrawn_by".to_string(),
+                refuted_deps
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            initial_metadata.insert("support_withdrawn_at".to_string(), now.clone());
+        }
 
         let node = Node {
             id,
@@ -2647,15 +2669,15 @@ impl Braim {
             created_at: now,
             verified_by: HashMap::new(),
             verification_status,
-            invalid: invalid_flag,
-            invalid_reason,
-            invalidated_at,
+            invalid: false,
+            invalid_reason: None,
+            invalidated_at: None,
             source_type: None,
             location: None,
             ingested_by: None,
             source_ids: vec![],
             pre_contested_status: None,
-            metadata: HashMap::new(),
+            metadata: initial_metadata,
         };
 
         self.state.nodes.insert(id, node);
@@ -3590,9 +3612,10 @@ impl Braim {
         cascade
     }
 
-    /// Invalidate a statement and cascade-invalidate all transitively dependent
-    /// statements per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3.
-    /// Returns the list of cascade-invalidated IDs (excluding the target).
+    /// Invalidate a statement, then RECOMPUTE its transitively dependent
+    /// statements per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3.3 — they are never
+    /// refuted by inheritance (§3.3.1), only demoted where support was lost.
+    /// Returns the IDs whose status actually moved (excluding the target).
     pub fn invalidate_statement(&mut self, statement_id: u32, reason: &str) -> Result<Vec<u32>, String> {
         {
             let node = self.state.nodes.get(&statement_id)
@@ -3608,10 +3631,6 @@ impl Braim {
         }
 
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let cascade_ids: Vec<u32> = self.find_cascade_nodes(statement_id)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
 
         {
             let node = self.state.nodes.get_mut(&statement_id).unwrap();
@@ -3623,18 +3642,9 @@ impl Braim {
             node.node_type = NodeType::InvalidStatement;
         }
 
-        for dep_id in &cascade_ids {
-            if let Some(dep_node) = self.state.nodes.get_mut(dep_id) {
-                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
-                    continue;
-                }
-                dep_node.invalid = true;
-                dep_node.invalid_reason = Some(format!("depends_on_invalidated:{}", statement_id));
-                dep_node.invalidated_at = Some(now.clone());
-                dep_node.verification_status = VerificationStatus::Invalid;
-                dep_node.node_type = NodeType::InvalidStatement;
-            }
-        }
+        // §3.3.3 — recompute, do not refute. Must run AFTER the target is marked
+        // so the recompute excludes it from every dependent's cap set (§3.3.2).
+        let cascade_ids = self.recompute_after_refutation(statement_id, &now);
 
         // because_of consequents above the invalidated cause are flagged for
         // re-investigation but not auto-invalidated (tests.md §13).
@@ -3708,7 +3718,7 @@ impl Braim {
                 }
             }
             let status = match cap {
-                Some(c) if source_derived.rank() > c => VerificationStatus::from_rank(c),
+                Some(c) if source_derived.rank() > c => VerificationStatus::from_cap_rank(c),
                 _ => source_derived,
             };
             (status, invalid_deps)
@@ -4290,6 +4300,100 @@ impl Braim {
         changed
     }
 
+    /// §3.3.3/§3.3.4 — a statement has just become refuted. Recompute its
+    /// transitive dependents instead of assigning `Invalid` to them, and record
+    /// the withdrawn support so the affected set is a reviewable worklist.
+    ///
+    /// Refutation is direct-evidence-only (§3.3.1), so nothing here ever writes
+    /// `Invalid`. A dependent that loses all support settles at `Unproven`:
+    /// unsupported, not false. This is also why the winner of a contradiction
+    /// resolution needs no special-casing — it cannot be refuted by the cascade
+    /// of its own resolution even when it transitively depends on the loser.
+    ///
+    /// Scope is deliberately narrow: only the refuted node's DIRECT dependents
+    /// are recomputed, because they are the only statements whose cap SET
+    /// changed — the refuted node left it. Deeper dependents' cap sets are
+    /// untouched; what moved is their parents' statuses, and braim does not
+    /// propagate status changes (verification is computed at creation and never
+    /// propagates). Recomputing the whole closure would retroactively introduce
+    /// that propagation and collapse entire subtrees to the floor: measured on
+    /// the real graph, a fixpoint over the closure demoted 88 nodes to Unproven,
+    /// nine of them from proven_strong. So the deeper closure is flagged for
+    /// review and left alone.
+    ///
+    /// Returns the ids whose status actually moved.
+    fn recompute_after_refutation(&mut self, refuted_id: u32, now: &str) -> Vec<u32> {
+        let closure: Vec<u32> = self
+            .find_cascade_nodes(refuted_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let (direct, indirect): (Vec<u32>, Vec<u32>) = closure.into_iter().partition(|dep_id| {
+            self.state
+                .nodes
+                .get(dep_id)
+                .is_some_and(|n| n.depends_on.contains_key(&refuted_id))
+        });
+
+        // §3.3.4 — direct dependents lost support directly: record it and
+        // recompute their cap without the refuted node in the set.
+        let mut moved: Vec<u32> = Vec::new();
+        for dep_id in &direct {
+            if let Some(node) = self.state.nodes.get_mut(dep_id) {
+                Self::append_csv_meta(node, "support_withdrawn_by", refuted_id);
+                node.metadata
+                    .insert("support_withdrawn_at".to_string(), now.to_string());
+            }
+            let before = self.state.nodes.get(dep_id).map(|n| n.verification_status);
+            self.recompute_statement_status(*dep_id);
+            let after = self.state.nodes.get(dep_id).map(|n| n.verification_status);
+            if before != after {
+                moved.push(*dep_id);
+            }
+        }
+
+        // Deeper dependents are recorded as a COUNT on the refuted node, not as
+        // a per-node marker. Tagging each one produced 596 flagged nodes on the
+        // real graph — 45% of it — which is noise rather than a worklist, and
+        // the set is recoverable at any time from find_cascade_nodes. What a
+        // reviewer needs is the scale and the entry points (§3.3.4).
+        if let Some(node) = self.state.nodes.get_mut(&refuted_id) {
+            node.metadata.insert(
+                "refutation_indirect_dependents".to_string(),
+                indirect.len().to_string(),
+            );
+            if !direct.is_empty() {
+                node.metadata.insert(
+                    "refutation_direct_dependents".to_string(),
+                    direct
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+        }
+
+        moved.sort_unstable();
+        moved
+    }
+
+    /// Append `value` to a comma-separated metadata list, without duplicates.
+    fn append_csv_meta(node: &mut Node, key: &str, value: u32) {
+        let value = value.to_string();
+        let entry = node.metadata.entry(key.to_string()).or_default();
+        if entry.split(',').any(|s| s == value) {
+            return;
+        }
+        if entry.is_empty() {
+            *entry = value;
+        } else {
+            entry.push(',');
+            entry.push_str(&value);
+        }
+    }
+
     /// Recompute a statement's verification from its (possibly just-unioned)
     /// sources plus dependency inheritance. Contested and invalid statements are
     /// left alone: those resolve only through their own lifecycles
@@ -4311,12 +4415,16 @@ impl Braim {
                 if !dep.node_type.is_statement_family() {
                     continue;
                 }
+                // §3.3.2 — refuted deps are excluded from the cap set.
+                if dep.invalid || dep.verification_status.is_refuted() {
+                    continue;
+                }
                 let r = dep.verification_status.rank();
                 cap = Some(cap.map_or(r, |p: u8| p.min(r)));
             }
         }
         let new_status = match cap {
-            Some(c) if source_derived.rank() > c => VerificationStatus::from_rank(c),
+            Some(c) if source_derived.rank() > c => VerificationStatus::from_cap_rank(c),
             _ => source_derived,
         };
         let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
@@ -5165,13 +5273,126 @@ mod defect_tests {
         let s2 = b.add_statement("dependent claim", vec!["t".into()],
             vec!["code:b.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
         b.invalidate_statement(s1, "retired").unwrap();
-        // cascade reached s2
-        assert_eq!(b.get_node(s2).unwrap().verification_status, VerificationStatus::Invalid);
+        // §3.3.3 — the cascade RECOMPUTES s2 rather than refuting it. s1 leaves
+        // the cap set, so s2 settles at its own source-derived status. This
+        // assertion previously read `Invalid`, which was the defect.
+        assert_eq!(b.get_node(s2).unwrap().verification_status, VerificationStatus::Partial);
+        assert!(!b.get_node(s2).unwrap().invalid);
+        assert_eq!(
+            b.get_node(s2).unwrap().metadata.get("support_withdrawn_by").map(String::as_str),
+            Some(s1.to_string().as_str()),
+            "§3.3.4 — withdrawn support is recorded so the node is reviewable"
+        );
+        // Under §3.3 the cascade no longer poisons s2, so there is nothing to
+        // revalidate — the call is refused. Refute s2 directly to exercise the
+        // revalidate path that this test exists for.
+        assert!(b.revalidate_statement(s2).is_err(),
+            "a node the cascade left healthy has nothing to revalidate");
+        b.invalidate_statement(s2, "refuted on its own evidence").unwrap();
         // revalidate s2 while s1 stays invalid: invalid dep is skipped, not re-poisoning.
         let (status, invalid_deps) = b.revalidate_statement(s2).unwrap();
         assert_eq!(status, VerificationStatus::Partial, "s2 revives to its own source-derived status");
         assert_eq!(invalid_deps, vec![s1], "the still-invalid dep is reported for re-anchoring");
         assert!(!b.get_node(s2).unwrap().invalid);
+    }
+
+    // ---- BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3 regressions ----------------
+
+    /// §6.1 — the winner of a contradiction resolution must survive the cascade
+    /// of its own resolution, even when it transitively depends on the loser.
+    /// Regression for the ID:1016 case: `1016 -> 438 -> 432`.
+    #[test]
+    fn resolution_winner_survives_its_own_cascade() {
+        let mut b = temp_braim("winner_survives_cascade");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        // loser sits low in the graph
+        let loser = b.add_statement("the base claim that loses", vec!["t".into()],
+            vec!["code:l.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        // mid depends on loser; winner depends on mid -> winner reaches loser
+        let mid = b.add_statement("intermediate claim", vec!["t".into()],
+            vec!["code:m.rs:1".into()], HashMap::from([(loser, 1.0)]), true).unwrap();
+        let winner = b.add_statement("the claim that wins", vec!["t".into()],
+            vec!["code:w.rs:1".into(), "doc:w.md:1".into()], HashMap::from([(mid, 1.0)]), true).unwrap();
+
+        b.contradict_statements(winner, loser, "test conflict", None).unwrap();
+        b.resolve_contradiction(winner, loser, "third source decides", None).unwrap();
+
+        let w = b.get_node(winner).unwrap();
+        assert!(!w.invalid, "the winner must not be refuted by its own resolution");
+        assert_ne!(w.verification_status, VerificationStatus::Invalid);
+        assert_eq!(b.get_node(loser).unwrap().verification_status, VerificationStatus::Invalid);
+    }
+
+    /// §6.2 — a dependent carrying two distinct PRIMARY source types keeps its
+    /// source-derived status when a parent is refuted. Regression for the 85
+    /// independently-sourced nodes the old cascade destroyed.
+    #[test]
+    fn refutation_does_not_override_a_dependents_own_sources() {
+        let mut b = temp_braim("own_sources_survive");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let parent = b.add_statement("parent to be refuted", vec!["t".into()],
+            vec!["code:p.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let child = b.add_statement("child with two primary types", vec!["t".into()],
+            vec!["code:c.rs:1".into(), "doc:c.md:1".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+
+        b.invalidate_statement(parent, "retired").unwrap();
+
+        let n = b.get_node(child).unwrap();
+        assert!(!n.invalid, "a refuted parent withdraws support; it does not refute the child");
+        assert_eq!(n.verification_status, VerificationStatus::Proven,
+            "two distinct PRIMARY types with an empty cap set → source-derived stands");
+    }
+
+    /// §6.4 and §6.5 — a dependent whose only support was refuted settles at
+    /// Unproven, and remains open to future evidence.
+    #[test]
+    fn sole_support_refuted_yields_unproven_and_stays_promotable() {
+        let mut b = temp_braim("sole_support_unproven");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let parent = b.add_statement("parent to be refuted", vec!["t".into()],
+            vec!["code:p.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let child = b.add_statement("weakly sourced child", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+
+        b.invalidate_statement(parent, "retired").unwrap();
+
+        let n = b.get_node(child).unwrap();
+        assert!(!n.invalid);
+        assert_eq!(n.verification_status, VerificationStatus::Unproven,
+            "unsupported, not false");
+
+        // §6.5 — withdrawn support must not poison the node against evidence.
+        let src = b.add_source("a measurement", "test", Some("test:cmd = result".to_string()), None).unwrap();
+        b.add_source_to_statement(child, src).unwrap();
+        assert!(!b.get_node(child).unwrap().invalid);
+        assert_ne!(b.get_node(child).unwrap().verification_status, VerificationStatus::Unproven,
+            "attaching a measured source promotes normally");
+    }
+
+    /// §6.7 — refuting two ancestors of one dependent, in either order, must
+    /// leave the dependent at the same status. Invariant 4.
+    #[test]
+    fn refutation_order_does_not_change_the_outcome() {
+        fn run(order: [usize; 2]) -> VerificationStatus {
+            let mut b = temp_braim(&format!("order_{}{}", order[0], order[1]));
+            let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+            let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+            let p1 = b.add_statement("first ancestor", vec!["t".into()],
+                vec!["code:p1.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+            let p2 = b.add_statement("second ancestor", vec!["t".into()],
+                vec!["code:p2.rs:1".into()], HashMap::from([(a, 0.7), (c, 0.3)]), true).unwrap();
+            let child = b.add_statement("dependent of both", vec!["t".into()],
+                vec!["code:ch.rs:1".into(), "doc:ch.md:1".into()],
+                HashMap::from([(p1, 0.6), (p2, 0.4)]), true).unwrap();
+            let ids = [p1, p2];
+            b.invalidate_statement(ids[order[0]], "retired").unwrap();
+            b.invalidate_statement(ids[order[1]], "retired").unwrap();
+            b.get_node(child).unwrap().verification_status
+        }
+        assert_eq!(run([0, 1]), run([1, 0]), "final status must not depend on refutation order");
     }
 
     #[test]
