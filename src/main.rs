@@ -508,10 +508,28 @@ enum StatementCommands {
         #[arg(long, help = "Replace all dependencies: \"ID:weight[,ID:weight]\" (exclusive with --add/--remove)")]
         set: Option<String>,
     },
-    #[command(about = "Attach a source entity to an existing statement", long_about = "Statement AddSource: Link a first-class source entity to a statement after creation.\n\nUsage:\n  braim statement add-source 42 --source-id 5001\n\nEffect on non-contested statements:\n  • Appends source entity to the statement's source_ids list\n  • Recomputes verification_status from all string sources + source entities\n  • A new PRIMARY-typed source can raise the verification level\n\nEffect on contested statements (Mechanism A auto-resolution):\n  • If the source is PRIMARY-typed AND the other contested statement does NOT\n    have this source, auto-resolution fires:\n      Winner (this statement) → status recomputed (likely partial/proven/proven_strong)\n      Loser  (other statement) → invalid; cascades to its dependents\n      Contradicts edge → marked resolved\n  • If the new source is on both sides (corroborates both), no auto-resolution;\n    use 'statement resolve-contradiction' instead.\n\nWorkflow:\n  braim source add \"Audit log entry\" --type transcript --location \"transcript:audit.txt:88\"\n  # → ID:5001\n  braim statement add-source 42 --source-id 5001\n  # If 42 is contested and the other side lacks source 5001 → auto-resolved")]
+    #[command(about = "Attach a source entity to an existing statement", long_about = "Statement AddSource: Link a first-class source entity to a statement after creation.\n\nUsage:\n  braim statement add-source 42 --source-id 5001\n\nEffect on non-contested statements:\n  • Appends source entity to the statement's source_ids list\n  • Recomputes verification_status from all string sources + source entities\n  • A new PRIMARY-typed source can raise the verification level\n\nEffect on contested statements (Mechanism A, report-only):\n  • If the source is PRIMARY-typed AND the other contested statement does NOT\n    have this source, that is corroboration — braim reports it, but does NOT\n    mutate either statement. Both stay contested. Accumulating unrelated\n    evidence for one side is not evidence the contradiction itself was\n    adjudicated (braim-contradiction-scoped-resolution.md).\n  • Settling it always requires an explicit call:\n      braim statement resolve-contradiction <a> <b> --winner <id> --reason \"...\"\n      braim statement resolve-contradiction <a> <b> --both-stand --reason \"...\"\n  • If the new source is on both sides (corroborates both), nothing is reported;\n    use 'statement resolve-contradiction' when ready.\n\nWorkflow:\n  braim source add \"Audit log entry\" --type transcript --location \"transcript:audit.txt:88\"\n  # → ID:5001\n  braim statement add-source 42 --source-id 5001\n  # If 42 is contested and the other side lacks source 5001 → corroboration reported")]
     AddSource {
         id: u32,
         #[arg(long, help = "Source entity ID to attach (from 'braim source add')")]
+        source_id: u32,
+    },
+    #[command(name = "update-sources", about = "Add, remove, or replace a statement's string sources", long_about = "Statement UpdateSources: Correct a statement's typed source strings in place.\n\nUsage:\n  braim statement update-sources 42 --add \"doc:spec.md:12-18\"\n  braim statement update-sources 42 --remove \"doc:spec.md:5\" --add \"doc:spec.md:12-18\"\n  braim statement update-sources 42 --set \"doc:spec.md:12-18,code:impl.rs:40-55\"\n\nPreserves the statement ID and every depends_on/because_of/contradicts edge\nreferencing it — the alternative (delete + re-add) breaks all three, and\ninvalidate is wrong for a node whose only defect is a wrong citation, not its\nbody (invalidate cascades to dependents).\n\nRules:\n  • --set is exclusive: --add and --remove are ignored when --set is provided\n  • Every new string (via --add or --set) must carry a typed prefix\n    (code:|doc:|schema:|config:|transcript:|test:|phase_N:|agent:|narrative:|\n    logic:|inference:) — rejected otherwise, same as 'statement add'\n  • --remove errors if the exact string is not currently a source\n  • Duplicate-source and PRIMARY+TERTIARY-mix issues in the RESULTING list\n    warn by default; --strict-sources makes them errors, same as 'statement add'\n  • Refused if the result would leave zero string sources AND zero attached\n    source entities (see 'statement add-source' for entities)\n  • Verification recomputes from the new sources + attached entities — can\n    demote when the last source of a PRIMARY type is removed\n  • Invalid and Contested statements keep the edit but skip the recompute\n    (matches 'statement delete-source': those states come from\n    invalidation/contradiction, not source diversity)")]
+    UpdateSources {
+        id: u32,
+        #[arg(long, help = "Add source strings: \"type:loc[,type:loc]\"")]
+        add: Option<String>,
+        #[arg(long, help = "Remove source strings by exact match: \"type:loc[,type:loc]\"")]
+        remove: Option<String>,
+        #[arg(long, help = "Replace all string sources: \"type:loc[,type:loc]\" (exclusive with --add/--remove)")]
+        set: Option<String>,
+        #[arg(long, help = "Treat duplicate-source / PRIMARY+TERTIARY-mix issues as errors")]
+        strict_sources: bool,
+    },
+    #[command(name = "delete-source", about = "Detach a source entity from a statement", long_about = "Statement DeleteSource: Remove a previously attached source entity from a statement (the inverse of add-source).\n\nUsage:\n  braim statement delete-source 42 --source-id 5001\n\nEffect:\n  • Removes the source entity from the statement's source_ids list\n  • Recomputes verification_status from the remaining string sources + source\n    entities — removing the last source of a PRIMARY type can demote the\n    statement (e.g. proven -> partial, partial -> unproven)\n  • Invalid and contested statements are left untouched: those states come\n    from invalidation/contradiction, not source diversity, so detaching a\n    source here does not revive or alter them\n\nErrors if the source ID is not currently attached to the statement.")]
+    DeleteSource {
+        id: u32,
+        #[arg(long, help = "Source entity ID to detach")]
         source_id: u32,
     },
     #[command(about = "Mark two statements as contradicting each other", long_about = "Statement Contradict: Record that two statements make incompatible claims about the same subject.\n\nUsage:\n  braim statement contradict 42 99 \\\n    --reason \"Statement 42 says 24h, statement 99 says 48h per spec_v2\"\n\n  braim statement contradict 42 99 \\\n    --reason \"Contradicted by spec_v2\" --source 5001\n\nEffect:\n  • Both statements move to 'contested' verification_status\n  • Both are hidden from default queries (use --include-contested to surface them)\n  • Neither can be auto-promoted while contested — new sources do not raise them\n  • Dependents of contested statements inherit the contested state\n\nResolution:\n  Explicit:  braim statement resolve-contradiction <winner> <loser> --winner <id> --reason \"...\"\n  → Winner: status restored to pre-contested level (or recomputed from sources)\n  → Loser:  becomes invalid, cascades to its dependents\n\nQuery contested statements:\n  braim query \"term\" --include-contested\n\nSee CONTRADICTION RESOLUTION section in 'braim --help' for full workflow.")]
@@ -523,15 +541,17 @@ enum StatementCommands {
         #[arg(long, help = "Source ID that revealed the conflict (optional)")]
         source: Option<u32>,
     },
-    #[command(about = "Resolve a contradiction between two statements", long_about = "Statement ResolveContradiction: Declare a winner and loser for an active contradiction.\n\nUsage:\n  braim statement resolve-contradiction 42 99 \\\n    --winner 42 --reason \"spec_v1 is authoritative; spec_v2 was a draft\"\n\n  braim statement resolve-contradiction 42 99 \\\n    --winner 99 --reason \"Confirmed by code review\" --source 5002\n\nArguments:\n  stmt_a, stmt_b:  The two statement IDs involved in the contradiction\n  --winner:        ID of the statement that is correct\n  --reason:        Explanation for why this side wins\n  --source:        Optional source entity ID that corroborates the winner\n\nEffect:\n  Winner:\n    • verification_status restored to pre-contested level (or recomputed from sources)\n    • node_type updated accordingly (claim / fact)\n  Loser:\n    • verification_status → invalid\n    • node_type → invalid_statement\n    • Cascade-invalidates all transitive dependents of the loser\n  Contradicts edge:\n    • Marked resolved=true with resolution_winner and resolution_source recorded\n\nPre-conditions:\n  • An unresolved 'contradicts' edge must exist between stmt_a and stmt_b\n  • Neither statement can already be invalid\n  • --winner must be one of the two statement IDs provided")]
+    #[command(about = "Resolve a contradiction between two statements", long_about = "Statement ResolveContradiction: Declare a winner and loser for an active contradiction, or mark both as standing without conflict.\n\nUsage:\n  braim statement resolve-contradiction 42 99 \\\n    --winner 42 --reason \"spec_v1 is authoritative; spec_v2 was a draft\"\n\n  braim statement resolve-contradiction 42 99 \\\n    --winner 99 --reason \"Confirmed by code review\" --source 5002\n\n  braim statement resolve-contradiction 42 99 \\\n    --both-stand --reason \"both describe the same function under different conditions\"\n\nArguments:\n  stmt_a, stmt_b:  The two statement IDs involved in the contradiction\n  --winner:        ID of the statement that is correct (mutually exclusive with --both-stand)\n  --both-stand:    Neither statement wins; both are true and just don't overlap\n  --reason:        Explanation for the resolution\n  --source:        Optional source entity ID that corroborates the winner (--winner only)\n\nEffect (--winner):\n  Winner:\n    • verification_status restored to pre-contested level (or recomputed from sources)\n    • node_type updated accordingly (claim / fact)\n  Loser:\n    • verification_status → invalid\n    • node_type → invalid_statement\n    • Cascade-invalidates all transitive dependents of the loser\n  Contradicts edge:\n    • Marked resolved=true, resolution_kind=winner, with resolution_winner/resolution_source/resolution_reason recorded\n\nEffect (--both-stand):\n  • Neither statement's verification_status, node_type, or dependents are touched\n  • Contradicts edge: marked resolved=true, resolution_kind=scoped, resolution_reason recorded\n\nPre-conditions:\n  • An unresolved 'contradicts' edge must exist between stmt_a and stmt_b\n  • Neither statement can already be invalid\n  • Exactly one of --winner or --both-stand must be given\n  • --winner must be one of the two statement IDs provided")]
     ResolveContradiction {
         stmt_a: u32,
         stmt_b: u32,
-        #[arg(long, help = "ID of the winning statement")]
-        winner: u32,
+        #[arg(long, help = "ID of the winning statement", conflicts_with = "both_stand")]
+        winner: Option<u32>,
+        #[arg(long, help = "Mark both statements as standing without conflict (scoped resolution, no winner/loser)")]
+        both_stand: bool,
         #[arg(long, help = "Reason for the resolution")]
         reason: String,
-        #[arg(long, help = "Source ID that corroborates the winner (optional)")]
+        #[arg(long, help = "Source ID that corroborates the winner (optional, --winner only)")]
         source: Option<u32>,
     },
 }
@@ -1539,6 +1559,31 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                         }
                     }
 
+                    let contradicts: Vec<_> = braim.state.contradicts.iter()
+                        .filter(|e| e.from == id || e.to == id)
+                        .collect();
+                    if !contradicts.is_empty() {
+                        println!("  Contradicts:");
+                        for edge in contradicts {
+                            let other_id = if edge.from == id { edge.to } else { edge.from };
+                            if edge.resolved {
+                                println!("    ID:{}  resolved  resolution_kind: {}", other_id,
+                                    edge.resolution_kind.as_deref().unwrap_or("winner"));
+                                if let Some(w) = edge.resolution_winner {
+                                    println!("      winner: ID:{}", w);
+                                }
+                                if let Some(s) = edge.resolution_source {
+                                    println!("      source: ID:{}", s);
+                                }
+                                if let Some(r) = &edge.resolution_reason {
+                                    println!("      reason: {}", r);
+                                }
+                            } else {
+                                println!("    ID:{}  unresolved  reason: {}", other_id, edge.reason);
+                            }
+                        }
+                    }
+
                     if related {
                         let (_, depended_by_nodes) = braim.get_related_nodes(id);
 
@@ -1940,17 +1985,67 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
         }
         Commands::Statement(StatementCommands::AddSource { id, source_id }) => {
             match braim.add_source_to_statement(id, source_id) {
-                Ok(AddSourceResult { auto_resolved: true, winner_id, loser_id, winner_status, .. }) => {
+                Ok(AddSourceResult { corroborated_with: Some(other_id) }) => {
                     println!("✓ Source ID:{} attached to statement ID:{}", source_id, id);
-                    println!("  ⚡ Auto-resolved contradiction (Mechanism A):");
-                    println!("    Winner ID:{} → {}", winner_id.unwrap(), winner_status.map(|s| s.label()).unwrap_or("?"));
-                    println!("    Loser  ID:{} → invalid", loser_id.unwrap());
+                    println!("  ⚡ Corroboration reached (Mechanism A, report-only):");
+                    println!("    ID:{} now has a PRIMARY source ID:{} not shared by ID:{}", id, source_id, other_id);
+                    println!("    Contradiction remains unresolved — run 'braim statement resolve-contradiction {} {} --winner <id>|--both-stand --reason ...' to settle it", id, other_id);
                     Ok(())
                 }
-                Ok(AddSourceResult { auto_resolved: false, .. }) => {
+                Ok(AddSourceResult { corroborated_with: None }) => {
                     let node = &braim.state.nodes[&id];
                     println!("✓ Source ID:{} attached to statement ID:{}", source_id, id);
                     println!("  Verification: {} {}", node.verification_status.badge(), node.verification_status.label());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::UpdateSources { id, add, remove, set, strict_sources }) => {
+            if add.is_none() && remove.is_none() && set.is_none() {
+                return Err("Error: provide at least one of --add, --remove, or --set".to_string());
+            }
+            let add_list = add.as_ref().map(|s| parse_list(s));
+            let remove_list = remove.as_ref().map(|s| parse_list(s));
+            let set_list = set.as_ref().map(|s| parse_list(s));
+
+            // Preview the resulting list to apply the same soft checks
+            // `statement add` applies, before the real write.
+            let preview = braim.preview_statement_sources(
+                id, add_list.as_deref(), remove_list.as_deref(), set_list.as_deref(),
+            )?;
+            let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&preview);
+            if has_dup_sources {
+                if strict_sources {
+                    return Err("Error: duplicate source entries detected".to_string());
+                } else {
+                    tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
+                }
+            }
+            if Braim::validate_primary_tertiary_mix(&preview) {
+                if strict_sources {
+                    return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
+                } else {
+                    tips::emit_tip_primary_tertiary_mix(cli.quiet);
+                }
+            }
+
+            match braim.update_statement_sources(id, add_list, remove_list, set_list) {
+                Ok(new_sources) => {
+                    let node = &braim.state.nodes[&id];
+                    println!("✓ Statement ID:{} sources updated", id);
+                    println!("  sources: {:?}", new_sources);
+                    println!("  Verification: {} {}", node.verification_status.badge(), node.verification_status.label());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::DeleteSource { id, source_id }) => {
+            match braim.delete_source_from_statement(id, source_id) {
+                Ok(status) => {
+                    println!("✓ Source ID:{} detached from statement ID:{}", source_id, id);
+                    println!("  Verification: {} {}", status.badge(), status.label());
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -1966,7 +2061,19 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Statement(StatementCommands::ResolveContradiction { stmt_a, stmt_b, winner, reason, source }) => {
+        Commands::Statement(StatementCommands::ResolveContradiction { stmt_a, stmt_b, winner, both_stand, reason, source }) => {
+            if both_stand {
+                return match braim.resolve_contradiction_both_stand(stmt_a, stmt_b, &reason) {
+                    Ok(()) => {
+                        println!("✓ Contradiction resolved (scoped — both stand)");
+                        println!("  ID:{} and ID:{}: both true, no winner/loser", stmt_a, stmt_b);
+                        println!("  Reason: {}", reason);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            let winner = winner.ok_or_else(|| "Error: provide --winner <id> or --both-stand".to_string())?;
             let loser = if winner == stmt_a { stmt_b } else { stmt_a };
             match braim.resolve_contradiction(winner, loser, &reason, source) {
                 Ok(()) => {
@@ -2922,4 +3029,36 @@ fn semantic_pair_scores(
 fn semantic_pair_scores(_: &Braim, _: &str, _: f32, _: bool) -> Vec<(u32, u32, f32)> {
     eprintln!("(the semantic strategy needs the embeddings feature; this binary was built with --no-default-features)");
     Vec::new()
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_contradiction_rejects_winner_and_both_stand_together() {
+        let result = Cli::try_parse_from([
+            "braim", "statement", "resolve-contradiction", "1", "2",
+            "--winner", "1", "--both-stand", "--reason", "x",
+        ]);
+        assert!(result.is_err(), "clap must reject --winner and --both-stand together");
+    }
+
+    #[test]
+    fn resolve_contradiction_accepts_both_stand_alone() {
+        let result = Cli::try_parse_from([
+            "braim", "statement", "resolve-contradiction", "1", "2",
+            "--both-stand", "--reason", "x",
+        ]);
+        assert!(result.is_ok(), "--both-stand alone must parse");
+    }
+
+    #[test]
+    fn resolve_contradiction_accepts_winner_alone() {
+        let result = Cli::try_parse_from([
+            "braim", "statement", "resolve-contradiction", "1", "2",
+            "--winner", "1", "--reason", "x",
+        ]);
+        assert!(result.is_ok(), "--winner alone must parse");
+    }
 }

@@ -422,6 +422,14 @@ pub struct ContradictEdge {
     pub resolved: bool,
     pub resolution_source: Option<u32>,
     pub resolution_winner: Option<u32>,
+    /// Distinguishes a winner/loser resolution ("winner") from a scoped one
+    /// ("scoped") where both statements stand untouched (braim-contradiction-
+    /// scoped-resolution.md). `#[serde(default)]` keeps pre-existing
+    /// current.json files loadable.
+    #[serde(default)]
+    pub resolution_kind: Option<String>,
+    #[serde(default)]
+    pub resolution_reason: Option<String>,
 }
 
 /// Directional causal edge: `from occurs because_of to` (consequent → cause).
@@ -573,10 +581,13 @@ pub struct DuplicateRecord {
 
 #[derive(Clone, Debug)]
 pub struct AddSourceResult {
-    pub auto_resolved: bool,
-    pub winner_id: Option<u32>,
-    pub loser_id: Option<u32>,
-    pub winner_status: Option<VerificationStatus>,
+    /// Set when this add-source call reached a third PRIMARY type on a
+    /// statement with a live, unresolved `contradicts` edge — Mechanism A's
+    /// corroboration signal. Carries the other (uncorroborated) statement's
+    /// id. Report-only: neither statement is mutated (braim-contradiction-
+    /// scoped-resolution.md) — settling the contradiction needs an explicit
+    /// `resolve-contradiction --winner|--both-stand` call.
+    pub corroborated_with: Option<u32>,
 }
 
 /// What a merge_nodes call did, so the caller can report it honestly.
@@ -1302,7 +1313,18 @@ impl Braim {
         let is_contested = self.state.nodes[&statement_id].verification_status
             == VerificationStatus::Contested;
 
-        // Check for Mechanism A auto-resolution
+        // Mechanism A: report-only corroboration signal. A statement reaching
+        // a third PRIMARY type while a `contradicts` edge against it is still
+        // live and unresolved is corroboration, not adjudication — it used to
+        // auto-invalidate the other side here, but accumulating unrelated
+        // evidence for one side is not evidence the contradiction itself was
+        // examined (braim-contradiction-scoped-resolution.md, the 179/235
+        // case). Settling it now always requires an explicit
+        // `resolve-contradiction --winner|--both-stand` call; this branch only
+        // detects and reports the corroboration, and neither statement is
+        // mutated (both stay contested — matches the locked-state handling
+        // in `delete_source_from_statement`/`update_statement_sources`).
+        let mut corroborated_with: Option<u32> = None;
         if is_contested && source_is_primary {
             let edge_idx = self.state.contradicts.iter().position(|e| {
                 !e.resolved && (e.from == statement_id || e.to == statement_id)
@@ -1317,46 +1339,7 @@ impl Braim {
                     .unwrap_or(false);
 
                 if !other_has_source {
-                    let winner_status = {
-                        let stmt = self.state.nodes.get(&statement_id).unwrap();
-                        let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
-                        Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
-                    };
-                    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    {
-                        let winner = self.state.nodes.get_mut(&statement_id).unwrap();
-                        winner.verification_status = winner_status;
-                        winner.node_type = NodeType::from_verification_status(winner_status);
-                        winner.pre_contested_status = None;
-                    }
-                    {
-                        let loser = self.state.nodes.get_mut(&other_id).unwrap();
-                        loser.verification_status = VerificationStatus::Invalid;
-                        loser.node_type = NodeType::InvalidStatement;
-                        loser.invalid = true;
-                        loser.invalid_reason = Some(format!(
-                            "contested_resolved_against_by_source_{}", source_id
-                        ));
-                        loser.invalidated_at = Some(now.clone());
-                        loser.pre_contested_status = None;
-                    }
-                    {
-                        let edge = &mut self.state.contradicts[idx];
-                        edge.resolved = true;
-                        edge.resolution_winner = Some(statement_id);
-                        edge.resolution_source = Some(source_id);
-                    }
-                    // §3.3.3 — recompute the loser's dependents; never refute
-                    // them. Runs after the winner is promoted above, and cannot
-                    // undo that promotion (§3.3.5).
-                    self.recompute_after_refutation(other_id, &now);
-                    self.flush()?;
-                    return Ok(AddSourceResult {
-                        auto_resolved: true,
-                        winner_id: Some(statement_id),
-                        loser_id: Some(other_id),
-                        winner_status: Some(winner_status),
-                    });
+                    corroborated_with = Some(other_id);
                 }
             }
         }
@@ -1374,12 +1357,153 @@ impl Braim {
         }
 
         self.flush()?;
-        Ok(AddSourceResult {
-            auto_resolved: false,
-            winner_id: None,
-            loser_id: None,
-            winner_status: None,
-        })
+        Ok(AddSourceResult { corroborated_with })
+    }
+
+    /// Detach a source entity from a statement (the inverse of `add_source_to_statement`).
+    ///
+    /// Invalid and contested statements keep their status untouched — those
+    /// states are governed by invalidation/contradiction, not raw source
+    /// diversity, so removing a source must not silently revive or alter them.
+    pub fn delete_source_from_statement(
+        &mut self,
+        statement_id: u32,
+        source_id: u32,
+    ) -> Result<VerificationStatus, String> {
+        {
+            let stmt = self.state.nodes.get(&statement_id)
+                .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+            if !stmt.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", statement_id));
+            }
+            if !stmt.source_ids.contains(&source_id) {
+                return Err(format!("Error: Source ID {} is not attached to statement ID {}", source_id, statement_id));
+            }
+        }
+
+        {
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.source_ids.retain(|&id| id != source_id);
+        }
+
+        let locked = matches!(
+            self.state.nodes[&statement_id].verification_status,
+            VerificationStatus::Invalid | VerificationStatus::Contested
+        );
+
+        let new_status = if locked {
+            self.state.nodes[&statement_id].verification_status
+        } else {
+            let status = {
+                let stmt = &self.state.nodes[&statement_id];
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+            };
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.verification_status = status;
+            stmt.node_type = NodeType::from_verification_status(status);
+            status
+        };
+
+        self.flush()?;
+        Ok(new_status)
+    }
+
+    /// Computes what a statement's string sources would become after
+    /// add/remove/set, without mutating the graph. Shared by the CLI's
+    /// strict-sources preview (duplicate / PRIMARY+TERTIARY checks before the
+    /// real write) and `update_statement_sources`'s own mutation, so the two
+    /// can never compute a different resulting list.
+    pub fn preview_statement_sources(
+        &self,
+        node_id: u32,
+        add: Option<&[String]>,
+        remove: Option<&[String]>,
+        set: Option<&[String]>,
+    ) -> Result<Vec<String>, String> {
+        let stmt = self.state.nodes.get(&node_id)
+            .ok_or(format!("Error: Node ID {} does not exist", node_id))?;
+        if !stmt.node_type.is_statement_family() {
+            return Err(format!(
+                "Error: Node ID {} is not a statement (node_type: {:?})",
+                node_id, stmt.node_type
+            ));
+        }
+
+        if let Some(set_sources) = set {
+            for s in set_sources {
+                Self::validate_source_prefix(s)?;
+            }
+            return Ok(set_sources.to_vec());
+        }
+
+        let mut sources = stmt.sources.clone();
+        if let Some(to_remove) = remove {
+            for s in to_remove {
+                let pos = sources.iter().position(|existing| existing == s).ok_or_else(|| {
+                    format!("Error: source '{}' is not a current source of statement ID {}", s, node_id)
+                })?;
+                sources.remove(pos);
+            }
+        }
+        if let Some(to_add) = add {
+            for s in to_add {
+                Self::validate_source_prefix(s)?;
+            }
+            sources.extend(to_add.iter().cloned());
+        }
+        Ok(sources)
+    }
+
+    /// Add, remove, or replace a statement's string sources in place,
+    /// preserving its ID and every depends_on/because_of/contradicts edge
+    /// referencing it — the alternative (delete + re-add) breaks all three.
+    ///
+    /// Locked-state handling mirrors `delete_source_from_statement`: Invalid
+    /// and Contested statements keep the mutation, but the verification
+    /// recompute is skipped, since those states come from
+    /// invalidation/contradiction, not source diversity.
+    pub fn update_statement_sources(
+        &mut self,
+        node_id: u32,
+        add: Option<Vec<String>>,
+        remove: Option<Vec<String>>,
+        set: Option<Vec<String>>,
+    ) -> Result<Vec<String>, String> {
+        let new_sources = self.preview_statement_sources(
+            node_id, add.as_deref(), remove.as_deref(), set.as_deref(),
+        )?;
+
+        let has_entities = !self.state.nodes[&node_id].source_ids.is_empty();
+        if new_sources.is_empty() && !has_entities {
+            return Err(format!(
+                "Error: refusing to leave statement ID {} with zero sources (zero string sources and zero attached source entities)",
+                node_id
+            ));
+        }
+
+        {
+            let stmt = self.state.nodes.get_mut(&node_id).unwrap();
+            stmt.sources = new_sources.clone();
+        }
+
+        let locked = matches!(
+            self.state.nodes[&node_id].verification_status,
+            VerificationStatus::Invalid | VerificationStatus::Contested
+        );
+        if !locked {
+            let status = {
+                let stmt = &self.state.nodes[&node_id];
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+            };
+            let stmt = self.state.nodes.get_mut(&node_id).unwrap();
+            stmt.verification_status = status;
+            stmt.node_type = NodeType::from_verification_status(status);
+        }
+
+        self.flush()?;
+        Ok(new_sources)
     }
 
     pub fn contradict_statements(
@@ -1421,6 +1545,8 @@ impl Braim {
             resolved: false,
             resolution_source: None,
             resolution_winner: None,
+            resolution_kind: None,
+            resolution_reason: None,
         });
         // Move both to contested, preserving pre_contested_status
         for &id in &[from, to] {
@@ -1481,12 +1607,46 @@ impl Braim {
         edge.resolved = true;
         edge.resolution_winner = Some(winner_id);
         edge.resolution_source = source_id;
+        edge.resolution_kind = Some("winner".to_string());
+        edge.resolution_reason = Some(reason.to_string());
 
         // §3.3.3 — recompute the loser's dependents rather than refuting them.
         // The winner was promoted above and this pass cannot undo it (§3.3.5),
         // which is the ID:1016 regression: the winner transitively depended on
         // the loser and the old cascade invalidated its own resolution.
         self.recompute_after_refutation(loser_id, &now);
+
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Resolves a contradiction without picking a side: both statements are
+    /// true, just scoped to different conditions (braim-contradiction-scoped-
+    /// resolution.md, the 179/235 case). Neither statement's
+    /// verification_status, node_type, nor dependents are touched — that is
+    /// the load-bearing difference from `resolve_contradiction`'s --winner
+    /// path, which is why this is a separate method rather than a branch that
+    /// shares its mutation of the statements.
+    pub fn resolve_contradiction_both_stand(
+        &mut self,
+        stmt_a: u32,
+        stmt_b: u32,
+        reason: &str,
+    ) -> Result<(), String> {
+        for &id in &[stmt_a, stmt_b] {
+            self.state.nodes.get(&id)
+                .ok_or(format!("Error: Statement ID {} not found", id))?;
+        }
+        let edge_idx = self.state.contradicts.iter().position(|e| {
+            !e.resolved
+                && ((e.from == stmt_a && e.to == stmt_b)
+                    || (e.from == stmt_b && e.to == stmt_a))
+        }).ok_or("Error: no active contradiction edge between these statements".to_string())?;
+
+        let edge = &mut self.state.contradicts[edge_idx];
+        edge.resolved = true;
+        edge.resolution_kind = Some("scoped".to_string());
+        edge.resolution_reason = Some(reason.to_string());
 
         self.flush()?;
         Ok(())
@@ -4900,6 +5060,111 @@ mod defect_tests {
     }
 
     #[test]
+    fn delete_source_reverses_add_source_and_respects_locked_states() {
+        let mut b = temp_braim("delete_source");
+        let (_, _, s) = two_concepts_and_claim(&mut b); // unproven, narrative-only
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "one PRIMARY source promotes");
+
+        let status = b.delete_source_from_statement(s, src).unwrap();
+        assert_eq!(status, VerificationStatus::Unproven, "removing the only PRIMARY source demotes back");
+        assert!(b.state.nodes[&s].source_ids.is_empty());
+
+        assert!(b.delete_source_from_statement(s, src).is_err(), "already detached");
+        assert!(b.delete_source_from_statement(9999, src).is_err(), "missing statement");
+    }
+
+    #[test]
+    fn delete_source_leaves_invalid_statements_untouched() {
+        let mut b = temp_braim("delete_source_locked");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        b.invalidate_statement(s, "no longer true").unwrap();
+
+        let status = b.delete_source_from_statement(s, src).unwrap();
+        assert_eq!(status, VerificationStatus::Invalid, "invalidation is not reversed by source removal");
+        assert_eq!(b.state.nodes[&s].node_type, NodeType::InvalidStatement);
+    }
+
+    #[test]
+    fn update_sources_add_and_remove_correct_a_citation_without_changing_id() {
+        let mut b = temp_braim("update_sources_basic");
+        let (_, _, s) = two_concepts_and_claim(&mut b); // sources: ["narrative:claim"], unproven
+
+        let updated = b.update_statement_sources(s, Some(vec!["doc:spec.md:12-18".into()]), None, None).unwrap();
+        assert_eq!(updated, vec!["narrative:claim".to_string(), "doc:spec.md:12-18".to_string()]);
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "one PRIMARY source promotes");
+
+        // Correct a wrong range: remove the bad citation, add the fixed one, same call.
+        let updated = b.update_statement_sources(
+            s,
+            Some(vec!["doc:spec.md:20-26".into()]),
+            Some(vec!["doc:spec.md:12-18".into()]),
+            None,
+        ).unwrap();
+        assert!(updated.contains(&"doc:spec.md:20-26".to_string()));
+        assert!(!updated.contains(&"doc:spec.md:12-18".to_string()));
+        assert_eq!(b.state.nodes[&s].sources, updated, "edited in place; node id s is unchanged");
+    }
+
+    #[test]
+    fn update_sources_set_replaces_the_whole_list_and_ignores_add_remove() {
+        let mut b = temp_braim("update_sources_set");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        let updated = b.update_statement_sources(
+            s,
+            Some(vec!["doc:ignored.md".into()]),
+            None,
+            Some(vec!["code:impl.rs:1-10".into(), "doc:spec.md:1".into()]),
+        ).unwrap();
+        assert_eq!(updated, vec!["code:impl.rs:1-10".to_string(), "doc:spec.md:1".to_string()]);
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Proven, "two distinct PRIMARY types");
+    }
+
+    #[test]
+    fn update_sources_rejects_untyped_and_missing_remove_targets() {
+        let mut b = temp_braim("update_sources_validation");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+
+        assert!(b.update_statement_sources(s, Some(vec!["no-prefix-here".into()]), None, None).is_err(),
+            "untyped sources are rejected like statement add");
+        assert!(b.update_statement_sources(s, None, Some(vec!["doc:never-added.md".into()]), None).is_err(),
+            "removing a source that isn't present is an error");
+        assert_eq!(b.state.nodes[&s].sources, vec!["narrative:claim".to_string()], "rejected ops leave the list untouched");
+    }
+
+    #[test]
+    fn update_sources_refuses_to_leave_zero_total_sources() {
+        let mut b = temp_braim("update_sources_zero_guard");
+        let (_, _, s) = two_concepts_and_claim(&mut b); // exactly one string source, no entities
+
+        assert!(b.update_statement_sources(s, None, Some(vec!["narrative:claim".into()]), None).is_err(),
+            "would leave zero strings and zero entities");
+
+        // With an entity attached, removing the only string is fine — the
+        // entity alone still counts as a source.
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        let updated = b.update_statement_sources(s, None, Some(vec!["narrative:claim".into()]), None).unwrap();
+        assert!(updated.is_empty());
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "the entity alone still verifies");
+    }
+
+    #[test]
+    fn update_sources_leaves_invalid_status_untouched() {
+        let mut b = temp_braim("update_sources_locked");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        b.invalidate_statement(s, "no longer true").unwrap();
+
+        let updated = b.update_statement_sources(s, Some(vec!["code:fix.rs:1".into()]), None, None).unwrap();
+        assert!(updated.contains(&"code:fix.rs:1".to_string()), "the citation edit still applies");
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Invalid, "status is not revived");
+        assert_eq!(b.state.nodes[&s].node_type, NodeType::InvalidStatement);
+    }
+
+    #[test]
     fn attached_source_entity_is_not_an_orphan() {
         let mut b = temp_braim("orphan_source");
         let (_, _, s) = two_concepts_and_claim(&mut b);
@@ -5577,5 +5842,79 @@ mod defect_tests {
         // revalidate recomputes it off the contested state.
         let (status, _) = b.revalidate_statement(s3).unwrap();
         assert_eq!(status, VerificationStatus::Partial, "orphan-contested node recomputes to its source-derived status");
+    }
+
+    /// braim-contradiction-scoped-resolution.md, D1: `--both-stand` marks a
+    /// contradiction resolved without picking a side. Both statements (and
+    /// their dependents) must come out byte-identical to how they went in;
+    /// only the edge itself changes.
+    #[test]
+    fn both_stand_leaves_both_statements_byte_identical() {
+        let mut b = temp_braim("both_stand_byte_identical");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("default import discards duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("--full import unions duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:2".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let dependent = b.add_statement("depends on s2", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(s2, 1.0)]), true).unwrap();
+
+        b.contradict_statements(s1, s2, "these look contradictory", None).unwrap();
+
+        let before_s1 = serde_json::to_string(b.get_node(s1).unwrap()).unwrap();
+        let before_s2 = serde_json::to_string(b.get_node(s2).unwrap()).unwrap();
+        let before_dependent = serde_json::to_string(b.get_node(dependent).unwrap()).unwrap();
+
+        b.resolve_contradiction_both_stand(s1, s2, "different modes of the same function, not a disagreement").unwrap();
+
+        assert_eq!(before_s1, serde_json::to_string(b.get_node(s1).unwrap()).unwrap(),
+            "the resolved side must be byte-identical");
+        assert_eq!(before_s2, serde_json::to_string(b.get_node(s2).unwrap()).unwrap(),
+            "the other side must be byte-identical");
+        assert_eq!(before_dependent, serde_json::to_string(b.get_node(dependent).unwrap()).unwrap(),
+            "a dependent must not be touched either");
+
+        let edge = b.state.contradicts.iter()
+            .find(|e| (e.from == s1 && e.to == s2) || (e.from == s2 && e.to == s1))
+            .unwrap();
+        assert!(edge.resolved);
+        assert_eq!(edge.resolution_kind.as_deref(), Some("scoped"));
+        assert_eq!(edge.resolution_reason.as_deref(), Some("different modes of the same function, not a disagreement"));
+        assert!(edge.resolution_winner.is_none(), "a scoped resolution picks no winner");
+    }
+
+    /// braim-contradiction-scoped-resolution.md, D2: reaching a third PRIMARY
+    /// type while a contradiction is live is corroboration, not adjudication.
+    /// Regression for the ID:179/235 incident: Mechanism A must report the
+    /// corroboration but leave both sides — and the edge — untouched.
+    #[test]
+    fn mechanism_a_reports_corroboration_without_mutating_either_side() {
+        let mut b = temp_braim("mechanism_a_report_only");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("default import discards duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("--full import unions duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:2".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+
+        b.contradict_statements(s1, s2, "these look contradictory", None).unwrap();
+
+        let src = b.add_source("third corroborating source", "doc", Some("doc:spec.md:1".into()), None).unwrap();
+        let result = b.add_source_to_statement(s1, src).unwrap();
+        assert_eq!(result.corroborated_with, Some(s2),
+            "a third PRIMARY type on s1, absent from s2, is corroboration");
+
+        assert_eq!(b.get_node(s1).unwrap().verification_status, VerificationStatus::Contested,
+            "the corroborated side must not be auto-promoted");
+        assert_eq!(b.get_node(s2).unwrap().verification_status, VerificationStatus::Contested,
+            "the other side must not be auto-invalidated");
+        assert!(!b.get_node(s2).unwrap().invalid, "no auto-invalidation");
+
+        let edge = b.state.contradicts.iter()
+            .find(|e| (e.from == s1 && e.to == s2) || (e.from == s2 && e.to == s1))
+            .unwrap();
+        assert!(!edge.resolved, "the contradiction remains unresolved");
+        assert!(edge.resolution_kind.is_none());
     }
 }

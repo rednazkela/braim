@@ -1,6 +1,6 @@
 ---
 name: dream
-description: Run one overnight dreaming session over a local braim graph — adjudicate candidate node pairs for missing relations, duplicates, and contradictions, and relax load-bearing constraints to find the ones the graph has already outgrown, writing every verdict back under a skeptical evidence protocol. Use when the user asks to dream, run a dream session, ask what-if, or consolidate a graph overnight.
+description: Run one overnight dreaming session over a local braim graph — adjudicate candidate node pairs for missing relations, duplicates, and contradictions, relax load-bearing constraints to find the ones the graph has already outgrown, and retune existing compounds' weights where rereading their sources justifies it, writing every verdict back under a skeptical evidence protocol. Use when the user asks to dream, run a dream session, ask what-if, or consolidate a graph overnight.
 ---
 
 # Dreaming: adjudicate candidate pairs
@@ -11,6 +11,12 @@ the verdict back. braim does structure; you do judgment.
 
 `$1` (optional) = how many pairs to adjudicate this session. Default **15**.
 `$2` (optional) = data dir. Default: the project's `.braim`.
+
+`$1` = **`weights`** or **`full-weights`** switches modes entirely: skip
+pairs and what-if, and run only the full-graph weight sweep described under
+"Full-graph weight sweep" below, over every equal-split compound in the graph
+regardless of when it was created. This is the explicit-request trigger that
+section requires — an ordinary `/dream` (no arg, or a number) never runs it.
 
 ## The prior you must hold
 
@@ -211,7 +217,7 @@ This is what stops the next session re-treading the same pair.
 
 ## What-if: relax a constraint
 
-Pairs are one half of a session. The other is asking what the graph would look
+Pairs are one part of a session. Another is asking what the graph would look
 like if one of its load-bearing statements stopped being true — the technique a
 dream applies to a life, applied to a knowledge graph.
 
@@ -319,6 +325,134 @@ and never reopen.
 is keyed on pairs and cannot hold a single-node walk, which is why the marker
 lives on the node.
 
+## Weight tuning: retune existing compounds, add nothing
+
+A dream can also revisit a compound already in the graph and ask whether its
+`depends_on` split still matches what the sources say — no new pair, no new
+statement, just rereading what is already cited. This is the sleep-consolidation
+move: the finding was already made; this pass only adjusts how much of it each
+dependency is carrying.
+
+**Default scope is today's new nodes, not the whole graph.** Run it after the
+pairs (and after what-if, if you ran that too), and keep it to a handful — two
+or three compounds a session, same budget as `whatif`. Build the candidate list
+from what today actually added, not from every equal-split compound the graph
+has ever accumulated:
+
+```bash
+python3 -c "
+import json, datetime
+d = json.load(open('.braim/current.json'))
+today = datetime.datetime.utcnow().strftime('%Y-%m-%d')  # or pass today's date explicitly
+for nid, n in d['nodes'].items():
+    if not n.get('created_at', '').startswith(today):
+        continue
+    deps = n.get('depends_on') or {}
+    if len(deps) < 2:
+        continue
+    even = 1.0 / len(deps)
+    if all(abs(v - even) < 0.01 for v in deps.values()):
+        print(nid, n.get('node_type'), n.get('label', '')[:100])
+"
+```
+
+This is a scoping choice, not a shortcut: a graph accumulates equal-split
+compounds across every session it has ever had, and re-litigating all of them
+every night turns a bounded nightly pass into an unbounded standing task. Today's
+new nodes are the ones nobody has looked at yet — the same reasoning `frontier.py`
+applies to pairs applies here. A full-graph sweep is a real, separate, valuable
+thing to do (see below) — just not automatically, every night.
+
+A compound with an even split (0.5/0.5, or an even share across more than two)
+is a stronger candidate than one already asymmetric — an even split is what a
+statement gets when nobody has stated an opinion, per the same rule that governs
+writing one in the first place (see "Rules" below).
+
+**Per compound:**
+
+1. `braim node <id>` — read the current split and what it depends on.
+2. `braim node <dep-a>`, `braim node <dep-b>` (and any others) — read each
+   dependency's own label, sources, and verification status.
+3. Open the actual cited sources — Read/Grep, not the labels. The question is
+   narrow: does the compound's claim rest more on what one dependency's source
+   demonstrates than the other's? A dependency that is `proven_strong` where the
+   other is `partial`, or whose source is what the compound's own wording is
+   actually describing, is carrying more of the claim.
+4. **If you cannot point to the specific sentence or line that justifies a
+   different split, leave it alone.** The default here is **no-change**, for the
+   same reason the default pair verdict is `no-relation`: a plausible-sounding
+   number is exactly what an LLM asked to reweigh something will produce whether
+   or not the evidence asymmetry actually changed since the split was set.
+5. If the sources do justify a change, write it — never by fiat, always citing
+   what you read:
+   ```bash
+   braim statement update-weights <id> --weights "<dep-a>:0.7,<dep-b>:0.3"
+   # or, if the compound is a concept rather than a statement:
+   braim concept update-weights <id> --weights "<dep-a>:0.7,<dep-b>:0.3"
+   ```
+6. Mark that it was looked at, on the compound itself — not `scope=agent_scratch`.
+   That tag drops a node out of `eligible()` entirely, and this compound is
+   established knowledge, not something dreaming wrote tonight; excluding it
+   would silently pull it out of constraint ranking and future dreaming for
+   good. `whatif_walked_at` sets this precedent already — a plain metadata mark,
+   not a scope change:
+   ```bash
+   braim meta <id> --set reweighed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   ```
+   Note the before/after split and the specific evidence in the closing report.
+   Flag it for human review if the change reverses which dependency carries the
+   majority — that is a structural change a human should see, not just read
+   about after the fact:
+   ```bash
+   braim dream flag "reweighed <id>: <dep-a> <old> to <new>, <dep-b> <old> to <new> - <why>" \
+     --kind note --nodes <id>,<dep-a>,<dep-b>
+   ```
+
+`reweighed_at` exists for the same reason `whatif_walked_at` does: without a
+mark, an even-weight compound looks like a candidate every single night even
+when nothing about its sources has changed since the last look.
+
+### Full-graph weight sweep — on request only, never part of the nightly default
+
+Dropping the today-only filter and scanning every equal-split compound the
+graph has ever accumulated is a real mode, not a bigger version of the same
+mode: on one real run it surfaced 38 candidates spanning the graph's whole
+history, most of them old demo/test/spec-bootstrap fixtures with no real
+domain content to reason about (labels like `TestB TestC` or May-era `Voice
+Charge` demo data — check `braim query` or the node's own domains for this
+before spending time on it, and skip anything that reads as fixture rather
+than fact). The real candidates among the rest are worth doing exactly the
+same per-compound procedure above on, just at a scale that does not fit a
+nightly budget.
+
+Run this **only when invoked with `$1 = weights` / `full-weights`, or when the
+user explicitly asks for a full weight sweep or audit** — never as a default
+step of an ordinary `/dream`, and never just because the today-only candidate
+list came up empty. An empty today-only list is a legitimate "nothing to
+reweigh tonight," the same as an empty pair list. This mode is standalone: it
+does not run pairs or what-if first.
+
+```bash
+python3 -c "
+import json
+d = json.load(open('.braim/current.json'))
+for nid, n in d['nodes'].items():
+    if n.get('status') != 'active':
+        continue
+    deps = n.get('depends_on') or {}
+    if len(deps) < 2:
+        continue
+    even = 1.0 / len(deps)
+    if all(abs(v - even) < 0.01 for v in deps.values()):
+        print(nid, n.get('node_type'), n.get('verification_status'), n.get('label', '')[:100])
+"
+```
+
+Weights never affect verification status — status is source-type diversity
+capped by the weakest dependency's status, not the depends_on split — so
+retuning a split cannot promote or demote anything. It changes how much of a
+compound's identity each dependency is read as carrying, nothing else.
+
 ## Anything a human must see goes in the review queue
 
 The closing report lives in the model's context and does not survive
@@ -374,6 +508,10 @@ braim dream log --verdict verified
 - Never `--force`, never delete a node, never resolve a contradiction, never
   edit an existing statement's text. Dreaming adds hypotheses and consolidates
   duplicates; it does not rewrite established knowledge.
+- `update-weights` is the one existing-statement mutation dreaming is allowed.
+  It changes a `depends_on` split, never a statement's text, and only through
+  the cited-evidence procedure in "Weight tuning" above — never a bare number
+  chosen because it "feels" more balanced now than it did when it was written.
 - Everything you create carries `scope=dream` so a human can review the whole
   session with `braim list --meta scope=dream`.
 - **Bookkeeping about the session itself carries `scope=agent_scratch` instead** —
@@ -409,6 +547,9 @@ in the graph, the ledger, or the review queue before you write a word of it:
 - constraints walked: which ones, whether each turned out stale, and for the ones
   that held, the single change you named — separate the stale findings from the
   counterfactuals, because only the first kind is a finding
+- compounds reweighed: which ones, the before/after split, and the specific
+  evidence that justified each change — and how many candidates you looked at
+  but left alone, since no-change is the expected outcome here too
 - what to review: `braim dream review` first — it is the only place the
   report-only observations live — then `braim list --meta scope=dream` for the
   nodes, and `braim list --meta counterfactual=true` for the hypotheses, which

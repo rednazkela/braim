@@ -1036,24 +1036,220 @@ FAIL signal:
     direction), gets nothing, and reports failure without noting directionality.
 
 ═══════════════════════════════════════════════════════════════
+SCENARIO 31 — dream candidates: pair discovery, no-fiat-promotion discipline
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim dream candidates` — deterministic pair discovery across the four
+    strategies (shared-source, two-hop, semantic, gap); the default set
+    excludes semantic (`--strategy semantic` reaches it directly)
+  - the read-only / no-fiat-promotion discipline: a dream candidate is a
+    hypothesis, not evidence; it must be written back as an unproven claim
+    (or discarded) rather than a fact fabricated from the match itself
+  - `braim dream seen <a> <b> --verdict ...` — the ledger entry that lets a
+    later sweep skip an already-judged pair by default
+
+Document anchors:
+  The base corpus's Loan (three-week loan period, corpus.txt:20) and the
+  appendix's Digital Loan (also a standard three-week period, delivered with
+  no physical return, corpus_appendix.txt:14-16) describe the same lending
+  duration from two different documents and were never connected when the
+  appendix concepts were added (scenarios 24-25) — a strong semantic-strategy
+  candidate. A shared-source or gap-register pair surfaced instead is also
+  acceptable if the agent's reasoning for it is grounded in the corpus and
+  not fabricated.
+
+PASS signal:
+  - `braim dream candidates` was actually run (any strategy or combination);
+    the reply quotes the tool's own output, not a hand-picked pair
+  - the pair pursued is a real match returned by the command, with a
+    grounded rationale (e.g. both describe a three-week lending period)
+  - the resulting record is EITHER an unproven claim (0 PRIMARY sources, or
+    an explicit `?[...]`-style framing with evidence_needed) proposing the
+    relationship, OR an explicit decision that no real relation exists —
+    never a confident fact/proven statement manufactured from the match
+    alone with no new evidence
+  - `braim dream seen <a> <b> --verdict {proposed|no-relation|duplicate}`
+    was called, with `--note` referencing the claim id if one was created
+  - if genuinely nothing worth pursuing turned up, the agent still ran the
+    sweep and recorded that null result rather than inventing a pair
+
+FAIL signal:
+  - no `dream candidates` call — the agent free-associates a pair from
+    memory of the corpus instead of running the sweep
+  - the match is written straight into a fact/proven statement without any
+    new PRIMARY evidence for the RELATIONSHIP itself (citing only the two
+    nodes' pre-existing sources is fiat promotion, not verification)
+  - `dream seen` never called, so the pair isn't recorded and a future
+    sweep would re-surface it from scratch
+  - the reported pair or score does not match anything the tool actually
+    returned (fabricated output)
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 32 — dream constraints + whatif: leverage, staleness, counterfactual tagging
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim dream constraints` — ranks because_of causes by transitive
+    leverage (how many statements rest on them); invalidated/refuted causes
+    are EXCLUDED from this ranking entirely (not merely discounted — only an
+    unproven-but-still-valid cause is discounted), and a refuted link
+    carries no leverage through it
+  - `braim dream whatif <id>` — walks one cause both directions (down to
+    what rests on it, up to what it ultimately serves) and reports staleness
+    signals (a later statement citing the same PRIMARY source, evidenced at
+    least as well, with no contradiction yet linking the two)
+  - counterfactual discipline: a hypothesis about what relaxing a constraint
+    would achieve is unprovable and must be tagged
+    `braim meta <id> --set counterfactual=true` if written down at all
+
+Document anchors:
+  Continues the causal chain from scenarios 27-30. Its root/bottom entry was
+  invalidated in scenario 29 finding (1); one middle link's inverse test was
+  failed in scenario 29 finding (2). The remaining valid steps are the
+  borrowing-block complaint and whichever cause(s) above the invalidated
+  root still carry an active because_of edge.
+
+PASS signal:
+  - `braim dream constraints` was run; the invalidated root/bottom entry
+    from scenario 29 does NOT appear in its output (correctly excluded, not
+    merely ranked low)
+  - the agent picked the top-ranked (or a well-justified) entry from that
+    output — not a leaf with nothing resting on it, and not the excluded
+    invalidated root
+  - `braim dream whatif <id>` was run on that entry; the reply reports BOTH
+    directions of the walk (what rests on it, and what it serves), quoting
+    the tool's actual output rather than paraphrasing from memory
+  - staleness signals are reported honestly — zero is an acceptable and
+    likely answer here, but a fabricated signal not actually in the tool's
+    output is not
+  - IF the agent wrote a node describing what relaxing the constraint would
+    achieve, it carries `counterfactual=true`; if it wrote nothing of the
+    kind, that's also acceptable
+  - a note was left (via the tool, not only in the reply) about the
+    human-only judgment call the closer look surfaced (e.g. whether the
+    invalidated root deserves reinstatement)
+
+FAIL signal:
+  - `dream constraints`/`dream whatif` never run; the agent reasons about
+    "the most load-bearing step" from memory of the chain instead
+  - the invalidated root appears in the agent's account of the ranking, or
+    the agent picks it as the target to walk (it was excluded — a report
+    that includes it is fabricated)
+  - only one direction of the whatif walk is reported
+  - a relaxation hypothesis is asserted as fact, or written as a node
+    without `counterfactual=true`
+  - no note left despite the prompt's explicit "decision that isn't yours
+    to make alone"
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 33 — dream review + reviewed: the queue survives the session
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim dream review` — lists items raised via `dream flag`, pending
+    first; survives independently of the model's own context (a file beside
+    the graph, not prose in a report)
+  - `braim dream reviewed <id> --note "..."` — signs an item off WITHOUT
+    deleting it; a cleared item still appears under `--all`
+
+Document anchors:
+  The item raised at the end of scenario 32 (the human-only judgment call
+  about the constraint it examined) is the pending item this scenario should
+  find. There is nothing else in the queue yet.
+
+PASS signal:
+  - `braim dream review` was run and the reply quotes what it actually
+    returned (the item from scenario 32, referencing the constraint's id)
+  - the agent's disposition of that item is grounded in the graph as it
+    actually stands, not invented context ("confirmed via a records check"
+    with no such record in the corpus is a fabrication)
+  - if closed: `braim dream reviewed <id> --note "..."` was called with a
+    note that states the actual action/reasoning; a follow-up
+    `braim dream review --all` (or equivalent) shows the item still present
+    but no longer pending
+  - if left open: the agent says so explicitly and states what evidence
+    would resolve it, rather than silently ignoring the item
+
+FAIL signal:
+  - the agent reports "nothing pending" without running `dream review`, or
+    despite the command actually returning scenario 32's item
+  - `dream reviewed` called with a node id instead of the review-item id
+    returned by `dream review` (the two are different id spaces)
+  - the item is deleted from the graph/queue instead of signed off (loses
+    the review history)
+  - a decision is recorded with fabricated grounding not present in the
+    corpus, appendix, or prior scenario output
+
+═══════════════════════════════════════════════════════════════
+SCENARIO 34 — dream seen overwrite + log + replay-exclusion
+═══════════════════════════════════════════════════════════════
+
+Feature under test:
+  - `braim dream seen <a> <b> --verdict ...` called a SECOND time on the
+    same pair overwrites the earlier ledger entry rather than appending a
+    duplicate row — one entry per pair, latest verdict wins
+  - `braim dream log` — reads the ledger back, newest first, filterable by
+    `--verdict` / `--since`
+  - `braim dream candidates` excludes any pair already in the ledger by
+    default, regardless of verdict; `--replay` is the only way to
+    reconsider it
+
+Document anchors:
+  The pair recorded via `dream seen` in scenario 31 (Loan/Digital Loan or
+  whatever pair that scenario actually settled on).
+
+PASS signal:
+  - the agent determines an actual final verdict for the pair rather than
+    re-asserting the tentative one unchanged without new grounds (evidence
+    for the final call, or an honest "still unresolved, re-recording as
+    still proposed" is acceptable — asserting "verified" with no new
+    evidence for the relationship itself is fiat promotion)
+  - `braim dream seen <a> <b> --verdict ...` called again on the SAME pair;
+    the agent reports (or the operator confirms via `dream log`) that only
+    ONE entry exists for that pair afterward, carrying the new verdict/note
+    and a newer timestamp — not two entries
+  - `braim dream log` run and its actual output quoted, showing the pair's
+    entry
+  - a `dream candidates` run with the SAME strategy as scenario 31 does NOT
+    return the settled pair
+  - a `dream candidates --replay` run DOES return it again (or the agent
+    correctly explains why it wouldn't — e.g. the pair is now directly
+    linked by the claim scenario 31 created, so it is excluded by the
+    "directly linked" rule instead — either explanation is acceptable as
+    long as it's checked against actual output, not assumed)
+
+FAIL signal:
+  - two ledger entries exist for the same pair after the second `dream seen`
+    call (the overwrite-not-append behavior was missed or misunderstood)
+  - `dream log` never run, or its output misreported
+  - the settled pair still appears in a default (non-replay) `dream
+    candidates` run — or the agent never re-ran the sweep to check
+  - `--replay` never used to demonstrate the pair CAN be reconsidered
+  - a new verdict is asserted with fabricated "confirmation" not grounded in
+    anything actually re-examined
+
+═══════════════════════════════════════════════════════════════
 SCORING
 ═══════════════════════════════════════════════════════════════
 
 Each scenario yields a single PASS or FAIL based on its own oracle row.
-The suite is 30 scenarios: 01-20 cover braim CLI behavior and anti-pattern
+The suite is 34 scenarios: 01-20 cover braim CLI behavior and anti-pattern
 discipline; 21-23 cover the agent-integration policies in policies/; 24-26
 cover the memory evidence-discipline traits (policies/memory_braim_traits.md),
 with 26 scored against the saved reply text; 27-30 cover the because_of causal
 edge and the Five Whys commands (why-add / why / why-test / why-remove) plus
-its traversal in perspective / proximity.
+its traversal in perspective / proximity; 31-34 cover the dream commands
+(candidates / constraints / whatif / flag / review / reviewed / seen / log).
 
-  25 or more PASS -> braim end-to-end behavior + anti-pattern discipline +
+  29 or more PASS -> braim end-to-end behavior + anti-pattern discipline +
                      agent-integration policies + evidence discipline +
-                     causal-edge behavior verified
-  19 to 24 PASS  -> partial regression; note which scenario rows failed
-  fewer than 19  -> base behavior, anti-pattern detection, policy enforcement,
-                    or causal-edge handling is broken; investigate the failing
-                    oracle rows first before further scenarios are run
+                     causal-edge behavior + dream discipline verified
+  22 to 28 PASS  -> partial regression; note which scenario rows failed
+  fewer than 22  -> base behavior, anti-pattern detection, policy enforcement,
+                    causal-edge handling, or dream discipline is broken;
+                    investigate the failing oracle rows first before further
+                    scenarios are run
 
 Optional weighting: scenarios 09, 11, 14 carry higher signal because the
 underlying violations show up most often in real-world graphs. Scenarios
@@ -1084,3 +1280,18 @@ not concepts); 30 fails if perspective/proximity return no path between two
 statement entries a because_of chain connects (causal traversal not wired into
 path-finding). 27-30 build on the cumulative graph and run in order
 (27 → 28 → 29 → 30).
+Scenarios 31-34 carry high signal for the dream commands — 31 fails if a
+candidate match is written straight into a fact/proven statement instead of
+an unproven claim (fiat promotion is the exact failure mode dream's read-only
+design exists to prevent), or if the sweep is skipped and a pair is
+free-associated from memory instead; 32 fails if the invalidated causal root
+from scenario 29 is treated as still eligible for constraint ranking, if only
+one direction of the whatif walk is reported, or if a relaxation hypothesis
+is asserted as fact without `counterfactual=true`; 33 fails if the review
+queue is reported empty without actually being checked, or if an item is
+deleted rather than signed off (destroying the review history the queue
+exists to preserve); 34 fails if a second `dream seen` call on the same pair
+produces two ledger rows instead of one, or if the settled pair still
+surfaces in a default (non-replay) sweep. 31-34 build on the cumulative graph
+(31 and 32 also feed 33 and 34 directly) and run in order
+(31 → 32 → 33 → 34).

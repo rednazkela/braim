@@ -58,21 +58,25 @@ Serves high-quality context to an LLM with an agent-agnostic, multi-source, cros
 concept    add | delete | update-weights |      atomics + compounds
            update-deps
 statement  add | verify | verify-suggest |      claims/facts lifecycle
-           add-source | contradict |
+           add-source | delete-source |
+           update-sources | contradict |
            resolve-contradiction | invalidate |
            revalidate | update-weights |
            update-deps | delete
 source     add                                  first-class source entities
 lookup | query | proximity | perspective        discovery and navigation
 why-add | why | why-test | why-remove           causal chains (because_of, Five Whys)
-similar                                         semantic search + dedup (embeddings builds)
+similar                                         semantic search + dedup (default build)
 node | list | domains | audit | meta            inspection and metadata
 version    save | list | restore                checkpoints (per-domain when sharded)
 init | policy                                   team bootstrap + agent policy payloads
-dream      candidates | seen                    pair discovery for overnight LLM adjudication
+dream      candidates | constraints | whatif |  pair/constraint discovery, review queue,
+           flag | review | reviewed | log |     ledger — overnight LLM adjudication
+           seen
 merge-nodes                                     fold a duplicate into its survivor, unioning evidence
 export | shard | rename-domain                  publish a domain, per-domain storage, governance
-serve | import | migrate-node-types             viewer, cross-project, migration
+serve | import | migrate-node-types |           viewer, cross-project, migration,
+migrate-refutation                              pre-3.3 refutation-cascade repair
 ```
 
 ### Creating knowledge
@@ -101,9 +105,17 @@ braim statement verify-suggest 42          # PRIMARY-typed candidate sources for
 braim source add "Treasurer ledger 1995" --type doc \
   --location "doc:treasurer_ledger_1995.pdf:7"          # → source entity ID:N
 braim statement add-source 42 --source-id N             # attach; recomputes status
+braim statement delete-source 42 --source-id N          # detach; recomputes status (can demote)
+braim statement update-sources 42 --remove "doc:spec.md:5" --add "doc:spec.md:12-18"
+                                                         # fix a wrong citation IN PLACE — no new ID,
+                                                         # no broken depends_on/because_of/contradicts edges
 ```
 
 @[A source entity referenced by multiple statements counts once for PRIMARY diversity] source: braim source add --help
+
+@[delete-source and update-sources leave invalid and contested statements untouched — those states come from invalidation/contradiction, not source diversity, so editing sources there does not revive or alter status] source: code:src/graph.rs delete_source_from_statement, update_statement_sources
+
+@[update-sources refuses an edit that would leave a statement with zero string sources AND zero attached source entities; --set is exclusive of --add/--remove; new strings must carry a typed prefix like statement add requires] source: braim statement update-sources --help
 
 @[braim node <id> lists attached entities under "Source entities:" with type and location] source: braim node output
 
@@ -162,9 +174,9 @@ braim why-add 42 --because 73         # re-point 42 at a new cause
 
 @[Invalidating a cause flags every consequent above it (metadata because_of_reinvestigate) for re-investigation but does not auto-invalidate them] source: code:src/graph.rs flag_because_of_reinvestigation
 
-### Semantic similarity (optional)
+### Semantic similarity (default build)
 
-Requires an embeddings build: `cargo build --release --features embeddings` (pulls fastembed/ONNX; needs rustc >= 1.88).
+Ships by default (pulls fastembed/ONNX; needs rustc >= 1.88) — omit it with `cargo build --release --no-default-features` for a dependency-light binary.
 
 ```bash
 braim similar "measuring how similar two texts are"   # nearest labels by MEANING
@@ -187,6 +199,8 @@ braim audit --semantic                                # near-duplicates + label 
 
 ```bash
 braim meta 6500 --set scope=agent_scratch   # first-class metadata on any node
+braim meta 6500 --inc recurrence            # increment a numeric key, prints new value
+braim meta 6500 --unset scope               # remove a key entirely
 braim list --meta scope=agent_scratch       # filter by metadata
 ```
 
@@ -196,12 +210,13 @@ braim list --meta scope=agent_scratch       # filter by metadata
 
 ```bash
 braim audit                      # orphans, pending, gaps, dangling refs, causal-edge health
-braim audit --semantic           # + near-duplicate pairs and label echoes (embeddings builds)
+braim audit --semantic           # + near-duplicate pairs and label echoes (default build)
 braim domains                    # domain inventory — check before adding (rule 4)
 braim version save "checkpoint"  # rule 3: checkpoint after each batch
 braim version restore 12         # overwrites current.json; save first
 braim serve --port 3000          # interactive graph viewer (physics/animation toggle)
 braim import /other/.braim --domain-map "Finance:Billing" --only-proven
+braim migrate-refutation         # repair pre-3.3 refutation-cascade collateral (dry by default, --apply to write)
 ```
 
 @[Never use jq or other tools directly on current.json] source: braim --help REQUIRED RULES:2
@@ -247,6 +262,29 @@ braim list --meta scope=dream                       # morning review
 
 #[Strategies differ by two orders of magnitude in selectivity, so budget runs semantic-first] based_on: @[measured yields on a 714-node graph: 30 semantic / 148 shared-source / 5135 two-hop]
 
+**Relaxing constraints** — a second dream mode, alongside pair discovery: rank the causes most statements rest on, then walk one to see what actually moves.
+
+```bash
+braim dream constraints --limit 10           # rank because_of causes by blast radius
+braim dream whatif 186                       # walk one: what rests on it, what it serves, staleness signals
+braim meta 210 --set counterfactual=true     # tag a hypothesis written from a relaxation — export refuses these
+```
+
+@[dream constraints scores by transitive statement count reaching a cause through because_of, discounted (not excluded) when the cause is unproven] source: braim dream constraints --help
+
+@[dream whatif reports staleness signals first — a later statement citing the same PRIMARY source, evidenced at least as well, with no contradiction linking the two yet — since that half of what-if dreaming is provable and the improvement half is not] source: braim dream whatif --help
+
+**Review queue** — the part of a night's output that isn't a node survives the session:
+
+```bash
+braim dream flag "merge 412 warned about deps only the loser had" --kind merge --nodes 412,88
+braim dream review                           # pending items, oldest reasoning first
+braim dream reviewed 3 --note "wired the dependency by hand"
+braim dream log --verdict verified --limit 20   # read back what a night adjudicated (dreams.json)
+```
+
+@[The review queue (reviews.json) exists because a closing report lives in the model's context and does not survive compaction — the part of the night most needing eyes was the part that evaporated] source: braim dream flag --help
+
 The adjudication loop itself is `.claude/skills/dream/` — install with
 `ln -sfn <repo>/.claude/skills/dream ~/.claude/skills/dream`.
 
@@ -258,16 +296,16 @@ The adjudication loop itself is `.claude/skills/dream/` — install with
 
 Core disciplines the policies encode:
 
-- **Lookup-first**: `braim lookup --exact` / `query --include-claims` before every add — duplicates are the documented failure mode. On embeddings builds, follow with semantic dedup: `braim similar "<label>" --dedup` or `--check-dupes` on the add; a hit >= 0.8 means reuse, not add.
+- **Lookup-first**: `braim lookup --exact` / `query --include-claims` before every add — duplicates are the documented failure mode. Follow with semantic dedup: `braim similar "<label>" --dedup` or `--check-dupes` on the add; a hit >= 0.8 means reuse, not add.
 - **Markers**: `@[verbatim fact]` with typed citation, `#[inference]` with 2+ asymmetric deps, `?[unknown]` with evidence_needed; exactly one marker per claim.
 - **Re-grounding**: a braim node label is a pointer, not evidence. Figures and quotes are verified against the cited source document; label-vs-document disagreement means the document wins and the node gets contradicted or invalidated — at promotion time especially.
 - **Promotion never by fiat**: claims become facts only through `add-source` with genuinely diverse PRIMARY types.
 
 ## Tests
 
-@[tests/ holds a 26-scenario blind-agent suite: prompts in scenario_NN.txt, operator-side checks in oracle.txt, procedure in run.txt] source: tests/README.txt
+@[tests/ holds a 34-scenario blind-agent suite: prompts in scenario_NN.txt, operator-side checks in oracle.txt, procedure in run.txt] source: tests/oracle.txt SCORING
 
-@[Scenarios 01-08 cover base features, 09-14 real-world usage violations, 15-20 cross-source verification primitives, 21-23 the hook policies, 24-26 the evidence-discipline traits (26 scored on the saved reply text)] source: tests/oracle.txt SCORING
+@[Scenarios 01-08 cover base features, 09-14 real-world usage violations, 15-20 cross-source verification primitives, 21-23 the hook policies, 24-26 the evidence-discipline traits (26 scored on the saved reply text), 27-30 the because_of causal edge and Five Whys commands (why-add/why/why-test/why-remove) plus their traversal in perspective/proximity, 31-34 the dream commands (candidates/constraints/whatif/flag/review/reviewed/seen/log)] source: tests/oracle.txt SCORING
 
 #[The suite tests whether an LLM operating under the policies produces a conformant graph — agent-behavioral, so it runs live sub-agents rather than cargo test] based_on: @[blind scenario + operator oracle design] + @[policies handed to agents as operating contracts]
 
