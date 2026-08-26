@@ -91,7 +91,7 @@ sit in. Take the top **two or three** and settle them:
 2. If it confirms the label, record the observation as a first-class source and
    attach it. This is evidence, not fiat — you ran the command:
    ```bash
-   braim source add "<what was counted>" --type test \
+   braim sources add "<what was counted>" --type test \
      --location "test:<exact command> = <exact result>, observed <YYYY-MM-DD>"
    braim statement add-source <node> --source-id <new-source-id>
    ```

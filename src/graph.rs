@@ -1286,7 +1286,7 @@ impl Braim {
                 .ok_or(format!("Error: Source ID {} not found", source_id))?;
             if src.node_type != NodeType::Source {
                 return Err(format!(
-                    "Error: Node ID {} is not a source entity (use 'braim source add' to create one)",
+                    "Error: Node ID {} is not a source entity (use 'braim sources add' to create one)",
                     source_id
                 ));
             }

@@ -509,7 +509,7 @@ SCENARIO 18 — first-class source entity registration
 ═══════════════════════════════════════════════════════════════
 
 Feature under test:
-  - `braim source add` with --type and --location
+  - `braim sources add` with --type and --location
   - node_type=source, source_type field, ingested_at auto-set
   - distinct source types for distinct document kinds
 
@@ -517,7 +517,7 @@ Expected targets: dedication plaque (doc), town annual report (doc or
 transcript), library catalog (doc or schema).
 
 PASS signal:
-  - At least 3 source entities created via `braim source add`
+  - At least 3 source entities created via `braim sources add`
   - `braim node <id>` for each shows node_type: source
   - source_type field is set and matches the document kind (doc for the
     plaque and annual report; doc or schema for the catalog — any
@@ -581,7 +581,7 @@ Pre-condition: two contested statements from scenario 19 (1995 vs 1998).
 
 PASS signal:
   - LLM first registers the photograph as a source entity via
-    `braim source add` (doc type), obtaining a source_id
+    `braim sources add` (doc type), obtaining a source_id
   - `braim statement add-source <1995_stmt_id> --source-id <photo_id>`
     called to attach it to the 1995 entry
   - After the call, `braim node <1995_stmt_id>` shows
@@ -592,7 +592,7 @@ PASS signal:
   - LLM reports the final state of both entries
 
 FAIL signal:
-  - LLM skips `braim source add` and attaches the photograph only as
+  - LLM skips `braim sources add` and attaches the photograph only as
     a --sources string (no source entity → Mechanism A cannot fire)
   - LLM uses `statement resolve-contradiction` manually instead of
     letting Mechanism A trigger (bypasses the auto-resolution path)
@@ -662,7 +662,7 @@ Pre-condition: the scratch markers/claims left by scenario 21.
 
 PASS signal:
   - The treasurer's ledger is registered as a source entity first
-    (`braim source add --type doc/transcript`) to obtain a source_id, then
+    (`braim sources add --type doc/transcript`) to obtain a source_id, then
     attached via `braim statement add-source <claim_id> --source-id <ledger_id>`
     (add-source rejects raw --sources strings). The ledger's PRIMARY type
     differs from the claim's existing primary type; afterwards
@@ -673,7 +673,7 @@ PASS signal:
   - The 2002 audit memo's conflict is recorded with `braim statement contradict`
     against the continuous-fee entry; both show contested immediately after
   - Resolution discipline: IF the session material contains a tiebreaker
-    PRIMARY source for one side, it is attached via `braim source add` +
+    PRIMARY source for one side, it is attached via `braim sources add` +
     `add-source --source-id` and Mechanism A auto-fires (loser becomes
     invalid_statement, contradicts edge resolved). IF no tiebreaker exists in
     the material — the as-shipped scenario provides none for the fee conflict —

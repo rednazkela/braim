@@ -106,7 +106,7 @@ fn scoped_resolution_end_to_end() {
     let before_s2 = before["nodes"][s2.to_string()].clone();
 
     // D2: corroborate s1 with a third PRIMARY source (source entity ID 5).
-    let (ok, _, out) = braim(dir, &["source", "add", "spec confirming the gate",
+    let (ok, _, out) = braim(dir, &["sources", "add", "spec confirming the gate",
         "--type", "doc", "--location", "doc:spec.md:12"]);
     assert!(ok, "{}", out);
     let source_id = 5u32;

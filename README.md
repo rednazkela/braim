@@ -102,7 +102,7 @@ braim statement add "Payment requires Invoice" \
 
 ```bash
 braim statement verify-suggest 42          # PRIMARY-typed candidate sources for a claim
-braim source add "Treasurer ledger 1995" --type doc \
+braim sources add "Treasurer ledger 1995" --type doc \
   --location "doc:treasurer_ledger_1995.pdf:7"          # → source entity ID:N
 braim statement add-source 42 --source-id N             # attach; recomputes status
 braim statement delete-source 42 --source-id N          # detach; recomputes status (can demote)
@@ -111,7 +111,7 @@ braim statement update-sources 42 --remove "doc:spec.md:5" --add "doc:spec.md:12
                                                          # no broken depends_on/because_of/contradicts edges
 ```
 
-@[A source entity referenced by multiple statements counts once for PRIMARY diversity] source: braim source add --help
+@[A source entity referenced by multiple statements counts once for PRIMARY diversity] source: braim sources add --help
 
 @[delete-source and update-sources leave invalid and contested statements untouched — those states come from invalidation/contradiction, not source diversity, so editing sources there does not revive or alter status] source: code:src/graph.rs delete_source_from_statement, update_statement_sources
 
