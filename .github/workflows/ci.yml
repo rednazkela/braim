@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same three platforms the release matrix ships, so a break is caught
+        # on the PR rather than at tag time. Windows and macOS build natively:
+        # the embeddings feature links ONNX Runtime binaries that `ort` fetches
+        # per host, which a Linux cross-build cannot supply (braim ID:267).
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+  # The dependency-light build is a supported configuration, so it must not rot.
+  # Linux only — this checks that the feature gating still compiles, not platform
+  # behaviour, which the matrix above already covers.
+  no-default-features:
+    name: build without embeddings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --no-default-features
+      - run: cargo test --release --locked --no-default-features

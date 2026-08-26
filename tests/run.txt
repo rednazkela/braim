@@ -49,13 +49,18 @@ Run order:        01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08
                   -> 09 -> 10 -> 11 -> 12 -> 13 -> 14 -> 15 -> 16
                   -> 17 -> 18 -> 19 -> 20 -> 21 -> 22 -> 23
                   -> 24 -> 25 -> 26 -> 27 -> 28 -> 29 -> 30
+                  -> 31 -> 32 -> 33 -> 34
                   (09-20 build on the cumulative graph from 01-08;
                    21-23 validate the agent-integration policies;
                    24-26 validate the evidence-discipline traits; 25 builds
                    on 24's appendix nodes — keep the order;
                    27-30 cover the because_of causal edge / Five Whys
                    commands and are blind like 01-20; 28-30 build on the
-                   causal chain scenario 27 records — keep the order)
+                   causal chain scenario 27 records — keep the order;
+                   31-34 cover the dream commands and are blind like 01-20
+                   and 27-30; 32 relaxes a constraint from the chain 27-30
+                   built, 33 reviews the item 32 flags, and 34 settles the
+                   pair 31 records — keep the order)
 
 Do NOT pass:
   - the contents of oracle.txt
@@ -64,9 +69,9 @@ Do NOT pass:
   - any reference to a parent test framework, post-mortem, or audit harness
 
 POLICY SCENARIOS (21-23) — DIFFERENCE FROM 01-20
-  Scenarios 01-20 and 27-30 keep the agent blind to the feature under test. Scenarios
-  21-23 test agent-integration POLICIES, so the agent IS given its operating
-  policy — it reads policies/perturn_logging.json (21, 22) or
+  Scenarios 01-20, 27-30, and 31-34 keep the agent blind to the feature under
+  test. Scenarios 21-23 test agent-integration POLICIES, so the agent IS given
+  its operating policy — it reads policies/perturn_logging.json (21, 22) or
   policies/compaction_rule.txt (23) as instructed in the scenario. The agent
   is still blind to oracle.txt and to the PASS thresholds. In deployment these
   policies arrive via Claude Code UserPromptSubmit / PreCompact hooks; in the

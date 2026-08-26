@@ -1,8 +1,116 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use chrono::Utc;
+
+/// Cross-process exclusive write lock over one data dir.
+///
+/// Every braim mutation is a read-modify-write cycle spanning the whole process:
+/// `Braim::new` loads the graph, the command mutates memory, `flush` rewrites the
+/// files. Without a lock, concurrent writers clobber each other — measured, not
+/// theorised: six simultaneous exports into one central lost two contributions
+/// outright, and six simultaneous `version save` runs recorded four of six index
+/// entries (braim ID:250). Writers hold this from BEFORE the load until the
+/// process exits; readers never take it and rely on atomic renames instead, so
+/// queries and the viewer stay non-blocking.
+///
+/// Built on `create_new` rather than an OS advisory lock to stay dependency-free
+/// and behave identically on Linux, macOS, and Windows.
+pub struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// A lock file older than this is assumed abandoned by a crashed process.
+    const STALE_AFTER: Duration = Duration::from_secs(60);
+    /// How long a writer waits for a peer before giving up with a clear error.
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    pub fn acquire(dir: &Path) -> Result<FileLock, String> {
+        let path = dir.join(".braim.lock");
+        let start = Instant::now();
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(FileLock { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().map(|age| age > Self::STALE_AFTER).unwrap_or(false))
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > Self::WAIT_TIMEOUT {
+                        return Err(format!(
+                            "Error: timed out after {}s waiting for the write lock at {}. \
+                             Another braim process is writing to this graph; if none is running, \
+                             delete that file.",
+                            Self::WAIT_TIMEOUT.as_secs(),
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("Failed to acquire write lock: {}", e)),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Monotonic counter bumped after a sharded write completes. Atomic renames make
+/// each shard file individually sound, but a sharded update touches MANY files,
+/// so a lock-free reader can otherwise merge shard A's new state with shard B's
+/// old one — observed in practice as dangling cross-domain references
+/// (tests/concurrency.rs::readers_never_observe_an_inconsistent_shard_set).
+/// Paired with the writer's lock file this forms a seqlock: see `load_sharded`.
+fn seq_path(dir: &Path) -> PathBuf {
+    dir.join(".braim.seq")
+}
+
+fn read_seq(dir: &Path) -> u64 {
+    fs::read_to_string(seq_path(dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Bumped only AFTER every file of an update has landed, so a reader seeing an
+/// unchanged sequence across its read knows no write completed inside it.
+fn bump_seq(dir: &Path) -> Result<(), String> {
+    let next = read_seq(dir).wrapping_add(1);
+    write_atomic(&seq_path(dir), &next.to_string())
+}
+
+fn writer_active(dir: &Path) -> bool {
+    dir.join(".braim.lock").exists()
+}
+
+/// Write a file atomically: fill a temp sibling, then rename over the target.
+/// `fs::write` truncates before writing, so a concurrent reader can observe an
+/// empty or half-written graph; rename is atomic on POSIX and replaces on
+/// Windows, so readers only ever see a complete prior or new state.
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, content)
+        .map_err(|e| format!("Failed to write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to replace {}: {}", path.display(), e)
+    })
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -128,8 +236,19 @@ impl VerificationStatus {
         }
     }
 
-    /// Canonical rank for inheritance capping per
-    /// BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.1.
+    /// Canonical rank per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.1.
+    ///
+    /// This is a *total ordering* over statuses, used for comparisons like
+    /// "is this at least Proven". It is NOT a support ladder: `Invalid` means
+    /// refuted (evidence contradicts the statement) while `Unproven` means
+    /// unsupported (nothing establishes it yet). Those are different claims on
+    /// different axes, and only the second is a support level.
+    ///
+    /// Consequence: `Invalid` MUST NOT participate in dependency capping. A
+    /// refuted dependency is excluded from the cap set (§3.3.2), never floored
+    /// into it — otherwise `min` yields rank 0 and a dependent that merely lost
+    /// support is recorded as refuted. Cap sites use `from_cap_rank`, which
+    /// cannot return `Invalid`.
     pub fn rank(&self) -> u8 {
         match self {
             VerificationStatus::Invalid => 0,
@@ -152,6 +271,26 @@ impl VerificationStatus {
             4 => VerificationStatus::Proven,
             _ => VerificationStatus::ProvenStrong,
         }
+    }
+
+    /// `from_rank` for dependency-cap results, per §3.1 and §3.3.2.
+    ///
+    /// Refutation is direct-evidence-only and never inherited, so a cap can
+    /// never produce `Invalid`. Rank 0 clamps to `Unproven`: a statement whose
+    /// support was withdrawn is unsupported, not false. This is the single
+    /// enforcement point for that invariant — cap sites call this, never
+    /// `from_rank`.
+    pub fn from_cap_rank(rank: u8) -> VerificationStatus {
+        match Self::from_rank(rank) {
+            VerificationStatus::Invalid => VerificationStatus::Unproven,
+            s => s,
+        }
+    }
+
+    /// True when this status records refutation by direct evidence, as opposed
+    /// to any level of (missing) support.
+    pub fn is_refuted(&self) -> bool {
+        matches!(self, VerificationStatus::Invalid)
     }
 }
 
@@ -225,7 +364,10 @@ impl From<GraphError> for String {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Node {
     pub id: u32,
+    /// Defaulted: pre-domains graphs (May 2026 era) lack the field entirely.
+    #[serde(default)]
     pub domains: Vec<String>,
+    #[serde(default)]
     pub sources: Vec<String>,
     pub node_type: NodeType,
     pub label: String,
@@ -280,6 +422,14 @@ pub struct ContradictEdge {
     pub resolved: bool,
     pub resolution_source: Option<u32>,
     pub resolution_winner: Option<u32>,
+    /// Distinguishes a winner/loser resolution ("winner") from a scoped one
+    /// ("scoped") where both statements stand untouched (braim-contradiction-
+    /// scoped-resolution.md). `#[serde(default)]` keeps pre-existing
+    /// current.json files loadable.
+    #[serde(default)]
+    pub resolution_kind: Option<String>,
+    #[serde(default)]
+    pub resolution_reason: Option<String>,
 }
 
 /// Directional causal edge: `from occurs because_of to` (consequent → cause).
@@ -321,6 +471,30 @@ pub struct GraphState {
     pub contradicts: Vec<ContradictEdge>,
     #[serde(default)]
     pub because_of: Vec<BecauseOfEdge>,
+}
+
+/// One checkpoint in the sharded layout's versions.json index. Instead of a
+/// whole-graph clone, it records WHICH per-domain snapshot each domain was at —
+/// the domain snapshot file (domains/<name>-<hash>.v<NNNN>.json) is the pin
+/// artifact the mount manifest's pinned_version references (braim ID:214/242).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ShardedVersionEntry {
+    pub version: u32,
+    pub description: String,
+    pub saved_at: String,
+    pub node_count: usize,
+    /// domain → that domain's snapshot version at this checkpoint
+    pub domain_versions: HashMap<String, u32>,
+    /// version of the cross-domain header snapshot (graph.v<NNNN>.json)
+    pub header_version: u32,
+}
+
+/// Layout-agnostic version summary for listings.
+pub struct VersionInfo {
+    pub version: u32,
+    pub description: String,
+    pub saved_at: String,
+    pub node_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -407,16 +581,46 @@ pub struct DuplicateRecord {
 
 #[derive(Clone, Debug)]
 pub struct AddSourceResult {
-    pub auto_resolved: bool,
-    pub winner_id: Option<u32>,
-    pub loser_id: Option<u32>,
-    pub winner_status: Option<VerificationStatus>,
+    /// Set when this add-source call reached a third PRIMARY type on a
+    /// statement with a live, unresolved `contradicts` edge — Mechanism A's
+    /// corroboration signal. Carries the other (uncorroborated) statement's
+    /// id. Report-only: neither statement is mutated (braim-contradiction-
+    /// scoped-resolution.md) — settling the contradiction needs an explicit
+    /// `resolve-contradiction --winner|--both-stand` call.
+    pub corroborated_with: Option<u32>,
+}
+
+/// What a merge_nodes call did, so the caller can report it honestly.
+pub struct MergeOutcome {
+    pub winner: u32,
+    pub loser: u32,
+    /// Source strings + source entities the winner gained from the loser.
+    pub sources_added: usize,
+    pub referents_rewired: usize,
+    pub edges_rewired: usize,
+    pub new_status: VerificationStatus,
+    /// Dependencies the loser had and the winner does not. NOT merged — that
+    /// would rewrite what the surviving statement asserts — so they surface here
+    /// for a human to decide about.
+    pub dep_differences: Vec<u32>,
 }
 
 pub struct ImportManifest {
+    /// Full-fidelity mode only: source entities imported.
+    pub sources_imported: usize,
+    /// Full-fidelity mode only: because_of edges carried over.
+    pub because_of_imported: usize,
+    /// Full-fidelity mode only: contradicts edges carried over.
+    pub contradicts_imported: usize,
+    /// Full-fidelity mode only: dedup hits whose sources were unioned into the target.
+    pub sources_unioned: usize,
     pub imported_count: usize,
     pub deduplicated_count: usize,
     pub skipped_count: usize,
+    /// Counterfactual hypotheses refused at the boundary, plus anything resting
+    /// on them. Reported rather than silently dropped: a quarantine nobody sees
+    /// is indistinguishable from a bug.
+    pub counterfactuals_refused: usize,
     pub id_mappings: HashMap<u32, u32>,
     pub duplicates: Vec<DuplicateRecord>,
 }
@@ -434,6 +638,10 @@ pub struct Braim {
     /// which (with the visited-set) bounds traversal to O(V+E) and fixes the
     /// high-fan-out query hang.
     pub dependents: HashMap<u32, Vec<(u32, f64)>>,
+    /// Held for the process lifetime by instances opened via `open_for_write`,
+    /// serialising this graph's read-modify-write cycle against other processes.
+    /// `None` on read-only instances, which never block and never write.
+    write_lock: Option<FileLock>,
 }
 
 /// Canonical list of PRIMARY-tier source type prefix names.
@@ -764,12 +972,17 @@ impl Braim {
                         if !dep.node_type.is_statement_family() {
                             continue;
                         }
+                        // §3.3.2 — refuted deps are excluded from the cap set,
+                        // never floored into it.
+                        if dep.invalid || dep.verification_status.is_refuted() {
+                            continue;
+                        }
                         let r = dep.verification_status.rank();
                         cap = Some(cap.map_or(r, |p: u8| p.min(r)));
                     }
                 }
                 match cap {
-                    Some(c) if source_derived.rank() > c => VerificationStatus::from_rank(c),
+                    Some(c) if source_derived.rank() > c => VerificationStatus::from_cap_rank(c),
                     _ => source_derived,
                 }
             };
@@ -843,11 +1056,17 @@ impl Braim {
     }
 
     pub fn new(data_dir: &str) -> Result<Self, String> {
+        Self::load_from(data_dir, false)
+    }
+
+    fn load_from(data_dir: &str, holds_lock: bool) -> Result<Self, String> {
         let path = PathBuf::from(data_dir);
         fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
 
         let current_path = path.join("current.json");
-        let mut state: GraphState = if current_path.exists() {
+        let mut state: GraphState = if path.join("domains").is_dir() {
+            Self::load_sharded(&path, holds_lock)?
+        } else if current_path.exists() {
             let content = fs::read_to_string(&current_path)
                 .map_err(|e| format!("Failed to read current.json: {}", e))?;
             serde_json::from_str(&content)
@@ -901,7 +1120,21 @@ impl Braim {
             state,
             legacy_node_types_migrated: legacy_count,
             dependents,
+            write_lock: None,
         })
+    }
+
+    /// Open for mutation: take the cross-process write lock BEFORE loading, and
+    /// hold it until this instance is dropped. Acquiring first is the whole
+    /// point — a lock taken after the load would leave the read half of the
+    /// read-modify-write cycle unprotected and still lose updates (braim ID:250).
+    pub fn open_for_write(data_dir: &str) -> Result<Self, String> {
+        let path = PathBuf::from(data_dir);
+        fs::create_dir_all(&path).map_err(|e| format!("Failed to create data dir: {}", e))?;
+        let lock = FileLock::acquire(&path)?;
+        let mut braim = Self::load_from(data_dir, true)?;
+        braim.write_lock = Some(lock);
+        Ok(braim)
     }
 
     /// dependents[X] = (node_id, weight) for every ACTIVE node whose
@@ -1053,7 +1286,7 @@ impl Braim {
                 .ok_or(format!("Error: Source ID {} not found", source_id))?;
             if src.node_type != NodeType::Source {
                 return Err(format!(
-                    "Error: Node ID {} is not a source entity (use 'braim source add' to create one)",
+                    "Error: Node ID {} is not a source entity (use 'braim sources add' to create one)",
                     source_id
                 ));
             }
@@ -1080,7 +1313,18 @@ impl Braim {
         let is_contested = self.state.nodes[&statement_id].verification_status
             == VerificationStatus::Contested;
 
-        // Check for Mechanism A auto-resolution
+        // Mechanism A: report-only corroboration signal. A statement reaching
+        // a third PRIMARY type while a `contradicts` edge against it is still
+        // live and unresolved is corroboration, not adjudication — it used to
+        // auto-invalidate the other side here, but accumulating unrelated
+        // evidence for one side is not evidence the contradiction itself was
+        // examined (braim-contradiction-scoped-resolution.md, the 179/235
+        // case). Settling it now always requires an explicit
+        // `resolve-contradiction --winner|--both-stand` call; this branch only
+        // detects and reports the corroboration, and neither statement is
+        // mutated (both stay contested — matches the locked-state handling
+        // in `delete_source_from_statement`/`update_statement_sources`).
+        let mut corroborated_with: Option<u32> = None;
         if is_contested && source_is_primary {
             let edge_idx = self.state.contradicts.iter().position(|e| {
                 !e.resolved && (e.from == statement_id || e.to == statement_id)
@@ -1095,58 +1339,7 @@ impl Braim {
                     .unwrap_or(false);
 
                 if !other_has_source {
-                    let winner_status = {
-                        let stmt = self.state.nodes.get(&statement_id).unwrap();
-                        let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
-                        Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
-                    };
-                    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    {
-                        let winner = self.state.nodes.get_mut(&statement_id).unwrap();
-                        winner.verification_status = winner_status;
-                        winner.node_type = NodeType::from_verification_status(winner_status);
-                        winner.pre_contested_status = None;
-                    }
-                    {
-                        let loser = self.state.nodes.get_mut(&other_id).unwrap();
-                        loser.verification_status = VerificationStatus::Invalid;
-                        loser.node_type = NodeType::InvalidStatement;
-                        loser.invalid = true;
-                        loser.invalid_reason = Some(format!(
-                            "contested_resolved_against_by_source_{}", source_id
-                        ));
-                        loser.invalidated_at = Some(now.clone());
-                        loser.pre_contested_status = None;
-                    }
-                    {
-                        let edge = &mut self.state.contradicts[idx];
-                        edge.resolved = true;
-                        edge.resolution_winner = Some(statement_id);
-                        edge.resolution_source = Some(source_id);
-                    }
-                    let cascade_ids: Vec<u32> = self.find_cascade_nodes(other_id)
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect();
-                    for dep_id in cascade_ids {
-                        if let Some(dep) = self.state.nodes.get_mut(&dep_id) {
-                            if dep.invalid || dep.verification_status == VerificationStatus::Invalid {
-                                continue;
-                            }
-                            dep.invalid = true;
-                            dep.invalid_reason = Some(format!("depends_on_invalidated:{}", other_id));
-                            dep.invalidated_at = Some(now.clone());
-                            dep.verification_status = VerificationStatus::Invalid;
-                            dep.node_type = NodeType::InvalidStatement;
-                        }
-                    }
-                    self.flush()?;
-                    return Ok(AddSourceResult {
-                        auto_resolved: true,
-                        winner_id: Some(statement_id),
-                        loser_id: Some(other_id),
-                        winner_status: Some(winner_status),
-                    });
+                    corroborated_with = Some(other_id);
                 }
             }
         }
@@ -1164,12 +1357,153 @@ impl Braim {
         }
 
         self.flush()?;
-        Ok(AddSourceResult {
-            auto_resolved: false,
-            winner_id: None,
-            loser_id: None,
-            winner_status: None,
-        })
+        Ok(AddSourceResult { corroborated_with })
+    }
+
+    /// Detach a source entity from a statement (the inverse of `add_source_to_statement`).
+    ///
+    /// Invalid and contested statements keep their status untouched — those
+    /// states are governed by invalidation/contradiction, not raw source
+    /// diversity, so removing a source must not silently revive or alter them.
+    pub fn delete_source_from_statement(
+        &mut self,
+        statement_id: u32,
+        source_id: u32,
+    ) -> Result<VerificationStatus, String> {
+        {
+            let stmt = self.state.nodes.get(&statement_id)
+                .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+            if !stmt.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", statement_id));
+            }
+            if !stmt.source_ids.contains(&source_id) {
+                return Err(format!("Error: Source ID {} is not attached to statement ID {}", source_id, statement_id));
+            }
+        }
+
+        {
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.source_ids.retain(|&id| id != source_id);
+        }
+
+        let locked = matches!(
+            self.state.nodes[&statement_id].verification_status,
+            VerificationStatus::Invalid | VerificationStatus::Contested
+        );
+
+        let new_status = if locked {
+            self.state.nodes[&statement_id].verification_status
+        } else {
+            let status = {
+                let stmt = &self.state.nodes[&statement_id];
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+            };
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.verification_status = status;
+            stmt.node_type = NodeType::from_verification_status(status);
+            status
+        };
+
+        self.flush()?;
+        Ok(new_status)
+    }
+
+    /// Computes what a statement's string sources would become after
+    /// add/remove/set, without mutating the graph. Shared by the CLI's
+    /// strict-sources preview (duplicate / PRIMARY+TERTIARY checks before the
+    /// real write) and `update_statement_sources`'s own mutation, so the two
+    /// can never compute a different resulting list.
+    pub fn preview_statement_sources(
+        &self,
+        node_id: u32,
+        add: Option<&[String]>,
+        remove: Option<&[String]>,
+        set: Option<&[String]>,
+    ) -> Result<Vec<String>, String> {
+        let stmt = self.state.nodes.get(&node_id)
+            .ok_or(format!("Error: Node ID {} does not exist", node_id))?;
+        if !stmt.node_type.is_statement_family() {
+            return Err(format!(
+                "Error: Node ID {} is not a statement (node_type: {:?})",
+                node_id, stmt.node_type
+            ));
+        }
+
+        if let Some(set_sources) = set {
+            for s in set_sources {
+                Self::validate_source_prefix(s)?;
+            }
+            return Ok(set_sources.to_vec());
+        }
+
+        let mut sources = stmt.sources.clone();
+        if let Some(to_remove) = remove {
+            for s in to_remove {
+                let pos = sources.iter().position(|existing| existing == s).ok_or_else(|| {
+                    format!("Error: source '{}' is not a current source of statement ID {}", s, node_id)
+                })?;
+                sources.remove(pos);
+            }
+        }
+        if let Some(to_add) = add {
+            for s in to_add {
+                Self::validate_source_prefix(s)?;
+            }
+            sources.extend(to_add.iter().cloned());
+        }
+        Ok(sources)
+    }
+
+    /// Add, remove, or replace a statement's string sources in place,
+    /// preserving its ID and every depends_on/because_of/contradicts edge
+    /// referencing it — the alternative (delete + re-add) breaks all three.
+    ///
+    /// Locked-state handling mirrors `delete_source_from_statement`: Invalid
+    /// and Contested statements keep the mutation, but the verification
+    /// recompute is skipped, since those states come from
+    /// invalidation/contradiction, not source diversity.
+    pub fn update_statement_sources(
+        &mut self,
+        node_id: u32,
+        add: Option<Vec<String>>,
+        remove: Option<Vec<String>>,
+        set: Option<Vec<String>>,
+    ) -> Result<Vec<String>, String> {
+        let new_sources = self.preview_statement_sources(
+            node_id, add.as_deref(), remove.as_deref(), set.as_deref(),
+        )?;
+
+        let has_entities = !self.state.nodes[&node_id].source_ids.is_empty();
+        if new_sources.is_empty() && !has_entities {
+            return Err(format!(
+                "Error: refusing to leave statement ID {} with zero sources (zero string sources and zero attached source entities)",
+                node_id
+            ));
+        }
+
+        {
+            let stmt = self.state.nodes.get_mut(&node_id).unwrap();
+            stmt.sources = new_sources.clone();
+        }
+
+        let locked = matches!(
+            self.state.nodes[&node_id].verification_status,
+            VerificationStatus::Invalid | VerificationStatus::Contested
+        );
+        if !locked {
+            let status = {
+                let stmt = &self.state.nodes[&node_id];
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+            };
+            let stmt = self.state.nodes.get_mut(&node_id).unwrap();
+            stmt.verification_status = status;
+            stmt.node_type = NodeType::from_verification_status(status);
+        }
+
+        self.flush()?;
+        Ok(new_sources)
     }
 
     pub fn contradict_statements(
@@ -1211,6 +1545,8 @@ impl Braim {
             resolved: false,
             resolution_source: None,
             resolution_winner: None,
+            resolution_kind: None,
+            resolution_reason: None,
         });
         // Move both to contested, preserving pre_contested_status
         for &id in &[from, to] {
@@ -1271,24 +1607,46 @@ impl Braim {
         edge.resolved = true;
         edge.resolution_winner = Some(winner_id);
         edge.resolution_source = source_id;
+        edge.resolution_kind = Some("winner".to_string());
+        edge.resolution_reason = Some(reason.to_string());
 
-        // Cascade-invalidate loser dependents
-        let cascade_ids: Vec<u32> = self.find_cascade_nodes(loser_id)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        for dep_id in cascade_ids {
-            if let Some(dep_node) = self.state.nodes.get_mut(&dep_id) {
-                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
-                    continue;
-                }
-                dep_node.invalid = true;
-                dep_node.invalid_reason = Some(format!("depends_on_invalidated:{}", loser_id));
-                dep_node.invalidated_at = Some(now.clone());
-                dep_node.verification_status = VerificationStatus::Invalid;
-                dep_node.node_type = NodeType::InvalidStatement;
-            }
+        // §3.3.3 — recompute the loser's dependents rather than refuting them.
+        // The winner was promoted above and this pass cannot undo it (§3.3.5),
+        // which is the ID:1016 regression: the winner transitively depended on
+        // the loser and the old cascade invalidated its own resolution.
+        self.recompute_after_refutation(loser_id, &now);
+
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Resolves a contradiction without picking a side: both statements are
+    /// true, just scoped to different conditions (braim-contradiction-scoped-
+    /// resolution.md, the 179/235 case). Neither statement's
+    /// verification_status, node_type, nor dependents are touched — that is
+    /// the load-bearing difference from `resolve_contradiction`'s --winner
+    /// path, which is why this is a separate method rather than a branch that
+    /// shares its mutation of the statements.
+    pub fn resolve_contradiction_both_stand(
+        &mut self,
+        stmt_a: u32,
+        stmt_b: u32,
+        reason: &str,
+    ) -> Result<(), String> {
+        for &id in &[stmt_a, stmt_b] {
+            self.state.nodes.get(&id)
+                .ok_or(format!("Error: Statement ID {} not found", id))?;
         }
+        let edge_idx = self.state.contradicts.iter().position(|e| {
+            !e.resolved
+                && ((e.from == stmt_a && e.to == stmt_b)
+                    || (e.from == stmt_b && e.to == stmt_a))
+        }).ok_or("Error: no active contradiction edge between these statements".to_string())?;
+
+        let edge = &mut self.state.contradicts[edge_idx];
+        edge.resolved = true;
+        edge.resolution_kind = Some("scoped".to_string());
+        edge.resolution_reason = Some(reason.to_string());
 
         self.flush()?;
         Ok(())
@@ -1610,11 +1968,402 @@ impl Braim {
         }
     }
 
-    fn flush(&mut self) -> Result<(), String> {
-        let path = self.data_dir.join("current.json");
-        let content = serde_json::to_string_pretty(&self.state)
+    /// Home domain of a node in sharded layout: first entry of its domains list.
+    /// Nodes without domains (e.g. source entities) shard to "_unassigned".
+    fn home_domain(node: &Node) -> String {
+        node.domains.first().cloned().unwrap_or_else(|| "_unassigned".to_string())
+    }
+
+    /// Deterministic, filesystem-safe shard filename for a domain. Lowercases and
+    /// replaces non-alphanumerics — but distinct domains may then collide (real
+    /// case: "Billing" vs "billing", which also collide RAW on case-insensitive
+    /// filesystems, braim ID:225/236). Every name therefore carries a short FNV-1a
+    /// hash of the exact domain string, making files unique per distinct domain
+    /// on every platform while staying human-readable.
+    fn shard_filename(domain: &str) -> String {
+        let mut sanitized: String = domain.to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if sanitized.len() > 60 {
+            sanitized.truncate(60);
+        }
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in domain.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{}-{:08x}.json", sanitized, (hash >> 32) as u32 ^ hash as u32)
+    }
+
+    /// Load the sharded layout: graph.json (cross-domain state) + every
+    /// domains/*.json (per-domain node maps) merged into one in-memory view
+    /// (braim ID:217). A node id appearing in two shard files is corruption.
+    /// Seqlock read: retry until the shard set is provably free of a concurrent
+    /// update. A write is detected if the writer's lock was present at either
+    /// end of our read, or if the completion sequence moved during it — which
+    /// together cover a writer that starts before, during, or wholly inside the
+    /// read. Readers never take the lock, so queries and the viewer stay
+    /// non-blocking.
+    /// `holds_lock` is set by writers, which already have exclusive access — for
+    /// them a plain read is correct, and running the seqlock would make them spin
+    /// against their own lock file until timeout.
+    fn load_sharded(path: &PathBuf, holds_lock: bool) -> Result<GraphState, String> {
+        if holds_lock {
+            return Self::load_sharded_once(path);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let seq_before = read_seq(path);
+            if !writer_active(path) {
+                let attempt = Self::load_sharded_once(path)?;
+                if !writer_active(path) && read_seq(path) == seq_before {
+                    return Ok(attempt);
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Starvation fallback: under sustained writes a lock-free reader may never
+        // find a quiet window, so take the writer lock briefly to force one.
+        // Guarantees progress; costs a short wait only on a saturated graph.
+        let _guard = FileLock::acquire(path)?;
+        Self::load_sharded_once(path)
+    }
+
+    fn load_sharded_once(path: &PathBuf) -> Result<GraphState, String> {
+        let header_path = path.join("graph.json");
+        let mut state: GraphState = if header_path.exists() {
+            let content = fs::read_to_string(&header_path)
+                .map_err(|e| format!("Failed to read graph.json: {}", e))?;
+            serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse graph.json: {}", e))?
+        } else {
+            return Err("Error: sharded layout (domains/ exists) but graph.json is missing".to_string());
+        };
+
+        let dir = fs::read_dir(path.join("domains"))
+            .map_err(|e| format!("Failed to read domains dir: {}", e))?;
+        let mut files: Vec<PathBuf> = dir
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            // Current shards only — versioned snapshots (*.vNNNN.json) are the
+            // immutable pin artifacts, not part of the working view.
+            .filter(|p| {
+                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                !name.rsplit_once(".v")
+                    .map(|(_, tail)| tail.trim_end_matches(".json").chars().all(|c| c.is_ascii_digit())
+                        && tail.ends_with(".json"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+
+        for file in files {
+            let content = fs::read_to_string(&file)
+                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+            let shard: HashMap<u32, Node> = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse {}: {}", file.display(), e))?;
+            for (id, node) in shard {
+                if state.nodes.insert(id, node).is_some() {
+                    return Err(format!(
+                        "Error: node ID {} appears in more than one domain shard ({}) — corrupt layout",
+                        id, file.display()
+                    ));
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    /// Persist the sharded layout: nodes split by home domain into
+    /// domains/<name>-<hash>.json, everything else into graph.json. Shard files
+    /// whose domain no longer has nodes are removed (node deleted or re-homed).
+    fn flush_sharded(&self) -> Result<(), String> {
+        let domains_dir = self.data_dir.join("domains");
+        fs::create_dir_all(&domains_dir).map_err(|e| format!("Failed to create domains dir: {}", e))?;
+
+        let mut shards: HashMap<String, HashMap<u32, Node>> = HashMap::new();
+        for (id, node) in &self.state.nodes {
+            shards.entry(Self::home_domain(node)).or_default().insert(*id, node.clone());
+        }
+
+        let mut live_files: HashSet<String> = HashSet::new();
+        for (domain, nodes) in &shards {
+            let filename = Self::shard_filename(domain);
+            let content = Self::canonical_json(nodes)?;
+            write_atomic(&domains_dir.join(&filename), &content)
+                .map_err(|e| format!("Failed to write shard {}: {}", filename, e))?;
+            live_files.insert(filename);
+        }
+
+        // Remove CURRENT shard files for domains that no longer own any node.
+        // Versioned snapshots (*.vNNNN.json) are immutable pin artifacts
+        // (ID:214/242) and are never pruned.
+        if let Ok(dir) = fs::read_dir(&domains_dir) {
+            for entry in dir.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_snapshot = name.rsplit_once(".v")
+                    .map(|(_, tail)| tail.trim_end_matches(".json").chars().all(|c| c.is_ascii_digit())
+                        && tail.ends_with(".json"))
+                    .unwrap_or(false);
+                if name.ends_with(".json") && !is_snapshot && !live_files.contains(&name) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        let header = GraphState {
+            nodes: HashMap::new(),
+            dictionary: self.state.dictionary.clone(),
+            id_to_domain: self.state.id_to_domain.clone(),
+            gaps: self.state.gaps.clone(),
+            next_id: self.state.next_id,
+            version: self.state.version,
+            contradicts: self.state.contradicts.clone(),
+            because_of: self.state.because_of.clone(),
+        };
+        let content = Self::canonical_json(&header)?;
+        write_atomic(&self.data_dir.join("graph.json"), &content)
+            .map_err(|e| format!("Failed to write graph.json: {}", e))?;
+        // Last: signals to lock-free readers that this multi-file update is whole.
+        bump_seq(&self.data_dir)?;
+        Ok(())
+    }
+
+    /// Fold `loser` into `winner`: union the evidence, move every reference, drop
+    /// the duplicate. This is the union-merge the corroboration model assumes
+    /// (braim ID:190/248) — before it existed the only route was update-deps plus
+    /// delete, which threw the loser's sources away, the exact anti-pattern the
+    /// import-union fix removed.
+    ///
+    /// Deliberately does NOT merge the loser's own dependencies into the winner:
+    /// that would silently rewrite what the surviving statement asserts. Any
+    /// difference is reported for a human to act on instead.
+    pub fn merge_nodes(&mut self, winner: u32, loser: u32) -> Result<MergeOutcome, String> {
+        if winner == loser {
+            return Err("Error: winner and loser are the same node".to_string());
+        }
+        let (w_node, l_node) = {
+            let w = self.state.nodes.get(&winner)
+                .ok_or(format!("Error: node ID {} not found", winner))?;
+            let l = self.state.nodes.get(&loser)
+                .ok_or(format!("Error: node ID {} not found", loser))?;
+            (w.clone(), l.clone())
+        };
+
+        // A refuted node's evidence must never be folded into a live one.
+        for (id, n) in [(winner, &w_node), (loser, &l_node)] {
+            if n.invalid || n.verification_status == VerificationStatus::Invalid {
+                return Err(format!(
+                    "Error: node ID {} is invalid — merging would launder refuted evidence into a live node",
+                    id
+                ));
+            }
+        }
+        // Statements and concepts are different kinds of thing.
+        if w_node.node_type.is_statement_family() != l_node.node_type.is_statement_family() {
+            return Err(format!(
+                "Error: cannot merge across kinds — ID:{} is a {:?} and ID:{} is a {:?}",
+                winner, w_node.node_type, loser, l_node.node_type
+            ));
+        }
+        // Either direction of dependency between the two means they are not
+        // duplicates, and folding them would create a self-loop.
+        if w_node.depends_on.contains_key(&loser) || l_node.depends_on.contains_key(&winner) {
+            return Err(format!(
+                "Error: ID:{} and ID:{} depend on each other — related nodes, not duplicates",
+                winner, loser
+            ));
+        }
+
+        // 1. Union the evidence. Source-entity ids are already local here, so the
+        //    remap is the identity.
+        let identity: HashMap<u32, u32> = l_node.source_ids.iter().map(|s| (*s, *s)).collect();
+        let before = self.state.nodes[&winner].sources.len()
+            + self.state.nodes[&winner].source_ids.len();
+        self.union_sources_into(winner, &l_node, &identity);
+        let sources_added = self.state.nodes[&winner].sources.len()
+            + self.state.nodes[&winner].source_ids.len()
+            - before;
+
+        // 2. Move every reference. Weights SUM, which preserves the 1.0 invariant
+        //    for a referent that depended on both.
+        let mut referents_rewired = 0;
+        let referent_ids: Vec<u32> = self.state.nodes.iter()
+            .filter(|(id, n)| **id != loser && n.depends_on.contains_key(&loser))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in referent_ids {
+            let node = self.state.nodes.get_mut(&id).unwrap();
+            if let Some(w) = node.depends_on.remove(&loser) {
+                *node.depends_on.entry(winner).or_insert(0.0) += w;
+                referents_rewired += 1;
+            }
+        }
+
+        // 3. Move relationship edges, dropping self-edges and duplicates.
+        let mut edges_rewired = 0;
+        for e in self.state.because_of.iter_mut() {
+            if e.from == loser { e.from = winner; edges_rewired += 1; }
+            if e.to == loser { e.to = winner; edges_rewired += 1; }
+        }
+        self.state.because_of.retain(|e| e.from != e.to);
+        let mut seen = HashSet::new();
+        self.state.because_of.retain(|e| seen.insert((e.from, e.to)));
+
+        for e in self.state.contradicts.iter_mut() {
+            if e.from == loser { e.from = winner; edges_rewired += 1; }
+            if e.to == loser { e.to = winner; edges_rewired += 1; }
+            if e.source_id == Some(loser) { e.source_id = Some(winner); }
+            if e.resolution_winner == Some(loser) { e.resolution_winner = Some(winner); }
+            if e.resolution_source == Some(loser) { e.resolution_source = Some(winner); }
+        }
+        self.state.contradicts.retain(|e| e.from != e.to);
+        let mut seen = HashSet::new();
+        self.state.contradicts.retain(|e| seen.insert((e.from, e.to)));
+
+        // 4. Gap register entries pointing at the loser now point at the winner.
+        for g in self.state.gaps.iter_mut() {
+            if g.concept_a == loser { g.concept_a = winner; }
+            if g.concept_b == loser { g.concept_b = winner; }
+        }
+        self.state.gaps.retain(|g| g.concept_a != g.concept_b);
+
+        // 5. Drop the loser from the label index.
+        for ids in self.state.dictionary.values_mut() {
+            ids.retain(|id| *id != loser);
+        }
+        self.state.dictionary.retain(|_, ids| !ids.is_empty());
+
+        // 6. Leave a trace: a merge is not a deletion, and the audit trail should
+        //    say where the winner's extra evidence came from.
+        let dep_differences: Vec<u32> = l_node.depends_on.keys()
+            .filter(|d| **d != winner && !w_node.depends_on.contains_key(d))
+            .copied()
+            .collect();
+        {
+            let w = self.state.nodes.get_mut(&winner).unwrap();
+            let prior = w.metadata.get("merged_from").cloned().unwrap_or_default();
+            let trace = if prior.is_empty() {
+                loser.to_string()
+            } else {
+                format!("{},{}", prior, loser)
+            };
+            w.metadata.insert("merged_from".to_string(), trace);
+        }
+
+        self.state.nodes.remove(&loser);
+
+        // 7. New evidence may promote the winner.
+        if self.state.nodes[&winner].node_type.is_statement_family() {
+            self.recompute_statement_status(winner);
+        }
+        self.dependents = Self::build_dependents(&self.state);
+        self.flush()?;
+
+        let mut dep_differences = dep_differences;
+        dep_differences.sort();
+        Ok(MergeOutcome {
+            winner,
+            loser,
+            sources_added,
+            referents_rewired,
+            edges_rewired,
+            new_status: self.state.nodes[&winner].verification_status,
+            dep_differences,
+        })
+    }
+
+    /// Rename a domain across the graph: every node carrying `old` in its domains
+    /// list gets `new` instead. In sharded layout the next flush re-homes the
+    /// affected nodes into the new domain's shard and prunes the old current
+    /// shard; existing versioned snapshots are immutable history and keep the
+    /// old name. Central-governance operation (braim ID:244): distinguishing a
+    /// rename from a merge is the caller's evidence-checked decision.
+    pub fn rename_domain(&mut self, old: &str, new: &str) -> Result<usize, String> {
+        if old == new {
+            return Err("Error: old and new domain names are identical".to_string());
+        }
+        let mut touched = 0;
+        for node in self.state.nodes.values_mut() {
+            let mut hit = false;
+            for d in node.domains.iter_mut() {
+                if d == old {
+                    *d = new.to_string();
+                    hit = true;
+                }
+            }
+            if hit {
+                // A node already carrying the new name would end up with a
+                // duplicate entry — collapse it.
+                let mut seen = HashSet::new();
+                node.domains.retain(|d| seen.insert(d.clone()));
+                touched += 1;
+            }
+        }
+        if touched == 0 {
+            return Err(format!("Error: no node carries domain '{}'", old));
+        }
+        for v in self.state.id_to_domain.values_mut() {
+            if v == old {
+                *v = new.to_string();
+            }
+        }
+        self.flush()?;
+        Ok(touched)
+    }
+
+    /// Convert this data dir from single-file to sharded layout. current.json is
+    /// kept as current.json.pre-shard — a full snapshot escape hatch, since the
+    /// conversion itself is one-way. Idempotent error if already sharded.
+    pub fn shard_layout(&mut self) -> Result<usize, String> {
+        if self.data_dir.join("domains").is_dir() {
+            return Err("Error: this data dir already uses the sharded layout".to_string());
+        }
+        self.flush_sharded()?;
+        let current = self.data_dir.join("current.json");
+        if current.exists() {
+            fs::rename(&current, self.data_dir.join("current.json.pre-shard"))
+                .map_err(|e| format!("Failed to archive current.json: {}", e))?;
+        }
+        let domain_count = self.state.nodes.values()
+            .map(Self::home_domain)
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(domain_count)
+    }
+
+    /// Serialize with deterministic key order. Persisted structs hold HashMaps,
+    /// whose iteration order changes per process — direct to_string_pretty made
+    /// identical graphs produce differently-ordered JSON (braim ID:218), which
+    /// makes git diffs of shared packs unreadable and breaks byte-level
+    /// integrity checks (braim ID:226). Round-tripping through serde_json::Value
+    /// sorts every map: with the preserve_order feature off, Value objects are
+    /// BTreeMap-backed. Numeric keys sort lexicographically ("10" < "2") — ugly
+    /// but stable, and stability is the requirement.
+    fn canonical_json<T: Serialize>(value: &T) -> Result<String, String> {
+        let v = serde_json::to_value(value)
             .map_err(|e| format!("Failed to serialize state: {}", e))?;
-        fs::write(&path, content)
+        serde_json::to_string_pretty(&v)
+            .map_err(|e| format!("Failed to serialize state: {}", e))
+    }
+
+    /// The full merged state as canonical JSON — what current.json holds in the
+    /// single-file layout. Lets consumers (e.g. `serve`) stay layout-agnostic.
+    pub fn state_json(&self) -> Result<String, String> {
+        Self::canonical_json(&self.state)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.data_dir.join("domains").is_dir() {
+            return self.flush_sharded();
+        }
+        let path = self.data_dir.join("current.json");
+        let content = Self::canonical_json(&self.state)?;
+        write_atomic(&path, &content)
             .map_err(|e| format!("Failed to write current.json: {}", e))?;
         Ok(())
     }
@@ -2015,18 +2764,20 @@ impl Braim {
 
         // Dependency inheritance per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.2:
         // Only statement-typed deps participate; concept deps are skipped.
-        // Invalid deps propagate fully (mark the new node invalid).
-        // Otherwise cap source_derived to the weakest statement dep.
-        let mut invalid_from_dep: Option<u32> = None;
+        // Refuted deps are EXCLUDED from the cap set (§3.3.2) and recorded as
+        // withdrawn support — they no longer mark the new node invalid, because
+        // refutation is direct-evidence-only and never inherited (§3.3.1).
+        // Otherwise cap source_derived to the weakest surviving statement dep.
+        let mut refuted_deps: Vec<u32> = Vec::new();
         let mut dep_cap: Option<u8> = None;
         for dep_id in depends_on.keys() {
             if let Some(dep_node) = self.state.nodes.get(dep_id) {
                 if !dep_node.node_type.is_statement_family() {
                     continue;
                 }
-                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
-                    invalid_from_dep = Some(*dep_id);
-                    break;
+                if dep_node.invalid || dep_node.verification_status.is_refuted() {
+                    refuted_deps.push(*dep_id);
+                    continue;
                 }
                 let r = dep_node.verification_status.rank();
                 dep_cap = Some(match dep_cap {
@@ -2035,28 +2786,36 @@ impl Braim {
                 });
             }
         }
+        refuted_deps.sort_unstable();
 
-        let (verification_status, invalid_flag, invalid_reason, invalidated_at) =
-            if let Some(dep_id) = invalid_from_dep {
-                (
-                    VerificationStatus::Invalid,
-                    true,
-                    Some(format!("depends_on_invalidated:{}", dep_id)),
-                    Some(now.clone()),
-                )
-            } else {
-                let final_status = match dep_cap {
-                    None => source_derived,
-                    Some(cap) => {
-                        if source_derived.rank() <= cap {
-                            source_derived
-                        } else {
-                            VerificationStatus::from_rank(cap)
-                        }
-                    }
-                };
-                (final_status, false, None, None)
-            };
+        // A statement resting only on refuted deps has an empty cap set, so its
+        // status is source_derived alone — the same treatment as a statement
+        // with no statement deps. Unsupported, not false.
+        let verification_status = match dep_cap {
+            None => source_derived,
+            Some(cap) => {
+                if source_derived.rank() <= cap {
+                    source_derived
+                } else {
+                    VerificationStatus::from_cap_rank(cap)
+                }
+            }
+        };
+
+        // §3.3.4 — withdrawn support is recorded on the node so the affected
+        // set is a reviewable worklist, not a silent verdict.
+        let mut initial_metadata: HashMap<String, String> = HashMap::new();
+        if !refuted_deps.is_empty() {
+            initial_metadata.insert(
+                "support_withdrawn_by".to_string(),
+                refuted_deps
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            initial_metadata.insert("support_withdrawn_at".to_string(), now.clone());
+        }
 
         let node = Node {
             id,
@@ -2070,15 +2829,15 @@ impl Braim {
             created_at: now,
             verified_by: HashMap::new(),
             verification_status,
-            invalid: invalid_flag,
-            invalid_reason,
-            invalidated_at,
+            invalid: false,
+            invalid_reason: None,
+            invalidated_at: None,
             source_type: None,
             location: None,
             ingested_by: None,
             source_ids: vec![],
             pre_contested_status: None,
-            metadata: HashMap::new(),
+            metadata: initial_metadata,
         };
 
         self.state.nodes.insert(id, node);
@@ -2154,6 +2913,22 @@ impl Braim {
         node.metadata.insert(key.to_string(), value.to_string());
         self.flush()?;
         Ok(())
+    }
+
+    /// Remove a metadata key. Returns whether it was there.
+    ///
+    /// A key exists or it does not — `--set k=false` leaves a tombstone that
+    /// `list --meta k=true` no longer matches but every reader still has to
+    /// interpret, which is how a stale `terminal_cause=false` outlives the
+    /// reason it was written.
+    pub fn unset_meta(&mut self, node_id: u32, key: &str) -> Result<bool, String> {
+        let node = self.state.nodes.get_mut(&node_id)
+            .ok_or_else(|| format!("Error: Node ID {} does not exist", node_id))?;
+        if node.metadata.remove(key).is_none() {
+            return Ok(false);
+        }
+        self.flush()?;
+        Ok(true)
     }
 
     /// Increment a numeric metadata key (absent/non-numeric treated as 0).
@@ -2564,45 +3339,164 @@ impl Braim {
         }
     }
 
+    fn versions_index_path(&self) -> PathBuf {
+        self.data_dir.join("versions.json")
+    }
+
+    fn read_versions_index(&self) -> Vec<ShardedVersionEntry> {
+        fs::read_to_string(self.versions_index_path())
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot filename for one domain at one version: the `<d><v>.json` pin
+    /// artifact (braim ID:214/242), hash-suffixed like the current shard.
+    fn shard_version_filename(domain: &str, version: u32) -> String {
+        let base = Self::shard_filename(domain);
+        format!("{}.v{:04}.json", base.trim_end_matches(".json"), version)
+    }
+
     pub fn version_save(&mut self, description: &str) -> Result<u32, String> {
         self.state.version += 1;
         let version_num = self.state.version;
-
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let meta = VersionMeta {
-            description: description.to_string(),
-            saved_at: now,
-            data: self.state.clone(),
-        };
 
-        let filename = format!("v{:04}.json", version_num);
-        let path = self.data_dir.join(&filename);
-        let content = serde_json::to_string_pretty(&meta)
-            .map_err(|e| format!("Failed to serialize version: {}", e))?;
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write version file: {}", e))?;
+        if self.data_dir.join("domains").is_dir() {
+            // Sharded: per-domain snapshots for changed domains only, plus a
+            // header snapshot and an index entry (ID:242). Unchanged domains
+            // keep their existing snapshot version — the pin stays stable.
+            let domains_dir = self.data_dir.join("domains");
+            let mut index = self.read_versions_index();
+            let prev: HashMap<String, u32> = index.last()
+                .map(|e| e.domain_versions.clone())
+                .unwrap_or_default();
+            let prev_header = index.last().map(|e| e.header_version).unwrap_or(0);
+
+            let mut shards: HashMap<String, HashMap<u32, Node>> = HashMap::new();
+            for (id, node) in &self.state.nodes {
+                shards.entry(Self::home_domain(node)).or_default().insert(*id, node.clone());
+            }
+
+            let mut domain_versions: HashMap<String, u32> = HashMap::new();
+            for (domain, nodes) in &shards {
+                let content = Self::canonical_json(nodes)?;
+                let next = match prev.get(domain) {
+                    Some(&v) => {
+                        let prev_file = domains_dir.join(Self::shard_version_filename(domain, v));
+                        match fs::read_to_string(&prev_file) {
+                            Ok(existing) if existing == content => {
+                                domain_versions.insert(domain.clone(), v);
+                                continue;
+                            }
+                            _ => v + 1,
+                        }
+                    }
+                    None => 1,
+                };
+                write_atomic(&domains_dir.join(Self::shard_version_filename(domain, next)), &content)
+                    .map_err(|e| format!("Failed to write domain snapshot: {}", e))?;
+                domain_versions.insert(domain.clone(), next);
+            }
+
+            let header = GraphState {
+                nodes: HashMap::new(),
+                dictionary: self.state.dictionary.clone(),
+                id_to_domain: self.state.id_to_domain.clone(),
+                gaps: self.state.gaps.clone(),
+                next_id: self.state.next_id,
+                version: self.state.version,
+                contradicts: self.state.contradicts.clone(),
+                because_of: self.state.because_of.clone(),
+            };
+            let header_content = Self::canonical_json(&header)?;
+            let header_version = {
+                let prev_file = self.data_dir.join(format!("graph.v{:04}.json", prev_header));
+                match fs::read_to_string(&prev_file) {
+                    Ok(existing) if existing == header_content => prev_header,
+                    _ => {
+                        let hv = prev_header + 1;
+                        write_atomic(&self.data_dir.join(format!("graph.v{:04}.json", hv)), &header_content)
+                            .map_err(|e| format!("Failed to write header snapshot: {}", e))?;
+                        hv
+                    }
+                }
+            };
+
+            index.push(ShardedVersionEntry {
+                version: version_num,
+                description: description.to_string(),
+                saved_at: now,
+                node_count: self.state.nodes.len(),
+                domain_versions,
+                header_version,
+            });
+            let index_content = Self::canonical_json(&index)?;
+            write_atomic(&self.versions_index_path(), &index_content)
+                .map_err(|e| format!("Failed to write versions index: {}", e))?;
+        } else {
+            let meta = VersionMeta {
+                description: description.to_string(),
+                saved_at: now,
+                data: self.state.clone(),
+            };
+            let filename = format!("v{:04}.json", version_num);
+            let path = self.data_dir.join(&filename);
+            let content = Self::canonical_json(&meta)
+                .map_err(|e| format!("Failed to serialize version: {}", e))?;
+            write_atomic(&path, &content)
+                .map_err(|e| format!("Failed to write version file: {}", e))?;
+        }
 
         self.flush()?;
         Ok(version_num)
     }
 
     pub fn version_restore(&mut self, n: u32) -> Result<(), String> {
-        let filename = format!("v{:04}.json", n);
-        let path = self.data_dir.join(&filename);
+        if self.data_dir.join("domains").is_dir() {
+            let index = self.read_versions_index();
+            let entry = index.iter().find(|e| e.version == n)
+                .ok_or(format!("Error: Version {} not found in versions.json", n))?;
 
-        let content = fs::read_to_string(&path)
-            .map_err(|_| format!("Error: Version {} not found", n))?;
-        let meta: VersionMeta = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse version file: {}", e))?;
+            let header_content = fs::read_to_string(
+                self.data_dir.join(format!("graph.v{:04}.json", entry.header_version)))
+                .map_err(|_| format!("Error: header snapshot graph.v{:04}.json missing", entry.header_version))?;
+            let mut state: GraphState = serde_json::from_str(&header_content)
+                .map_err(|e| format!("Failed to parse header snapshot: {}", e))?;
 
-        self.state = meta.data;
+            for (domain, v) in &entry.domain_versions {
+                let file = self.data_dir.join("domains").join(Self::shard_version_filename(domain, *v));
+                let content = fs::read_to_string(&file)
+                    .map_err(|_| format!("Error: domain snapshot {} missing", file.display()))?;
+                let nodes: HashMap<u32, Node> = serde_json::from_str(&content)
+                    .map_err(|e| format!("Failed to parse domain snapshot: {}", e))?;
+                state.nodes.extend(nodes);
+            }
+            self.state = state;
+        } else {
+            let filename = format!("v{:04}.json", n);
+            let path = self.data_dir.join(&filename);
+            let content = fs::read_to_string(&path)
+                .map_err(|_| format!("Error: Version {} not found", n))?;
+            let meta: VersionMeta = serde_json::from_str(&content)
+                .map_err(|e| format!("Failed to parse version file: {}", e))?;
+            self.state = meta.data;
+        }
         self.flush()?;
         Ok(())
     }
 
-    pub fn version_list(&self) -> Result<Vec<VersionMeta>, String> {
-        let mut versions = Vec::new();
+    pub fn version_list(&self) -> Result<Vec<VersionInfo>, String> {
+        if self.data_dir.join("domains").is_dir() {
+            return Ok(self.read_versions_index().into_iter().map(|e| VersionInfo {
+                version: e.version,
+                description: e.description,
+                saved_at: e.saved_at,
+                node_count: e.node_count,
+            }).collect());
+        }
 
+        let mut versions = Vec::new();
         for entry in fs::read_dir(&self.data_dir)
             .map_err(|e| format!("Failed to read data dir: {}", e))?
         {
@@ -2616,7 +3510,12 @@ impl Braim {
             if filename.starts_with('v') && filename.ends_with(".json") {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(meta) = serde_json::from_str::<VersionMeta>(&content) {
-                        versions.push(meta);
+                        versions.push(VersionInfo {
+                            version: meta.data.version,
+                            description: meta.description,
+                            saved_at: meta.saved_at,
+                            node_count: meta.data.nodes.len(),
+                        });
                     }
                 }
             }
@@ -2873,9 +3772,10 @@ impl Braim {
         cascade
     }
 
-    /// Invalidate a statement and cascade-invalidate all transitively dependent
-    /// statements per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3.
-    /// Returns the list of cascade-invalidated IDs (excluding the target).
+    /// Invalidate a statement, then RECOMPUTE its transitively dependent
+    /// statements per BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3.3 — they are never
+    /// refuted by inheritance (§3.3.1), only demoted where support was lost.
+    /// Returns the IDs whose status actually moved (excluding the target).
     pub fn invalidate_statement(&mut self, statement_id: u32, reason: &str) -> Result<Vec<u32>, String> {
         {
             let node = self.state.nodes.get(&statement_id)
@@ -2891,10 +3791,6 @@ impl Braim {
         }
 
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let cascade_ids: Vec<u32> = self.find_cascade_nodes(statement_id)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
 
         {
             let node = self.state.nodes.get_mut(&statement_id).unwrap();
@@ -2906,18 +3802,9 @@ impl Braim {
             node.node_type = NodeType::InvalidStatement;
         }
 
-        for dep_id in &cascade_ids {
-            if let Some(dep_node) = self.state.nodes.get_mut(dep_id) {
-                if dep_node.invalid || dep_node.verification_status == VerificationStatus::Invalid {
-                    continue;
-                }
-                dep_node.invalid = true;
-                dep_node.invalid_reason = Some(format!("depends_on_invalidated:{}", statement_id));
-                dep_node.invalidated_at = Some(now.clone());
-                dep_node.verification_status = VerificationStatus::Invalid;
-                dep_node.node_type = NodeType::InvalidStatement;
-            }
-        }
+        // §3.3.3 — recompute, do not refute. Must run AFTER the target is marked
+        // so the recompute excludes it from every dependent's cap set (§3.3.2).
+        let cascade_ids = self.recompute_after_refutation(statement_id, &now);
 
         // because_of consequents above the invalidated cause are flagged for
         // re-investigation but not auto-invalidated (tests.md §13).
@@ -2925,6 +3812,86 @@ impl Braim {
 
         self.flush()?;
         Ok(cascade_ids)
+    }
+
+    /// Inverse of `invalidate_statement` for a single node: clears the invalid
+    /// flags and recomputes verification_status from sources + dependency
+    /// inheritance. Dependencies that are themselves invalid are SKIPPED in the
+    /// inheritance cap (and returned) rather than re-poisoning the node — this is
+    /// what lets a node be revived while a foundational dep stays intentionally
+    /// retired; the caller re-anchors those deps with `update-deps`. Does NOT
+    /// cascade to dependents: revive explicitly, dependency order outward.
+    pub fn revalidate_statement(&mut self, statement_id: u32) -> Result<(VerificationStatus, Vec<u32>), String> {
+        {
+            let node = self.state.nodes.get(&statement_id)
+                .ok_or(format!("Error: Statement ID {} not found", statement_id))?;
+            if !node.node_type.is_statement_family() {
+                return Err(format!("Error: Node ID {} is not a statement", statement_id));
+            }
+            let is_invalid = node.invalid || node.verification_status == VerificationStatus::Invalid;
+            let is_contested = node.verification_status == VerificationStatus::Contested;
+            // A node stuck contested purely by inheritance (a dependency was contested
+            // when this node was created, then removed) has no contradiction edge of its
+            // own. update_statement_deps refuses to recompute contested nodes, so it can
+            // never clear — revalidate recomputes it. A node with a real, unresolved
+            // contradiction edge must NOT be touched here; that is the contradiction
+            // lifecycle's job (resolve-contradiction).
+            let has_active_contradiction = self.state.contradicts.iter().any(|e| {
+                !e.resolved && (e.from == statement_id || e.to == statement_id)
+            });
+            if is_contested && has_active_contradiction {
+                return Err(format!(
+                    "Error: Statement ID {} is contested by an active contradiction edge — resolve it with 'statement resolve-contradiction', not revalidate",
+                    statement_id
+                ));
+            }
+            if !is_invalid && !is_contested {
+                return Err(format!("Error: Statement ID {} is neither invalid nor contested — nothing to revalidate", statement_id));
+            }
+        }
+
+        {
+            let node = self.state.nodes.get_mut(&statement_id).unwrap();
+            node.invalid = false;
+            node.invalid_reason = None;
+            node.invalidated_at = None;
+        }
+
+        let (new_status, invalid_deps) = {
+            let stmt = self.state.nodes.get(&statement_id).unwrap();
+            let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+            let source_derived =
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types);
+            let mut cap: Option<u8> = None;
+            let mut invalid_deps: Vec<u32> = Vec::new();
+            for dep_id in stmt.depends_on.keys() {
+                if let Some(dep) = self.state.nodes.get(dep_id) {
+                    if !dep.node_type.is_statement_family() {
+                        continue;
+                    }
+                    if dep.invalid || dep.verification_status == VerificationStatus::Invalid {
+                        invalid_deps.push(*dep_id);
+                        continue;
+                    }
+                    let r = dep.verification_status.rank();
+                    cap = Some(cap.map_or(r, |p: u8| p.min(r)));
+                }
+            }
+            let status = match cap {
+                Some(c) if source_derived.rank() > c => VerificationStatus::from_cap_rank(c),
+                _ => source_derived,
+            };
+            (status, invalid_deps)
+        };
+
+        {
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.verification_status = new_status;
+            stmt.node_type = NodeType::from_verification_status(new_status);
+        }
+
+        self.flush()?;
+        Ok((new_status, invalid_deps))
     }
 
     pub fn verify_statement(&mut self, statement_id: u32, domain: &str, note: Option<String>) -> Result<(), String> {
@@ -2953,19 +3920,84 @@ impl Braim {
         Ok(())
     }
 
+    /// `min_status` is the verification floor for admission (`None` = admit all).
+    /// `full` = full-fidelity (trusted self-import, braim ID:229/234): preserves
+    /// verification state instead of resetting it, imports source entities and
+    /// remaps statement source_ids, carries because_of/contradicts edges, and
+    /// unions a duplicate's sources into the dedup target so corroboration
+    /// accumulates (ID:185/190) instead of being discarded (ID:179).
     pub fn import_graph(
         &mut self,
         source_path: &str,
         filter_domain: Option<&str>,
-        only_proven: bool,
+        min_status: Option<VerificationStatus>,
         domain_mappings: HashMap<String, String>,
+        full: bool,
     ) -> Result<ImportManifest, String> {
-        // Load source graph
-        let source_content = fs::read_to_string(source_path)
-            .map_err(|e| format!("Error reading source file: {}", e))?;
-        let mut source_state: GraphState = serde_json::from_str(&source_content)
-            .map_err(|e| format!("Error parsing source graph: {}", e))?;
+        let path = PathBuf::from(source_path);
+        let source_state: GraphState = if path.is_dir() && path.join("domains").is_dir() {
+            // Sharded source dir: merge its shards exactly as load does. Not our
+            // lock, so use the reader path.
+            Self::load_sharded(&path, false)?
+        } else {
+            let file = if path.is_dir() { path.join("current.json") } else { path };
+            let source_content = fs::read_to_string(&file)
+                .map_err(|e| format!("Error reading source file: {}", e))?;
+            serde_json::from_str(&source_content)
+                .map_err(|e| format!("Error parsing source graph: {}", e))?
+        };
+        self.import_state(source_state, filter_domain, min_status, domain_mappings, full)
+    }
 
+    /// Core of import/export: merge an in-memory source state into this graph.
+    /// `braim export` calls this directly with the working graph's state — the
+    /// contribute flow and the consume flow are one code path (braim ID:232/240).
+    /// Remove counterfactual-tagged nodes and everything resting on them from a
+    /// state about to be imported. Returns how many were refused.
+    ///
+    /// Dependents are found by fixpoint rather than one pass: a hypothesis three
+    /// statements deep still taints the chain above it.
+    fn strip_counterfactuals(state: &mut GraphState) -> usize {
+        let mut tainted: HashSet<u32> = state
+            .nodes
+            .values()
+            .filter(|n| n.metadata.get("counterfactual").map(|v| v == "true").unwrap_or(false))
+            .map(|n| n.id)
+            .collect();
+        if tainted.is_empty() {
+            return 0;
+        }
+        loop {
+            let grown: HashSet<u32> = state
+                .nodes
+                .values()
+                .filter(|n| !tainted.contains(&n.id))
+                .filter(|n| n.depends_on.keys().any(|d| tainted.contains(d)))
+                .map(|n| n.id)
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            tainted.extend(grown);
+        }
+        state.nodes.retain(|id, _| !tainted.contains(id));
+        state.because_of.retain(|e| !tainted.contains(&e.from) && !tainted.contains(&e.to));
+        state.contradicts.retain(|e| !tainted.contains(&e.from) && !tainted.contains(&e.to));
+        for ids in state.dictionary.values_mut() {
+            ids.retain(|i| !tainted.contains(i));
+        }
+        state.dictionary.retain(|_, ids| !ids.is_empty());
+        tainted.len()
+    }
+
+    pub fn import_state(
+        &mut self,
+        mut source_state: GraphState,
+        filter_domain: Option<&str>,
+        min_status: Option<VerificationStatus>,
+        domain_mappings: HashMap<String, String>,
+        full: bool,
+    ) -> Result<ImportManifest, String> {
         // Apply domain mappings to source nodes
         for node in source_state.nodes.values_mut() {
             let mut remapped_domains = Vec::new();
@@ -2976,13 +4008,63 @@ impl Braim {
             node.domains = remapped_domains;
         }
 
+        // Quarantine, enforced here rather than left to the writer's discipline.
+        // A what-if output is unverifiable by construction — no source can prove
+        // that removing a constraint would improve an outcome — so it can never
+        // leave `unproven`, and an unproven node that crosses into a shared graph
+        // is indistinguishable from a finding nobody got round to verifying
+        // (braim ID:322). The closure goes too: a statement resting on a
+        // hypothesis is a hypothesis.
+        let counterfactuals_refused = Self::strip_counterfactuals(&mut source_state);
+
         let mut id_mappings: HashMap<u32, u32> = HashMap::new();
         let mut duplicates: Vec<DuplicateRecord> = Vec::new();
         let mut imported_count = 0;
         let mut deduplicated_count = 0;
         let mut skipped_count = 0;
+        let mut sources_imported = 0;
+        let mut because_of_imported = 0;
+        let mut contradicts_imported = 0;
+        let mut sources_unioned = 0;
 
-        // Collect nodes by type for ordered processing
+        // Domain filtering is closure-aware: the admitted set is the domain's own
+        // nodes PLUS everything they transitively depend on (concepts, statements,
+        // attached source entities), regardless of those dependencies' domains.
+        // Bare same-domain filtering silently dropped every statement with a
+        // cross-domain dependency (braim ID:180); a published domain slice must be
+        // self-contained — the vendored-closure pack decision (ID:220).
+        let domain_admitted: Option<HashSet<u32>> = filter_domain.map(|d| {
+            let mut admitted: HashSet<u32> = HashSet::new();
+            let mut frontier: Vec<u32> = source_state.nodes.values()
+                .filter(|n| n.domains.contains(&d.to_string()))
+                .map(|n| n.id)
+                .collect();
+            while let Some(id) = frontier.pop() {
+                if !admitted.insert(id) {
+                    continue;
+                }
+                if let Some(n) = source_state.nodes.get(&id) {
+                    frontier.extend(n.depends_on.keys().copied());
+                    frontier.extend(n.source_ids.iter().copied());
+                }
+            }
+            admitted
+        });
+        let in_domain_scope = |node: &Node| -> bool {
+            domain_admitted.as_ref().map_or(true, |adm| adm.contains(&node.id))
+        };
+
+        // Verification floor for admission. A rank comparison, not equality:
+        // `!= Proven` silently dropped proven_strong nodes. `None` admits
+        // everything. Export defaults to a Partial floor so a statement with one
+        // PRIMARY source can publish and corroborate (braim ID:253); import
+        // --only-proven passes Proven.
+        let meets_floor =
+            |s: VerificationStatus| min_status.map_or(true, |m| s.rank() >= m.rank());
+
+        // Collect nodes by type for ordered processing; sorted by id so import
+        // results don't depend on HashMap iteration order.
+        let mut source_entities = Vec::new();
         let mut atomics = Vec::new();
         let mut compounds = Vec::new();
         let mut statements = Vec::new();
@@ -2996,54 +4078,117 @@ impl Braim {
                 | NodeType::Fact
                 | NodeType::InvalidStatement
                 | NodeType::ContestedStatement => statements.push(node.clone()),
-                NodeType::Source => {} // skip source nodes during import
+                // Source entities are carried only in full-fidelity mode; the
+                // legacy path drops them (statement source_ids would dangle).
+                NodeType::Source => if full { source_entities.push(node.clone()) },
+            }
+        }
+        for list in [&mut source_entities, &mut atomics, &mut compounds, &mut statements] {
+            list.sort_by_key(|n| n.id);
+        }
+
+        // --only-proven admits statements at proven rank or above PLUS the concept
+        // closure they depend on. Concepts are vocabulary — they rarely reach
+        // proven — so gating them by status starves every proven statement of its
+        // dependencies and imports nothing. Statement-typed dependencies need no
+        // exemption: MIN-inheritance already guarantees a proven statement's
+        // statement deps are themselves at proven rank.
+        let needed_concepts: HashSet<u32> = if min_status.is_some() {
+            let mut needed: HashSet<u32> = HashSet::new();
+            let mut frontier: Vec<u32> = statements.iter()
+                .filter(|s| meets_floor(s.verification_status))
+                .flat_map(|s| s.depends_on.keys().copied())
+                .collect();
+            while let Some(id) = frontier.pop() {
+                if !needed.insert(id) {
+                    continue;
+                }
+                if let Some(n) = source_state.nodes.get(&id) {
+                    if !n.node_type.is_statement_family() {
+                        frontier.extend(n.depends_on.keys().copied());
+                    }
+                }
+            }
+            needed
+        } else {
+            HashSet::new()
+        };
+        let concept_admitted = |node: &Node| -> bool {
+            min_status.is_none() || meets_floor(node.verification_status) || needed_concepts.contains(&node.id)
+        };
+
+        // Process source entities first: statements remap source_ids against them.
+        // Dedup key: same label (case-insensitive) and location. Under a domain
+        // filter, only entities referenced by admitted statements cross.
+        for node in source_entities {
+            if !in_domain_scope(&node) {
+                skipped_count += 1;
+                continue;
+            }
+            let found = self.state.nodes.iter().find(|(_, t)| {
+                t.node_type == NodeType::Source
+                    && t.label.to_lowercase() == node.label.to_lowercase()
+                    && t.location == node.location
+            }).map(|(id, _)| *id);
+
+            if let Some(target_id) = found {
+                id_mappings.insert(node.id, target_id);
+                deduplicated_count += 1;
+            } else {
+                let new_id = self.state.next_id;
+                id_mappings.insert(node.id, new_id);
+                let mut new_node = node.clone();
+                new_node.id = new_id;
+                self.state.nodes.insert(new_id, new_node);
+                self.state.next_id += 1;
+                self.state.dictionary.entry(node.label.to_lowercase()).or_insert_with(Vec::new).push(new_id);
+                sources_imported += 1;
             }
         }
 
         // Process atomics first
         for node in atomics {
-            if let Some(domain_filter) = filter_domain {
-                if !node.domains.contains(&domain_filter.to_string()) {
-                    skipped_count += 1;
-                    continue;
-                }
+            if !in_domain_scope(&node) {
+                skipped_count += 1;
+                continue;
             }
 
-            if only_proven && node.verification_status != VerificationStatus::Proven {
+            if !concept_admitted(&node) {
                 skipped_count += 1;
                 continue;
             }
 
             let key = (node.label.to_lowercase(), node.domains.clone());
-            let mut is_duplicate = false;
 
             // Check for existing atomic with same name and domain
-            for (target_id, target_node) in &self.state.nodes {
-                if target_node.node_type == NodeType::Atomic
-                    && target_node.label.to_lowercase() == key.0
-                    && target_node.domains == key.1
-                {
-                    id_mappings.insert(node.id, *target_id);
-                    duplicates.push(DuplicateRecord {
-                        source_id: node.id,
-                        target_id: *target_id,
-                        target_label: target_node.label.clone(),
-                        reason: "same name and domain".to_string(),
-                    });
-                    is_duplicate = true;
-                    deduplicated_count += 1;
-                    break;
-                }
-            }
+            let found = self.state.nodes.iter().find(|(_, t)| {
+                t.node_type == NodeType::Atomic
+                    && t.label.to_lowercase() == key.0
+                    && t.domains == key.1
+            }).map(|(id, t)| (*id, t.label.clone()));
 
-            if !is_duplicate {
+            if let Some((target_id, target_label)) = found {
+                id_mappings.insert(node.id, target_id);
+                duplicates.push(DuplicateRecord {
+                    source_id: node.id,
+                    target_id,
+                    target_label,
+                    reason: "same name and domain".to_string(),
+                });
+                deduplicated_count += 1;
+                if full && self.union_sources_into(target_id, &node, &id_mappings) {
+                    sources_unioned += 1;
+                }
+            } else {
                 let new_id = self.state.next_id;
                 id_mappings.insert(node.id, new_id);
 
                 let mut new_node = node.clone();
                 new_node.id = new_id;
-                new_node.verification_status = VerificationStatus::Unproven;
-                new_node.verified_by = HashMap::new();
+                if !full {
+                    new_node.verification_status = VerificationStatus::Unproven;
+                    new_node.verified_by = HashMap::new();
+                }
 
                 self.state.nodes.insert(new_id, new_node.clone());
                 self.state.next_id += 1;
@@ -3062,14 +4207,12 @@ impl Braim {
 
         // Process compounds
         for node in compounds {
-            if let Some(domain_filter) = filter_domain {
-                if !node.domains.contains(&domain_filter.to_string()) {
-                    skipped_count += 1;
-                    continue;
-                }
+            if !in_domain_scope(&node) {
+                skipped_count += 1;
+                continue;
             }
 
-            if only_proven && node.verification_status != VerificationStatus::Proven {
+            if !concept_admitted(&node) {
                 skipped_count += 1;
                 continue;
             }
@@ -3088,28 +4231,27 @@ impl Braim {
             }
 
             let key = (node.label.to_lowercase(), node.domains.clone());
-            let mut is_duplicate = false;
 
             // Check for existing compound with same name and domain
-            for (target_id, target_node) in &self.state.nodes {
-                if target_node.node_type == NodeType::Compound
-                    && target_node.label.to_lowercase() == key.0
-                    && target_node.domains == key.1
-                {
-                    id_mappings.insert(node.id, *target_id);
-                    duplicates.push(DuplicateRecord {
-                        source_id: node.id,
-                        target_id: *target_id,
-                        target_label: target_node.label.clone(),
-                        reason: "same name and domain".to_string(),
-                    });
-                    is_duplicate = true;
-                    deduplicated_count += 1;
-                    break;
-                }
-            }
+            let found = self.state.nodes.iter().find(|(_, t)| {
+                t.node_type == NodeType::Compound
+                    && t.label.to_lowercase() == key.0
+                    && t.domains == key.1
+            }).map(|(id, t)| (*id, t.label.clone()));
 
-            if !is_duplicate {
+            if let Some((target_id, target_label)) = found {
+                id_mappings.insert(node.id, target_id);
+                duplicates.push(DuplicateRecord {
+                    source_id: node.id,
+                    target_id,
+                    target_label,
+                    reason: "same name and domain".to_string(),
+                });
+                deduplicated_count += 1;
+                if full && self.union_sources_into(target_id, &node, &id_mappings) {
+                    sources_unioned += 1;
+                }
+            } else {
                 let new_id = self.state.next_id;
 
                 // Remap dependency IDs
@@ -3126,8 +4268,10 @@ impl Braim {
                 let mut new_node = node.clone();
                 new_node.id = new_id;
                 new_node.depends_on = new_depends_on;
-                new_node.verification_status = VerificationStatus::Unproven;
-                new_node.verified_by = HashMap::new();
+                if !full {
+                    new_node.verification_status = VerificationStatus::Unproven;
+                    new_node.verified_by = HashMap::new();
+                }
 
                 self.state.nodes.insert(new_id, new_node.clone());
                 self.state.next_id += 1;
@@ -3139,102 +4283,313 @@ impl Braim {
             }
         }
 
-        // Process statements
-        for node in statements {
-            if let Some(domain_filter) = filter_domain {
-                if !node.domains.contains(&domain_filter.to_string()) {
+        // Process statements to a fixpoint: a statement may depend on another
+        // statement, and a single id-sorted pass would skip any dependent that
+        // precedes its dependency. Loop until a pass imports nothing new;
+        // whatever remains genuinely has an unimportable dependency.
+        let mut pending = statements;
+        loop {
+            let mut next_pending = Vec::new();
+            let mut progressed = false;
+
+            for node in pending {
+                if !in_domain_scope(&node) {
                     skipped_count += 1;
                     continue;
                 }
-            }
 
-            if only_proven && node.verification_status != VerificationStatus::Proven {
-                skipped_count += 1;
-                continue;
-            }
-
-            // Check if all dependencies were imported
-            let mut all_deps_imported = true;
-            for dep_id in node.depends_on.keys() {
-                if !id_mappings.contains_key(dep_id) {
-                    all_deps_imported = false;
+                if !meets_floor(node.verification_status) {
                     skipped_count += 1;
-                    break;
+                    continue;
                 }
-            }
-            if !all_deps_imported {
-                continue;
-            }
 
-            // Remap dependency IDs for comparison
-            let mut remapped_deps = Vec::new();
-            for dep_id in node.depends_on.keys() {
-                if let Some(mapped_id) = id_mappings.get(dep_id) {
-                    remapped_deps.push(*mapped_id);
+                // Defer if any dependency is not (yet) imported.
+                if node.depends_on.keys().any(|d| !id_mappings.contains_key(d)) {
+                    next_pending.push(node);
+                    continue;
                 }
-            }
-            remapped_deps.sort();
 
-            let mut is_duplicate = false;
+                // Remap dependency IDs for comparison
+                let mut remapped_deps: Vec<u32> = node.depends_on.keys()
+                    .filter_map(|d| id_mappings.get(d).copied())
+                    .collect();
+                remapped_deps.sort();
 
-            // Check for existing statement with same text and remapped dependencies
-            for (target_id, target_node) in &self.state.nodes {
-                if target_node.node_type.is_statement_family()
-                    && target_node.label == node.label
-                {
-                    let mut target_deps: Vec<u32> = target_node.depends_on.keys().copied().collect();
+                // Check for existing statement with same text and remapped dependencies
+                let found = self.state.nodes.iter().find(|(_, t)| {
+                    if !t.node_type.is_statement_family() || t.label != node.label {
+                        return false;
+                    }
+                    let mut target_deps: Vec<u32> = t.depends_on.keys().copied().collect();
                     target_deps.sort();
+                    target_deps == remapped_deps
+                }).map(|(id, t)| (*id, t.label.clone()));
 
-                    if target_deps == remapped_deps {
-                        id_mappings.insert(node.id, *target_id);
-                        duplicates.push(DuplicateRecord {
-                            source_id: node.id,
-                            target_id: *target_id,
-                            target_label: target_node.label.clone(),
-                            reason: "same text and dependencies".to_string(),
-                        });
-                        is_duplicate = true;
-                        deduplicated_count += 1;
-                        break;
+                if let Some((target_id, target_label)) = found {
+                    id_mappings.insert(node.id, target_id);
+                    duplicates.push(DuplicateRecord {
+                        source_id: node.id,
+                        target_id,
+                        target_label,
+                        reason: "same text and dependencies".to_string(),
+                    });
+                    deduplicated_count += 1;
+                    if full && self.union_sources_into(target_id, &node, &id_mappings) {
+                        sources_unioned += 1;
+                        self.recompute_statement_status(target_id);
+                    }
+                } else {
+                    let new_id = self.state.next_id;
+
+                    // Remap dependency IDs
+                    let mut new_depends_on = HashMap::new();
+                    for (dep_id, weight) in &node.depends_on {
+                        let mapped_id = id_mappings
+                            .get(dep_id)
+                            .ok_or_else(|| format!("Error: Dependency ID {} not found in mappings", dep_id))?;
+                        new_depends_on.insert(*mapped_id, *weight);
+                    }
+
+                    id_mappings.insert(node.id, new_id);
+
+                    let mut new_node = node.clone();
+                    new_node.id = new_id;
+                    new_node.depends_on = new_depends_on;
+                    if full {
+                        // Remap source-entity references; drop any that were not
+                        // imported (filtered upstream) rather than dangling.
+                        new_node.source_ids = node.source_ids.iter()
+                            .filter_map(|sid| id_mappings.get(sid).copied())
+                            .collect();
+                    } else {
+                        new_node.verification_status = VerificationStatus::Unproven;
+                        new_node.verified_by = HashMap::new();
+                        new_node.source_ids = Vec::new();
+                    }
+
+                    self.state.nodes.insert(new_id, new_node.clone());
+                    self.state.next_id += 1;
+                    imported_count += 1;
+                }
+                progressed = true;
+            }
+
+            if next_pending.is_empty() || !progressed {
+                skipped_count += next_pending.len();
+                break;
+            }
+            pending = next_pending;
+        }
+
+        // Carry relationship edges (full-fidelity only). An edge crosses only if
+        // both endpoints were imported or deduplicated; already-present edges
+        // (same remapped endpoints) are not duplicated.
+        if full {
+            for e in &source_state.because_of {
+                if let (Some(&f), Some(&t)) = (id_mappings.get(&e.from), id_mappings.get(&e.to)) {
+                    if !self.state.because_of.iter().any(|x| x.from == f && x.to == t) {
+                        let mut ne = e.clone();
+                        ne.from = f;
+                        ne.to = t;
+                        self.state.because_of.push(ne);
+                        because_of_imported += 1;
                     }
                 }
             }
-
-            if !is_duplicate {
-                let new_id = self.state.next_id;
-
-                // Remap dependency IDs
-                let mut new_depends_on = HashMap::new();
-                for (dep_id, weight) in &node.depends_on {
-                    let mapped_id = id_mappings
-                        .get(dep_id)
-                        .ok_or_else(|| format!("Error: Dependency ID {} not found in mappings", dep_id))?;
-                    new_depends_on.insert(*mapped_id, *weight);
+            for e in &source_state.contradicts {
+                if let (Some(&f), Some(&t)) = (id_mappings.get(&e.from), id_mappings.get(&e.to)) {
+                    if !self.state.contradicts.iter().any(|x| x.from == f && x.to == t) {
+                        let mut ne = e.clone();
+                        ne.from = f;
+                        ne.to = t;
+                        ne.source_id = e.source_id.and_then(|s| id_mappings.get(&s).copied());
+                        ne.resolution_source = e.resolution_source.and_then(|s| id_mappings.get(&s).copied());
+                        ne.resolution_winner = e.resolution_winner.and_then(|s| id_mappings.get(&s).copied());
+                        self.state.contradicts.push(ne);
+                        contradicts_imported += 1;
+                    }
                 }
-
-                id_mappings.insert(node.id, new_id);
-
-                let mut new_node = node.clone();
-                new_node.id = new_id;
-                new_node.depends_on = new_depends_on;
-                new_node.verification_status = VerificationStatus::Unproven;
-                new_node.verified_by = HashMap::new();
-
-                self.state.nodes.insert(new_id, new_node.clone());
-                self.state.next_id += 1;
-                imported_count += 1;
             }
         }
 
         self.flush()?;
 
         Ok(ImportManifest {
+            sources_imported,
+            because_of_imported,
+            contradicts_imported,
+            sources_unioned,
             imported_count,
             deduplicated_count,
             skipped_count,
+            counterfactuals_refused,
             id_mappings,
             duplicates,
         })
+    }
+
+    /// Union an incoming duplicate's evidence into its dedup target: source
+    /// strings, remapped source-entity ids, and verified_by entries the target
+    /// lacks. Returns true if anything was added. Same-source repetition stacks
+    /// as corroboration without inventing type diversity (braim ID:185/190) —
+    /// the promotion math still counts distinct PRIMARY types only.
+    fn union_sources_into(&mut self, target_id: u32, incoming: &Node, id_mappings: &HashMap<u32, u32>) -> bool {
+        let remapped_sids: Vec<u32> = incoming.source_ids.iter()
+            .filter_map(|sid| id_mappings.get(sid).copied())
+            .collect();
+        let Some(target) = self.state.nodes.get_mut(&target_id) else { return false };
+        let mut changed = false;
+        for s in &incoming.sources {
+            if !target.sources.contains(s) {
+                target.sources.push(s.clone());
+                changed = true;
+            }
+        }
+        for sid in remapped_sids {
+            if !target.source_ids.contains(&sid) {
+                target.source_ids.push(sid);
+                changed = true;
+            }
+        }
+        for (k, v) in &incoming.verified_by {
+            if !target.verified_by.contains_key(k) {
+                target.verified_by.insert(k.clone(), v.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// §3.3.3/§3.3.4 — a statement has just become refuted. Recompute its
+    /// transitive dependents instead of assigning `Invalid` to them, and record
+    /// the withdrawn support so the affected set is a reviewable worklist.
+    ///
+    /// Refutation is direct-evidence-only (§3.3.1), so nothing here ever writes
+    /// `Invalid`. A dependent that loses all support settles at `Unproven`:
+    /// unsupported, not false. This is also why the winner of a contradiction
+    /// resolution needs no special-casing — it cannot be refuted by the cascade
+    /// of its own resolution even when it transitively depends on the loser.
+    ///
+    /// Scope is deliberately narrow: only the refuted node's DIRECT dependents
+    /// are recomputed, because they are the only statements whose cap SET
+    /// changed — the refuted node left it. Deeper dependents' cap sets are
+    /// untouched; what moved is their parents' statuses, and braim does not
+    /// propagate status changes (verification is computed at creation and never
+    /// propagates). Recomputing the whole closure would retroactively introduce
+    /// that propagation and collapse entire subtrees to the floor: measured on
+    /// the real graph, a fixpoint over the closure demoted 88 nodes to Unproven,
+    /// nine of them from proven_strong. So the deeper closure is flagged for
+    /// review and left alone.
+    ///
+    /// Returns the ids whose status actually moved.
+    fn recompute_after_refutation(&mut self, refuted_id: u32, now: &str) -> Vec<u32> {
+        let closure: Vec<u32> = self
+            .find_cascade_nodes(refuted_id)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let (direct, indirect): (Vec<u32>, Vec<u32>) = closure.into_iter().partition(|dep_id| {
+            self.state
+                .nodes
+                .get(dep_id)
+                .is_some_and(|n| n.depends_on.contains_key(&refuted_id))
+        });
+
+        // §3.3.4 — direct dependents lost support directly: record it and
+        // recompute their cap without the refuted node in the set.
+        let mut moved: Vec<u32> = Vec::new();
+        for dep_id in &direct {
+            if let Some(node) = self.state.nodes.get_mut(dep_id) {
+                Self::append_csv_meta(node, "support_withdrawn_by", refuted_id);
+                node.metadata
+                    .insert("support_withdrawn_at".to_string(), now.to_string());
+            }
+            let before = self.state.nodes.get(dep_id).map(|n| n.verification_status);
+            self.recompute_statement_status(*dep_id);
+            let after = self.state.nodes.get(dep_id).map(|n| n.verification_status);
+            if before != after {
+                moved.push(*dep_id);
+            }
+        }
+
+        // Deeper dependents are recorded as a COUNT on the refuted node, not as
+        // a per-node marker. Tagging each one produced 596 flagged nodes on the
+        // real graph — 45% of it — which is noise rather than a worklist, and
+        // the set is recoverable at any time from find_cascade_nodes. What a
+        // reviewer needs is the scale and the entry points (§3.3.4).
+        if let Some(node) = self.state.nodes.get_mut(&refuted_id) {
+            node.metadata.insert(
+                "refutation_indirect_dependents".to_string(),
+                indirect.len().to_string(),
+            );
+            if !direct.is_empty() {
+                node.metadata.insert(
+                    "refutation_direct_dependents".to_string(),
+                    direct
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+        }
+
+        moved.sort_unstable();
+        moved
+    }
+
+    /// Append `value` to a comma-separated metadata list, without duplicates.
+    fn append_csv_meta(node: &mut Node, key: &str, value: u32) {
+        let value = value.to_string();
+        let entry = node.metadata.entry(key.to_string()).or_default();
+        if entry.split(',').any(|s| s == value) {
+            return;
+        }
+        if entry.is_empty() {
+            *entry = value;
+        } else {
+            entry.push(',');
+            entry.push_str(&value);
+        }
+    }
+
+    /// Recompute a statement's verification from its (possibly just-unioned)
+    /// sources plus dependency inheritance. Contested and invalid statements are
+    /// left alone: those resolve only through their own lifecycles
+    /// (resolve-contradiction / revalidate), never as an import side effect.
+    fn recompute_statement_status(&mut self, statement_id: u32) {
+        let Some(stmt) = self.state.nodes.get(&statement_id) else { return };
+        if !stmt.node_type.is_statement_family()
+            || stmt.invalid
+            || matches!(stmt.verification_status, VerificationStatus::Invalid | VerificationStatus::Contested)
+        {
+            return;
+        }
+        let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+        let source_derived =
+            Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types);
+        let mut cap: Option<u8> = None;
+        for dep_id in stmt.depends_on.keys() {
+            if let Some(dep) = self.state.nodes.get(dep_id) {
+                if !dep.node_type.is_statement_family() {
+                    continue;
+                }
+                // §3.3.2 — refuted deps are excluded from the cap set.
+                if dep.invalid || dep.verification_status.is_refuted() {
+                    continue;
+                }
+                let r = dep.verification_status.rank();
+                cap = Some(cap.map_or(r, |p: u8| p.min(r)));
+            }
+        }
+        let new_status = match cap {
+            Some(c) if source_derived.rank() > c => VerificationStatus::from_cap_rank(c),
+            _ => source_derived,
+        };
+        let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+        stmt.verification_status = new_status;
+        stmt.node_type = NodeType::from_verification_status(new_status);
     }
 }
 
@@ -3526,6 +4881,109 @@ mod because_of_tests {
     }
 }
 
+/// One node the pre-§3.3 cascade refuted, and what it becomes once its support
+/// is recomputed instead.
+#[derive(Debug, Clone)]
+pub struct RefutationRepair {
+    pub id: u32,
+    /// The refuted ancestor named in `depends_on_invalidated:<id>`.
+    pub refuted_by: u32,
+    pub label: String,
+    pub restored: VerificationStatus,
+    /// The named ancestor is no longer refuted — the reason outlived its cause.
+    pub cause_recovered: bool,
+}
+
+impl Braim {
+/// BRAIM_DEPENDENCY_INHERITANCE_SPEC §4 — undo the pre-§3.3 refutation
+    /// cascade.
+    ///
+    /// Nodes carrying `invalid_reason: depends_on_invalidated:<id>` were never
+    /// refuted on their own evidence; they were collateral of an ancestor's
+    /// refutation, under the rule §3.3 replaced. The reason string is fully
+    /// re-derivable, so nothing is lost by recomputing it away.
+    ///
+    /// Dry by default. `apply == false` restores the graph before returning, so
+    /// the report costs a clone and changes nothing — repairing hundreds of
+    /// nodes silently would be indistinguishable from corrupting them (§4.5).
+    ///
+    /// Two passes, not a fixpoint: every selected node is cleared before any is
+    /// recomputed, so a repaired node is already out of its dependents' cap set
+    /// by the time they are recomputed. Within pass two each node is computed
+    /// once, in id order, which matches braim's own rule that verification is
+    /// computed at a point in time and does not propagate — the same reason
+    /// §3.3.3 recomputes direct dependents only.
+    ///
+    /// Idempotent: a second run selects nothing.
+    pub fn migrate_refutation_cascade(
+        &mut self,
+        apply: bool,
+    ) -> Result<Vec<RefutationRepair>, String> {
+        const MARKER: &str = "depends_on_invalidated:";
+
+        let mut selected: Vec<(u32, u32)> = Vec::new();
+        for node in self.state.nodes.values() {
+            let Some(reason) = node.invalid_reason.as_deref() else { continue };
+            let Some(rest) = reason.strip_prefix(MARKER) else { continue };
+            // A malformed reason is left alone rather than guessed at: the
+            // repair is only sound when the cause is identifiable.
+            let Ok(cause) = rest.trim().parse::<u32>() else { continue };
+            selected.push((node.id, cause));
+        }
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        selected.sort_unstable();
+
+        let snapshot = if apply { None } else { Some(self.state.clone()) };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        // Pass 1 — clear the collateral refutation on every selected node. The
+        // provisional Unproven is what "unsupported" means and is also what lets
+        // recompute_statement_status run at all: it refuses Invalid nodes.
+        for (id, _) in &selected {
+            if let Some(node) = self.state.nodes.get_mut(id) {
+                node.invalid = false;
+                node.invalid_reason = None;
+                node.invalidated_at = None;
+                node.verification_status = VerificationStatus::Unproven;
+                node.node_type = NodeType::from_verification_status(VerificationStatus::Unproven);
+            }
+        }
+
+        // Pass 2 — recompute under §3.3.2 and record the withdrawn support.
+        let mut repairs = Vec::new();
+        for (id, cause) in &selected {
+            self.recompute_statement_status(*id);
+            let cause_recovered = self
+                .state
+                .nodes
+                .get(cause)
+                .map(|c| !(c.invalid || c.verification_status.is_refuted()))
+                .unwrap_or(true);
+            if let Some(node) = self.state.nodes.get_mut(id) {
+                // §3.3.4 — the affected set stays a reviewable worklist.
+                Self::append_csv_meta(node, "support_withdrawn_by", *cause);
+                node.metadata
+                    .insert("support_withdrawn_at".to_string(), now.clone());
+                repairs.push(RefutationRepair {
+                    id: *id,
+                    refuted_by: *cause,
+                    label: node.label.clone(),
+                    restored: node.verification_status,
+                    cause_recovered,
+                });
+            }
+        }
+
+        match snapshot {
+            Some(state) => self.state = state,
+            None => self.flush()?,
+        }
+        Ok(repairs)
+    }
+}
+
 #[cfg(test)]
 mod defect_tests {
     use super::*;
@@ -3545,6 +5003,165 @@ mod defect_tests {
         deps.insert(c, 0.4);
         let s = b.add_statement("alpha relates to beta", vec!["t".into()], vec!["narrative:claim".into()], deps, true).unwrap();
         (a, c, s)
+    }
+
+    #[test]
+    fn unset_meta_removes_the_key_rather_than_falsifying_it() {
+        let mut b = temp_braim("unset_meta");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        b.set_meta(s, "terminal_cause", "true").unwrap();
+        b.set_meta(s, "scope", "dream").unwrap();
+
+        assert!(b.unset_meta(s, "terminal_cause").unwrap(), "it was there");
+        let meta = &b.state.nodes[&s].metadata;
+        assert!(!meta.contains_key("terminal_cause"), "the key is gone, not set to false");
+        assert_eq!(meta.get("scope").map(|v| v.as_str()), Some("dream"), "siblings survive");
+
+        assert!(!b.unset_meta(s, "terminal_cause").unwrap(), "removing it twice reports absence");
+        assert!(!b.unset_meta(s, "never_set").unwrap());
+        assert!(b.unset_meta(9999, "scope").is_err(), "a missing node is an error, not an absence");
+
+        // The removal is durable, not just in memory.
+        let reloaded = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        assert!(!reloaded.state.nodes[&s].metadata.contains_key("terminal_cause"));
+    }
+
+    #[test]
+    fn a_counterfactual_and_its_dependents_never_leave_the_local_graph() {
+        let mut src = temp_braim("cf_quarantine_src");
+        let (a, c, base) = two_concepts_and_claim(&mut src);
+        let mut deps = HashMap::new();
+        deps.insert(a, 0.7);
+        deps.insert(c, 0.3);
+        let hypo = src.add_statement("what if the constraint were lifted", vec!["t".into()],
+            vec!["narrative:dream".into()], deps, true).unwrap();
+        src.set_meta(hypo, "counterfactual", "true").unwrap();
+        // A statement resting on a hypothesis is a hypothesis, however it is
+        // sourced — the taint travels through depends_on.
+        let mut deps2 = HashMap::new();
+        deps2.insert(hypo, 0.8);
+        deps2.insert(base, 0.2);
+        let downstream = src.add_statement("and therefore this would follow", vec!["t".into()],
+            vec!["code:a.rs:1".into(), "doc:b.md".into()], deps2, true).unwrap();
+        src.why_add(downstream, hypo, Some("narrative:w".into())).unwrap();
+
+        let mut target = temp_braim("cf_quarantine_dst");
+        let manifest = target.import_state(src.state.clone(), None, None, HashMap::new(), true).unwrap();
+
+        assert_eq!(manifest.counterfactuals_refused, 2, "the hypothesis and its dependent");
+        let landed: Vec<&str> = target.state.nodes.values().map(|n| n.label.as_str()).collect();
+        assert!(!landed.iter().any(|l| l.contains("what if the constraint")),
+            "a hypothesis must not reach a shared graph");
+        assert!(!landed.iter().any(|l| l.contains("and therefore this would follow")),
+            "nor anything resting on one, even with PRIMARY sources of its own");
+        assert!(landed.iter().any(|l| l.contains("alpha relates to beta")),
+            "ordinary statements still publish");
+        assert!(target.state.because_of.is_empty(), "edges into quarantine go too");
+    }
+
+    #[test]
+    fn delete_source_reverses_add_source_and_respects_locked_states() {
+        let mut b = temp_braim("delete_source");
+        let (_, _, s) = two_concepts_and_claim(&mut b); // unproven, narrative-only
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "one PRIMARY source promotes");
+
+        let status = b.delete_source_from_statement(s, src).unwrap();
+        assert_eq!(status, VerificationStatus::Unproven, "removing the only PRIMARY source demotes back");
+        assert!(b.state.nodes[&s].source_ids.is_empty());
+
+        assert!(b.delete_source_from_statement(s, src).is_err(), "already detached");
+        assert!(b.delete_source_from_statement(9999, src).is_err(), "missing statement");
+    }
+
+    #[test]
+    fn delete_source_leaves_invalid_statements_untouched() {
+        let mut b = temp_braim("delete_source_locked");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        b.invalidate_statement(s, "no longer true").unwrap();
+
+        let status = b.delete_source_from_statement(s, src).unwrap();
+        assert_eq!(status, VerificationStatus::Invalid, "invalidation is not reversed by source removal");
+        assert_eq!(b.state.nodes[&s].node_type, NodeType::InvalidStatement);
+    }
+
+    #[test]
+    fn update_sources_add_and_remove_correct_a_citation_without_changing_id() {
+        let mut b = temp_braim("update_sources_basic");
+        let (_, _, s) = two_concepts_and_claim(&mut b); // sources: ["narrative:claim"], unproven
+
+        let updated = b.update_statement_sources(s, Some(vec!["doc:spec.md:12-18".into()]), None, None).unwrap();
+        assert_eq!(updated, vec!["narrative:claim".to_string(), "doc:spec.md:12-18".to_string()]);
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "one PRIMARY source promotes");
+
+        // Correct a wrong range: remove the bad citation, add the fixed one, same call.
+        let updated = b.update_statement_sources(
+            s,
+            Some(vec!["doc:spec.md:20-26".into()]),
+            Some(vec!["doc:spec.md:12-18".into()]),
+            None,
+        ).unwrap();
+        assert!(updated.contains(&"doc:spec.md:20-26".to_string()));
+        assert!(!updated.contains(&"doc:spec.md:12-18".to_string()));
+        assert_eq!(b.state.nodes[&s].sources, updated, "edited in place; node id s is unchanged");
+    }
+
+    #[test]
+    fn update_sources_set_replaces_the_whole_list_and_ignores_add_remove() {
+        let mut b = temp_braim("update_sources_set");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        let updated = b.update_statement_sources(
+            s,
+            Some(vec!["doc:ignored.md".into()]),
+            None,
+            Some(vec!["code:impl.rs:1-10".into(), "doc:spec.md:1".into()]),
+        ).unwrap();
+        assert_eq!(updated, vec!["code:impl.rs:1-10".to_string(), "doc:spec.md:1".to_string()]);
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Proven, "two distinct PRIMARY types");
+    }
+
+    #[test]
+    fn update_sources_rejects_untyped_and_missing_remove_targets() {
+        let mut b = temp_braim("update_sources_validation");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+
+        assert!(b.update_statement_sources(s, Some(vec!["no-prefix-here".into()]), None, None).is_err(),
+            "untyped sources are rejected like statement add");
+        assert!(b.update_statement_sources(s, None, Some(vec!["doc:never-added.md".into()]), None).is_err(),
+            "removing a source that isn't present is an error");
+        assert_eq!(b.state.nodes[&s].sources, vec!["narrative:claim".to_string()], "rejected ops leave the list untouched");
+    }
+
+    #[test]
+    fn update_sources_refuses_to_leave_zero_total_sources() {
+        let mut b = temp_braim("update_sources_zero_guard");
+        let (_, _, s) = two_concepts_and_claim(&mut b); // exactly one string source, no entities
+
+        assert!(b.update_statement_sources(s, None, Some(vec!["narrative:claim".into()]), None).is_err(),
+            "would leave zero strings and zero entities");
+
+        // With an entity attached, removing the only string is fine — the
+        // entity alone still counts as a source.
+        let src = b.add_source("evidence file", "code", Some("code:x.rs:1".into()), None).unwrap();
+        b.add_source_to_statement(s, src).unwrap();
+        let updated = b.update_statement_sources(s, None, Some(vec!["narrative:claim".into()]), None).unwrap();
+        assert!(updated.is_empty());
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "the entity alone still verifies");
+    }
+
+    #[test]
+    fn update_sources_leaves_invalid_status_untouched() {
+        let mut b = temp_braim("update_sources_locked");
+        let (_, _, s) = two_concepts_and_claim(&mut b);
+        b.invalidate_statement(s, "no longer true").unwrap();
+
+        let updated = b.update_statement_sources(s, Some(vec!["code:fix.rs:1".into()]), None, None).unwrap();
+        assert!(updated.contains(&"code:fix.rs:1".to_string()), "the citation edit still applies");
+        assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Invalid, "status is not revived");
+        assert_eq!(b.state.nodes[&s].node_type, NodeType::InvalidStatement);
     }
 
     #[test]
@@ -3613,5 +5230,691 @@ mod defect_tests {
         assert!(b.update_statement_deps(s, None, None, Some(HashMap::from([(a, 0.4), (c, 0.4)]))).is_err());
         // concept update-deps still rejects statements
         assert!(b.update_deps(s, None, None, Some(HashMap::from([(a, 1.0)]))).is_err());
+    }
+
+    /// Build a source graph for import tests: two concepts, a proven statement
+    /// (code+doc), a claim depending on that statement, a source entity attached
+    /// to the proven statement, one because_of edge and one contradicts edge.
+    fn import_fixture(name: &str) -> (Braim, u32, u32) {
+        let mut src = temp_braim(name);
+        let a = src.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = src.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = src.add_statement("proven base", vec!["t".into()],
+            vec!["code:a.rs:1".into(), "doc:a.md:2".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        // statement depending on a statement — exercises the fixpoint pass
+        let s2 = src.add_statement("dependent claim", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        let se = src.add_source("evidence ledger", "test", Some("test:run.log:3".into()), None).unwrap();
+        src.add_source_to_statement(s1, se).unwrap();
+        src.why_add(s2, s1, Some("narrative:why".into())).unwrap();
+        let s3 = src.add_statement("rival claim", vec!["t".into()],
+            vec!["narrative:m".into()], HashMap::from([(a, 0.7), (c, 0.3)]), true).unwrap();
+        src.contradict_statements(s2, s3, "disagree", None).unwrap();
+        (src, s1, s2)
+    }
+
+    #[test]
+    fn full_import_preserves_verification_sources_and_edges() {
+        let (src, s1, _) = import_fixture("full_import_src");
+        let src_path = src.data_dir.join("current.json");
+        let src_status = src.get_node(s1).unwrap().verification_status;
+
+        let mut dst = temp_braim("full_import_dst");
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
+
+        // everything crossed: 2 concepts + 3 statements imported, 1 source entity
+        assert_eq!(m.imported_count, 5);
+        assert_eq!(m.sources_imported, 1);
+        assert_eq!(m.because_of_imported, 1);
+        assert_eq!(m.contradicts_imported, 1);
+
+        // verification preserved, not reset
+        let new_s1 = m.id_mappings[&s1];
+        let n = dst.get_node(new_s1).unwrap();
+        assert_eq!(n.verification_status, src_status, "trusted import must not reset verification");
+        assert_eq!(n.source_ids.len(), 1, "source-entity reference remapped, not dropped");
+
+        // carried edges point at remapped ids that exist
+        for e in &dst.state.because_of {
+            assert!(dst.state.nodes.contains_key(&e.from) && dst.state.nodes.contains_key(&e.to));
+        }
+        assert_eq!(dst.state.contradicts.len(), 1);
+    }
+
+    #[test]
+    fn legacy_import_still_resets_and_drops() {
+        let (src, s1, _) = import_fixture("legacy_import_src");
+        let src_path = src.data_dir.join("current.json");
+
+        let mut dst = temp_braim("legacy_import_dst");
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, None, HashMap::new(), false).unwrap();
+
+        assert_eq!(m.sources_imported, 0);
+        assert_eq!(m.because_of_imported, 0);
+        assert!(dst.state.because_of.is_empty() && dst.state.contradicts.is_empty());
+        let new_s1 = m.id_mappings[&s1];
+        assert_eq!(dst.get_node(new_s1).unwrap().verification_status, VerificationStatus::Unproven);
+        assert!(dst.get_node(new_s1).unwrap().source_ids.is_empty());
+    }
+
+    #[test]
+    fn full_import_dedup_unions_sources_and_recomputes() {
+        let mut dst = temp_braim("union_dst");
+        let a = dst.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = dst.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        // target has the same statement with only a code source → partial
+        let s = dst.add_statement("shared finding", vec!["t".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        assert_eq!(dst.get_node(s).unwrap().verification_status, VerificationStatus::Partial);
+
+        // source graph: same concepts + same statement text/deps, but with a doc source
+        let mut src = temp_braim("union_src");
+        let sa = src.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let sc = src.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        src.add_statement("shared finding", vec!["t".into()],
+            vec!["doc:spec.md:9".into()], HashMap::from([(sa, 0.6), (sc, 0.4)]), true).unwrap();
+        let src_path = src.data_dir.join("current.json");
+
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
+        assert_eq!(m.sources_unioned, 1);
+
+        let n = dst.get_node(s).unwrap();
+        assert!(n.sources.contains(&"doc:spec.md:9".to_string()), "duplicate's source unioned into target");
+        // code + doc = two distinct PRIMARY types → promoted by the union
+        assert_eq!(n.verification_status, VerificationStatus::Proven,
+            "independent corroboration with a new PRIMARY type must promote (ID:185/190)");
+    }
+
+    #[test]
+    fn only_proven_admits_proven_strong() {
+        let mut src = temp_braim("proven_strong_src");
+        let a = src.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = src.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        // three distinct PRIMARY types → proven_strong
+        let s = src.add_statement("strong fact", vec!["t".into()],
+            vec!["code:a.rs:1".into(), "doc:a.md:2".into(), "test:t.log:3".into()],
+            HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        assert_eq!(src.get_node(s).unwrap().verification_status, VerificationStatus::ProvenStrong);
+
+        // an unproven statement that must NOT cross with --only-proven
+        let junk = src.add_statement("unproven aside", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(a, 1.0)]), true).unwrap();
+        let src_path = src.data_dir.join("current.json");
+
+        let mut dst = temp_braim("proven_strong_dst");
+        // --only-proven admits: the proven_strong statement (rank fix: != Proven
+        // used to drop it) PLUS its concept closure (concepts are vocabulary and
+        // are admitted as dependencies regardless of their own status).
+        let m = dst.import_graph(src_path.to_str().unwrap(), None, Some(VerificationStatus::Proven), HashMap::new(), true).unwrap();
+        assert_eq!(m.imported_count, 3, "proven_strong statement + its 2 concepts");
+        let new_s = m.id_mappings[&s];
+        assert_eq!(dst.get_node(new_s).unwrap().verification_status, VerificationStatus::ProvenStrong);
+        assert!(!m.id_mappings.contains_key(&junk), "unproven statement must not cross");
+    }
+
+    #[test]
+    fn domain_export_carries_dependency_closure() {
+        // Working graph: billing statement standing on a concept from another
+        // domain, plus an unrelated other-domain node. Export must vendored-carry
+        // the closure (ID:220, fixing lossy slice ID:180) and leave the rest.
+        let mut work = temp_braim("export_closure_src");
+        let bill = work.add_concept("Invoice: payment request document", vec!["billing".into()], vec!["narrative:x".into()], None).unwrap();
+        let other = work.add_concept("Account: customer record", vec!["crm".into()], vec!["narrative:x".into()], None).unwrap();
+        let unrelated = work.add_concept("Ticket: support case", vec!["crm".into()], vec!["narrative:x".into()], None).unwrap();
+        let s = work.add_statement("invoices belong to accounts", vec!["billing".into()],
+            vec!["code:b.rs:1".into(), "doc:b.md:2".into()], HashMap::from([(bill, 0.6), (other, 0.4)]), true).unwrap();
+        let se = work.add_source("billing spec", "doc", Some("doc:spec.md".into()), None).unwrap();
+        work.add_source_to_statement(s, se).unwrap();
+
+        let mut central = temp_braim("export_closure_dst");
+        let m = central.import_state(work.state.clone(), Some("billing"), Some(VerificationStatus::Proven), HashMap::new(), true).unwrap();
+
+        // statement + its billing concept + its cross-domain concept dep cross
+        assert!(m.id_mappings.contains_key(&s), "proven billing statement crosses");
+        assert!(m.id_mappings.contains_key(&bill));
+        assert!(m.id_mappings.contains_key(&other), "cross-domain dependency must be vendored (ID:180)");
+        assert_eq!(m.sources_imported, 1, "attached source entity crosses via closure");
+        // unrelated other-domain node stays home
+        assert!(!m.id_mappings.contains_key(&unrelated), "unrelated crm node must not cross");
+        // fidelity: status preserved through the export path
+        let ns = m.id_mappings[&s];
+        assert_eq!(central.get_node(ns).unwrap().verification_status,
+            work.get_node(s).unwrap().verification_status);
+    }
+
+    #[test]
+    fn import_reads_sharded_source_dir() {
+        let (mut src, s1, _) = import_fixture("sharded_source");
+        let dir = src.data_dir.clone();
+        src.shard_layout().unwrap();
+
+        let mut dst = temp_braim("sharded_source_dst");
+        let m = dst.import_graph(dir.to_str().unwrap(), None, None, HashMap::new(), true).unwrap();
+        assert!(m.id_mappings.contains_key(&s1), "import must load a sharded source dir");
+        assert_eq!(m.because_of_imported, 1);
+    }
+
+    #[test]
+    fn merge_unions_evidence_rewires_referents_and_can_promote() {
+        let mut b = temp_braim("merge_union");
+        let a = b.add_concept("Alpha: first", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        // Two statements saying the same thing with DIFFERENT primary evidence.
+        let keep = b.add_statement("payment settles invoice", vec!["d".into()],
+            vec!["code:pay.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let dup = b.add_statement("payment settles the invoice", vec!["d".into()],
+            vec!["doc:spec.md:9".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        assert_eq!(b.get_node(keep).unwrap().verification_status, VerificationStatus::Partial);
+
+        // A third statement depends on BOTH — after merge its weights must still sum to 1.0.
+        let referent = b.add_statement("settlement matters", vec!["d".into()],
+            vec!["code:z.rs:1".into()], HashMap::from([(keep, 0.7), (dup, 0.3)]), true).unwrap();
+
+        let out = b.merge_nodes(keep, dup).unwrap();
+        assert!(b.get_node(dup).is_none(), "loser is removed");
+        assert_eq!(out.referents_rewired, 1);
+
+        let w = b.get_node(keep).unwrap();
+        assert!(w.sources.contains(&"doc:spec.md:9".to_string()), "loser's evidence unioned");
+        assert_eq!(w.verification_status, VerificationStatus::Proven,
+            "code + doc from the merge promotes the survivor");
+        assert_eq!(w.metadata.get("merged_from").map(String::as_str), Some(dup.to_string().as_str()));
+
+        let r = b.get_node(referent).unwrap();
+        assert_eq!(r.depends_on.len(), 1, "both edges collapsed onto the winner");
+        let total: f64 = r.depends_on.values().sum();
+        assert!((total - 1.0).abs() < 1e-9, "summed weights preserve the 1.0 invariant, got {}", total);
+    }
+
+    #[test]
+    fn merge_moves_edges_and_reports_dependency_differences() {
+        let mut b = temp_braim("merge_edges");
+        let a = b.add_concept("Alpha: first", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let extra = b.add_concept("Gamma: third", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let keep = b.add_statement("claim one", vec!["d".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        // duplicate stands on a dependency the winner lacks
+        let dup = b.add_statement("claim one restated", vec!["d".into()],
+            vec!["doc:a.md:1".into()], HashMap::from([(a, 0.5), (extra, 0.5)]), true).unwrap();
+        let cause = b.add_statement("root cause", vec!["d".into()],
+            vec!["code:c.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        b.why_add(dup, cause, Some("narrative:why".into())).unwrap();
+
+        let out = b.merge_nodes(keep, dup).unwrap();
+        assert!(out.edges_rewired >= 1, "because_of edge moved to the winner");
+        assert!(b.state.because_of.iter().any(|e| e.from == keep && e.to == cause));
+        assert_eq!(out.dep_differences, vec![extra],
+            "a dependency only the loser had is reported, never silently merged");
+        assert!(!b.get_node(keep).unwrap().depends_on.contains_key(&extra),
+            "the winner's assertion is left intact");
+    }
+
+    #[test]
+    fn merge_refuses_unsafe_pairs() {
+        let mut b = temp_braim("merge_refuse");
+        let a = b.add_concept("Alpha: first", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["d".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("one", vec!["d".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("two", vec!["d".into()],
+            vec!["code:b.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+
+        assert!(b.merge_nodes(s1, s1).is_err(), "same node");
+        assert!(b.merge_nodes(s1, 9999).is_err(), "missing node");
+        assert!(b.merge_nodes(s1, a).is_err(), "concept into statement");
+
+        // depends-on either way means related, not duplicate
+        let dependent = b.add_statement("depends on one", vec!["d".into()],
+            vec!["code:c.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        assert!(b.merge_nodes(dependent, s1).is_err(), "winner depends on loser");
+        assert!(b.merge_nodes(s1, dependent).is_err(), "loser depends on winner");
+
+        // refuted evidence must not be laundered into a live node
+        b.invalidate_statement(s2, "refuted").unwrap();
+        assert!(b.merge_nodes(s1, s2).is_err(), "invalid loser");
+        assert!(b.merge_nodes(s2, s1).is_err(), "invalid winner");
+    }
+
+    #[test]
+    fn rename_domain_rehomes_shards() {
+        let mut b = temp_braim("rename_domain");
+        let dir = b.data_dir.clone();
+        let a = b.add_concept("Alpha: first", vec!["Billing".into()], vec!["narrative:x".into()], None).unwrap();
+        b.add_concept("Beta: second", vec!["billing".into()], vec!["narrative:x".into()], None).unwrap();
+        b.shard_layout().unwrap();
+        let mut b = Braim::new(dir.to_str().unwrap()).unwrap();
+
+        let touched = b.rename_domain("Billing", "braim_demo").unwrap();
+        assert_eq!(touched, 1);
+        assert_eq!(b.get_node(a).unwrap().domains, vec!["braim_demo".to_string()]);
+        // shard re-homed: new file exists, old case-variant shard pruned
+        assert!(dir.join("domains").join(Braim::shard_filename("braim_demo")).exists());
+        assert!(!dir.join("domains").join(Braim::shard_filename("Billing")).exists());
+        assert!(dir.join("domains").join(Braim::shard_filename("billing")).exists(), "unrelated lowercase domain untouched");
+        // errors: unknown domain, identity rename
+        assert!(b.rename_domain("nope", "x").is_err());
+        assert!(b.rename_domain("billing", "billing").is_err());
+    }
+
+    #[test]
+    fn sharded_versions_are_per_domain_and_incremental() {
+        let mut b = temp_braim("sharded_versions");
+        let dir = b.data_dir.clone();
+        let a = b.add_concept("Alpha: first", vec!["billing".into()], vec!["narrative:x".into()], None).unwrap();
+        b.add_concept("Beta: second", vec!["crm".into()], vec!["narrative:x".into()], None).unwrap();
+        b.shard_layout().unwrap();
+
+        let mut b = Braim::new(dir.to_str().unwrap()).unwrap();
+        let v1 = b.version_save("first checkpoint").unwrap();
+        // per-domain pin artifacts exist (ID:214/242)
+        let billing_v1 = dir.join("domains").join(Braim::shard_version_filename("billing", 1));
+        let crm_v1 = dir.join("domains").join(Braim::shard_version_filename("crm", 1));
+        assert!(billing_v1.exists() && crm_v1.exists(), "each domain gets its own versioned snapshot");
+
+        // change ONLY billing, checkpoint again
+        let c = b.add_concept("Invoice: payment request", vec!["billing".into()], vec!["narrative:y".into()], None).unwrap();
+        let v2 = b.version_save("billing changed").unwrap();
+        assert!(dir.join("domains").join(Braim::shard_version_filename("billing", 2)).exists(),
+            "changed domain advances to v2");
+        assert!(!dir.join("domains").join(Braim::shard_version_filename("crm", 2)).exists(),
+            "unchanged domain must NOT get a new snapshot — its pin stays stable");
+
+        // list reflects both checkpoints; restore v1 drops the new node, keeps the rest
+        let list = b.version_list().unwrap();
+        assert_eq!(list.len(), 2);
+        b.version_restore(v1).unwrap();
+        assert!(b.get_node(c).is_none(), "node added after v1 gone on restore");
+        assert!(b.get_node(a).is_some());
+        // restore v2 brings it back
+        b.version_restore(v2).unwrap();
+        assert!(b.get_node(c).is_some());
+        // reload from disk still clean (snapshots not merged into working view)
+        let again = Braim::new(dir.to_str().unwrap()).unwrap();
+        assert_eq!(again.state.nodes.len(), b.state.nodes.len());
+    }
+
+    #[test]
+    fn shard_roundtrip_preserves_full_state() {
+        let (mut src, s1, _) = import_fixture("shard_roundtrip");
+        let dir = src.data_dir.clone();
+        let nodes_before = src.state.nodes.len();
+        let s1_status = src.get_node(s1).unwrap().verification_status;
+
+        let domain_count = src.shard_layout().unwrap();
+        assert!(domain_count >= 1);
+        assert!(dir.join("domains").is_dir());
+        assert!(dir.join("graph.json").exists());
+        assert!(!dir.join("current.json").exists(), "single file archived, not left as dual source");
+        assert!(dir.join("current.json.pre-shard").exists());
+
+        // Reload from disk: merged view identical
+        let reloaded = Braim::new(dir.to_str().unwrap()).unwrap();
+        assert_eq!(reloaded.state.nodes.len(), nodes_before);
+        assert_eq!(reloaded.get_node(s1).unwrap().verification_status, s1_status);
+        assert_eq!(reloaded.state.because_of.len(), src.state.because_of.len());
+        assert_eq!(reloaded.state.contradicts.len(), src.state.contradicts.len());
+        assert_eq!(reloaded.state.next_id, src.state.next_id);
+        assert_eq!(reloaded.state.dictionary.len(), src.state.dictionary.len());
+    }
+
+    #[test]
+    fn sharded_mutation_persists_and_reloads() {
+        let (mut b, _, _) = import_fixture("shard_mutate");
+        let dir = b.data_dir.clone();
+        b.shard_layout().unwrap();
+
+        // mutate AFTER sharding — flush must route to the sharded writer
+        let mut b = Braim::new(dir.to_str().unwrap()).unwrap();
+        let g = b.add_concept("Gamma: third", vec!["newdomain".into()], vec!["narrative:z".into()], None).unwrap();
+
+        let again = Braim::new(dir.to_str().unwrap()).unwrap();
+        assert!(again.get_node(g).is_some(), "mutation in sharded mode must persist");
+        assert_eq!(again.get_node(g).unwrap().domains, vec!["newdomain".to_string()]);
+        // and the new domain got its own shard file
+        let shard = dir.join("domains").join(Braim::shard_filename("newdomain"));
+        assert!(shard.exists(), "new home domain must create its shard file");
+    }
+
+    #[test]
+    fn case_colliding_domains_get_distinct_shards() {
+        // Real data has both "Billing" and "billing" as distinct domains; on
+        // case-insensitive filesystems raw names would be one file (ID:236).
+        let a = Braim::shard_filename("Billing");
+        let b = Braim::shard_filename("billing");
+        assert_ne!(a, b, "distinct domains must never share a shard file");
+        // and the sanitized prefix is still human-readable
+        assert!(a.starts_with("billing-") && b.starts_with("billing-"));
+        // determinism
+        assert_eq!(a, Braim::shard_filename("Billing"));
+    }
+
+    #[test]
+    fn serialization_is_deterministic_across_instances() {
+        // Two graphs, identical operation sequences, separate HashMap seeds →
+        // current.json must still be byte-identical (braim ID:218/226: diffable
+        // packs and byte-level integrity both require canonical serialization).
+        let build = |name: &str| -> String {
+            let mut b = temp_braim(name);
+            let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+            let c = b.add_concept("Beta: second", vec!["u".into()], vec!["narrative:y".into()], None).unwrap();
+            let g = b.add_concept("Gamma: third", vec!["t".into()], vec!["narrative:z".into()], None).unwrap();
+            let s = b.add_statement("alpha relates to beta", vec!["t".into()],
+                vec!["code:x.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+            b.add_statement("beta relates to gamma", vec!["u".into()],
+                vec!["doc:y.md:2".into()], HashMap::from([(c, 0.7), (g, 0.3)]), true).unwrap();
+            b.set_meta(s, "scope", "agent_scratch").unwrap();
+            std::fs::read_to_string(b.data_dir.join("current.json")).unwrap()
+        };
+        let one = build("determinism_a");
+        let two = build("determinism_b");
+        assert_eq!(one, two, "identical operations must produce byte-identical current.json");
+    }
+
+    #[test]
+    fn revalidate_round_trips_invalidate() {
+        let mut b = temp_braim("revalidate_roundtrip");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s = b.add_statement("alpha relates to beta", vec!["t".into()],
+            vec!["code:x.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        assert_eq!(b.get_node(s).unwrap().verification_status, VerificationStatus::Partial);
+        b.invalidate_statement(s, "test").unwrap();
+        assert_eq!(b.get_node(s).unwrap().verification_status, VerificationStatus::Invalid);
+        let (status, invalid_deps) = b.revalidate_statement(s).unwrap();
+        assert_eq!(status, VerificationStatus::Partial, "one code source → partial after revalidate");
+        assert!(invalid_deps.is_empty());
+        let node = b.get_node(s).unwrap();
+        assert!(!node.invalid);
+        assert!(node.invalid_reason.is_none());
+        assert_eq!(node.node_type, NodeType::Fact);
+    }
+
+    #[test]
+    fn revalidate_skips_invalid_dep_in_cap() {
+        let mut b = temp_braim("revalidate_skip_invalid_dep");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        // S1 is a statement; S2 depends on S1 so the cascade reaches it.
+        let s1 = b.add_statement("base claim", vec!["t".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("dependent claim", vec!["t".into()],
+            vec!["code:b.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        b.invalidate_statement(s1, "retired").unwrap();
+        // §3.3.3 — the cascade RECOMPUTES s2 rather than refuting it. s1 leaves
+        // the cap set, so s2 settles at its own source-derived status. This
+        // assertion previously read `Invalid`, which was the defect.
+        assert_eq!(b.get_node(s2).unwrap().verification_status, VerificationStatus::Partial);
+        assert!(!b.get_node(s2).unwrap().invalid);
+        assert_eq!(
+            b.get_node(s2).unwrap().metadata.get("support_withdrawn_by").map(String::as_str),
+            Some(s1.to_string().as_str()),
+            "§3.3.4 — withdrawn support is recorded so the node is reviewable"
+        );
+        // Under §3.3 the cascade no longer poisons s2, so there is nothing to
+        // revalidate — the call is refused. Refute s2 directly to exercise the
+        // revalidate path that this test exists for.
+        assert!(b.revalidate_statement(s2).is_err(),
+            "a node the cascade left healthy has nothing to revalidate");
+        b.invalidate_statement(s2, "refuted on its own evidence").unwrap();
+        // revalidate s2 while s1 stays invalid: invalid dep is skipped, not re-poisoning.
+        let (status, invalid_deps) = b.revalidate_statement(s2).unwrap();
+        assert_eq!(status, VerificationStatus::Partial, "s2 revives to its own source-derived status");
+        assert_eq!(invalid_deps, vec![s1], "the still-invalid dep is reported for re-anchoring");
+        assert!(!b.get_node(s2).unwrap().invalid);
+    }
+
+    // ---- BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3 regressions ----------------
+
+    /// §4 — the migration undoes collateral refutation, reports before it
+    /// writes, and selects nothing on a second run.
+    #[test]
+    fn migrating_the_old_cascade_repairs_only_collateral() {
+        let mut b = temp_braim("migrate_refutation");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let parent = b.add_statement("the parent", vec!["t".into()],
+            vec!["code:p.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let well_sourced = b.add_statement("collateral with two primary types", vec!["t".into()],
+            vec!["code:w.rs:1".into(), "doc:w.md:1".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+        let weak = b.add_statement("collateral with nothing of its own", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+        let direct = b.add_statement("refuted on its own evidence", vec!["t".into()],
+            vec!["code:d.rs:1".into()], HashMap::from([(a, 0.7), (c, 0.3)]), true).unwrap();
+
+        // Fabricate the pre-3.3 world: the cascade refuted both dependents.
+        b.invalidate_statement(parent, "retired").unwrap();
+        b.invalidate_statement(direct, "disproved").unwrap();
+        for id in [well_sourced, weak] {
+            let n = b.state.nodes.get_mut(&id).unwrap();
+            n.invalid = true;
+            n.invalid_reason = Some(format!("depends_on_invalidated:{}", parent));
+            n.verification_status = VerificationStatus::Invalid;
+            n.node_type = NodeType::InvalidStatement;
+        }
+
+        // Dry run reports and changes nothing.
+        let dry = b.migrate_refutation_cascade(false).unwrap();
+        assert_eq!(dry.len(), 2, "both collateral nodes, and only those");
+        assert!(b.get_node(well_sourced).unwrap().invalid, "a dry run must not write");
+        assert!(dry.iter().all(|r| r.refuted_by == parent));
+
+        let applied = b.migrate_refutation_cascade(true).unwrap();
+        assert_eq!(applied.len(), 2);
+        let w = b.get_node(well_sourced).unwrap();
+        assert!(!w.invalid);
+        assert_eq!(w.verification_status, VerificationStatus::Proven,
+            "its own two PRIMARY types stand once the refuted parent leaves the cap set");
+        assert_eq!(w.metadata.get("support_withdrawn_by").map(String::as_str),
+            Some(parent.to_string().as_str()));
+        assert_eq!(b.get_node(weak).unwrap().verification_status, VerificationStatus::Unproven,
+            "unsupported, not false");
+
+        // Nodes refuted on their OWN evidence are untouched, both of them.
+        assert!(b.get_node(parent).unwrap().invalid, "the cause stays refuted");
+        assert!(b.get_node(direct).unwrap().invalid, "and so does a directly refuted node");
+
+        assert!(b.migrate_refutation_cascade(true).unwrap().is_empty(), "idempotent");
+
+        // Durable, not just in memory.
+        let reloaded = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        assert!(!reloaded.get_node(well_sourced).unwrap().invalid);
+    }
+
+    /// §6.1 — the winner of a contradiction resolution must survive the cascade
+    /// of its own resolution, even when it transitively depends on the loser.
+    /// Regression for the ID:1016 case: `1016 -> 438 -> 432`.
+    #[test]
+    fn resolution_winner_survives_its_own_cascade() {
+        let mut b = temp_braim("winner_survives_cascade");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        // loser sits low in the graph
+        let loser = b.add_statement("the base claim that loses", vec!["t".into()],
+            vec!["code:l.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        // mid depends on loser; winner depends on mid -> winner reaches loser
+        let mid = b.add_statement("intermediate claim", vec!["t".into()],
+            vec!["code:m.rs:1".into()], HashMap::from([(loser, 1.0)]), true).unwrap();
+        let winner = b.add_statement("the claim that wins", vec!["t".into()],
+            vec!["code:w.rs:1".into(), "doc:w.md:1".into()], HashMap::from([(mid, 1.0)]), true).unwrap();
+
+        b.contradict_statements(winner, loser, "test conflict", None).unwrap();
+        b.resolve_contradiction(winner, loser, "third source decides", None).unwrap();
+
+        let w = b.get_node(winner).unwrap();
+        assert!(!w.invalid, "the winner must not be refuted by its own resolution");
+        assert_ne!(w.verification_status, VerificationStatus::Invalid);
+        assert_eq!(b.get_node(loser).unwrap().verification_status, VerificationStatus::Invalid);
+    }
+
+    /// §6.2 — a dependent carrying two distinct PRIMARY source types keeps its
+    /// source-derived status when a parent is refuted. Regression for the 85
+    /// independently-sourced nodes the old cascade destroyed.
+    #[test]
+    fn refutation_does_not_override_a_dependents_own_sources() {
+        let mut b = temp_braim("own_sources_survive");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let parent = b.add_statement("parent to be refuted", vec!["t".into()],
+            vec!["code:p.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let child = b.add_statement("child with two primary types", vec!["t".into()],
+            vec!["code:c.rs:1".into(), "doc:c.md:1".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+
+        b.invalidate_statement(parent, "retired").unwrap();
+
+        let n = b.get_node(child).unwrap();
+        assert!(!n.invalid, "a refuted parent withdraws support; it does not refute the child");
+        assert_eq!(n.verification_status, VerificationStatus::Proven,
+            "two distinct PRIMARY types with an empty cap set → source-derived stands");
+    }
+
+    /// §6.4 and §6.5 — a dependent whose only support was refuted settles at
+    /// Unproven, and remains open to future evidence.
+    #[test]
+    fn sole_support_refuted_yields_unproven_and_stays_promotable() {
+        let mut b = temp_braim("sole_support_unproven");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let parent = b.add_statement("parent to be refuted", vec!["t".into()],
+            vec!["code:p.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let child = b.add_statement("weakly sourced child", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(parent, 1.0)]), true).unwrap();
+
+        b.invalidate_statement(parent, "retired").unwrap();
+
+        let n = b.get_node(child).unwrap();
+        assert!(!n.invalid);
+        assert_eq!(n.verification_status, VerificationStatus::Unproven,
+            "unsupported, not false");
+
+        // §6.5 — withdrawn support must not poison the node against evidence.
+        let src = b.add_source("a measurement", "test", Some("test:cmd = result".to_string()), None).unwrap();
+        b.add_source_to_statement(child, src).unwrap();
+        assert!(!b.get_node(child).unwrap().invalid);
+        assert_ne!(b.get_node(child).unwrap().verification_status, VerificationStatus::Unproven,
+            "attaching a measured source promotes normally");
+    }
+
+    /// §6.7 — refuting two ancestors of one dependent, in either order, must
+    /// leave the dependent at the same status. Invariant 4.
+    #[test]
+    fn refutation_order_does_not_change_the_outcome() {
+        fn run(order: [usize; 2]) -> VerificationStatus {
+            let mut b = temp_braim(&format!("order_{}{}", order[0], order[1]));
+            let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+            let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+            let p1 = b.add_statement("first ancestor", vec!["t".into()],
+                vec!["code:p1.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+            let p2 = b.add_statement("second ancestor", vec!["t".into()],
+                vec!["code:p2.rs:1".into()], HashMap::from([(a, 0.7), (c, 0.3)]), true).unwrap();
+            let child = b.add_statement("dependent of both", vec!["t".into()],
+                vec!["code:ch.rs:1".into(), "doc:ch.md:1".into()],
+                HashMap::from([(p1, 0.6), (p2, 0.4)]), true).unwrap();
+            let ids = [p1, p2];
+            b.invalidate_statement(ids[order[0]], "retired").unwrap();
+            b.invalidate_statement(ids[order[1]], "retired").unwrap();
+            b.get_node(child).unwrap().verification_status
+        }
+        assert_eq!(run([0, 1]), run([1, 0]), "final status must not depend on refutation order");
+    }
+
+    #[test]
+    fn revalidate_clears_orphan_contested_but_refuses_active_contradiction() {
+        let mut b = temp_braim("revalidate_orphan_contested");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("claim one", vec!["t".into()],
+            vec!["code:a.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("claim two", vec!["t".into()],
+            vec!["code:b.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        b.contradict_statements(s1, s2, "conflict", None).unwrap();
+        // active contradiction edge → revalidate must refuse
+        assert!(b.revalidate_statement(s1).is_err(), "must not touch a genuinely contested node");
+        // Orphan-contested trap: s3 inherits contested from s1, then its contested dep is
+        // swapped out. update_statement_deps skips recompute for contested nodes, so s3 is
+        // left contested with only concept deps and no contradiction edge of its own.
+        let s3 = b.add_statement("inherits contested", vec!["t".into()],
+            vec!["code:c.rs:1".into()], HashMap::from([(s1, 1.0)]), true).unwrap();
+        assert_eq!(b.get_node(s3).unwrap().verification_status, VerificationStatus::Contested);
+        b.update_statement_deps(s3, None, None, Some(HashMap::from([(a, 0.6), (c, 0.4)]))).unwrap();
+        assert_eq!(b.get_node(s3).unwrap().verification_status, VerificationStatus::Contested,
+            "update-deps leaves the orphan-contested node stuck");
+        // revalidate recomputes it off the contested state.
+        let (status, _) = b.revalidate_statement(s3).unwrap();
+        assert_eq!(status, VerificationStatus::Partial, "orphan-contested node recomputes to its source-derived status");
+    }
+
+    /// braim-contradiction-scoped-resolution.md, D1: `--both-stand` marks a
+    /// contradiction resolved without picking a side. Both statements (and
+    /// their dependents) must come out byte-identical to how they went in;
+    /// only the edge itself changes.
+    #[test]
+    fn both_stand_leaves_both_statements_byte_identical() {
+        let mut b = temp_braim("both_stand_byte_identical");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("default import discards duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("--full import unions duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:2".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let dependent = b.add_statement("depends on s2", vec!["t".into()],
+            vec!["narrative:n".into()], HashMap::from([(s2, 1.0)]), true).unwrap();
+
+        b.contradict_statements(s1, s2, "these look contradictory", None).unwrap();
+
+        let before_s1 = serde_json::to_string(b.get_node(s1).unwrap()).unwrap();
+        let before_s2 = serde_json::to_string(b.get_node(s2).unwrap()).unwrap();
+        let before_dependent = serde_json::to_string(b.get_node(dependent).unwrap()).unwrap();
+
+        b.resolve_contradiction_both_stand(s1, s2, "different modes of the same function, not a disagreement").unwrap();
+
+        assert_eq!(before_s1, serde_json::to_string(b.get_node(s1).unwrap()).unwrap(),
+            "the resolved side must be byte-identical");
+        assert_eq!(before_s2, serde_json::to_string(b.get_node(s2).unwrap()).unwrap(),
+            "the other side must be byte-identical");
+        assert_eq!(before_dependent, serde_json::to_string(b.get_node(dependent).unwrap()).unwrap(),
+            "a dependent must not be touched either");
+
+        let edge = b.state.contradicts.iter()
+            .find(|e| (e.from == s1 && e.to == s2) || (e.from == s2 && e.to == s1))
+            .unwrap();
+        assert!(edge.resolved);
+        assert_eq!(edge.resolution_kind.as_deref(), Some("scoped"));
+        assert_eq!(edge.resolution_reason.as_deref(), Some("different modes of the same function, not a disagreement"));
+        assert!(edge.resolution_winner.is_none(), "a scoped resolution picks no winner");
+    }
+
+    /// braim-contradiction-scoped-resolution.md, D2: reaching a third PRIMARY
+    /// type while a contradiction is live is corroboration, not adjudication.
+    /// Regression for the ID:179/235 incident: Mechanism A must report the
+    /// corroboration but leave both sides — and the edge — untouched.
+    #[test]
+    fn mechanism_a_reports_corroboration_without_mutating_either_side() {
+        let mut b = temp_braim("mechanism_a_report_only");
+        let a = b.add_concept("Alpha: first", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let s1 = b.add_statement("default import discards duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:1".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+        let s2 = b.add_statement("--full import unions duplicate sources", vec!["t".into()],
+            vec!["code:g.rs:2".into()], HashMap::from([(a, 0.6), (c, 0.4)]), true).unwrap();
+
+        b.contradict_statements(s1, s2, "these look contradictory", None).unwrap();
+
+        let src = b.add_source("third corroborating source", "doc", Some("doc:spec.md:1".into()), None).unwrap();
+        let result = b.add_source_to_statement(s1, src).unwrap();
+        assert_eq!(result.corroborated_with, Some(s2),
+            "a third PRIMARY type on s1, absent from s2, is corroboration");
+
+        assert_eq!(b.get_node(s1).unwrap().verification_status, VerificationStatus::Contested,
+            "the corroborated side must not be auto-promoted");
+        assert_eq!(b.get_node(s2).unwrap().verification_status, VerificationStatus::Contested,
+            "the other side must not be auto-invalidated");
+        assert!(!b.get_node(s2).unwrap().invalid, "no auto-invalidation");
+
+        let edge = b.state.contradicts.iter()
+            .find(|e| (e.from == s1 && e.to == s2) || (e.from == s2 && e.to == s1))
+            .unwrap();
+        assert!(!edge.resolved, "the contradiction remains unresolved");
+        assert!(edge.resolution_kind.is_none());
     }
 }

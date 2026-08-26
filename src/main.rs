@@ -1,4 +1,7 @@
+mod bootstrap;
+mod dream;
 mod graph;
+mod manifest;
 mod tips;
 // Without the embeddings feature the module compiles but only its pure helpers
 // are reachable from tests; suppress dead-code noise in that configuration.
@@ -6,7 +9,8 @@ mod tips;
 mod embed;
 
 use clap::{Parser, Subcommand};
-use graph::{Braim, NodeType, AddSourceResult};
+use dream::{Candidate, DreamOptions, Strategy};
+use graph::{Braim, NodeType, AddSourceResult, VerificationStatus};
 use std::collections::HashMap;
 
 #[derive(Parser)]
@@ -118,7 +122,7 @@ QUERY DEFAULTS (filter flags compose orthogonally):\n\
   --min-trust partial|proven                 → filter by verification level\n\
   --primary-only                             → only statements with ≥1 PRIMARY source\n\n\
   Concepts (atomic/compound) are always returned regardless of these flags.\n\n\
-SEMANTIC SIMILARITY (optional; build with --features embeddings):\n\
+SEMANTIC SIMILARITY (included in the default build):\n\
   braim similar \"<text>\"            → nearest labels by MEANING (zero shared words ok)\n\
   braim similar \"<label>\" --dedup   → write-time duplicate check (floor 0.8)\n\
   --check-dupes on concept/statement add → same check inline, advisory warn\n\
@@ -188,7 +192,7 @@ FOR AGENTS:\n\
       more central — express importance via asymmetric weights so query results,\n\
       perspective paths, and proximity scores reflect actual semantic structure.\n\
       See DEPENDENCY WEIGHTS section.\n\
-    • Putting line numbers in source node labels (braim source add 'file.rs:42')\n\
+    • Putting line numbers in source node labels (braim sources add 'file.rs:42')\n\
       — node labels are stable identity; put ranges in --sources metadata strings.\n\
     • Deleting and recreating a compound to change dependencies — use\n\
       'braim concept update-deps <id> --add/--remove/--set' to preserve node ID\n\
@@ -210,7 +214,7 @@ enum Commands {
     Concept(ConceptCommands),
     #[command(subcommand, about = "Create and manage statements (claims linking concepts)")]
     Statement(StatementCommands),
-    #[command(subcommand, about = "Manage source entities")]
+    #[command(name = "sources", alias = "source", subcommand, about = "Manage source entities")]
     Source(SourceCommands),
     #[command(about = "Find a single concept by name or ID", long_about = "Lookup: Find exact or fuzzy match for a concept by name or ID.\n\nExamples:\n  braim lookup Payment                           # Exact or fuzzy match with related nodes\n  braim lookup charge                            # Fuzzy: finds 'Charge', 'Charge Service'\n  braim lookup Payment --exact                   # Fast exact match only (O(1) lookup)\n  braim lookup Payment --no-related              # Skip related node enumeration\n  braim lookup payment --include-claims          # Show both facts and claims\n\nBy default, shows FACTS only (verified statements with ≥1 PRIMARY source).\nUse --include-claims to show CLAIMS (unproven statements with 0 PRIMARY sources).\n\nOutput shows:\n  • Badge (✓✓, ✓, ✗) indicating verification status\n  • ID, domains, label\n  • Immediate neighbors: nodes this concept depends on (up to 10)\n  • Immediate neighbors: nodes that reference this concept (up to 10)\n\nPerformance:\n  --exact: Fast path, skips fuzzy matching. Use when you know the exact name.\n  --no-related: Skip related node enumeration for instant results (shows concept only).\n  Without flags: Full lookup with fuzzy matching and up to 10 neighbors per category.")]
     Lookup {
@@ -241,7 +245,7 @@ enum Commands {
         include_invalid: bool,
         #[arg(long, help = "Include contested statements (hidden by default)")]
         include_contested: bool,
-        #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (requires --features embeddings)")]
+        #[arg(long, help = "If concept-graph traversal finds nothing, fall back to embedding search by meaning (default build; absent only with --no-default-features)")]
         semantic: bool,
     },
     #[command(about = "Find shortest connection between two concepts", long_about = "Proximity: Find the shortest path connecting term_a to term_b.\n\nExamples:\n  braim proximity Payment Invoice\n  braim proximity \"Voice Charge\" Account\n\nShows hop count and intermediate concepts.\n\nTraverses both depends_on (compositional, weighted) and because_of (causal,\nunweighted — followed cause → consequent at full weight, refuted links skipped).\nbecause_of endpoints are statements, so concept-to-concept paths are unaffected;\npass statement IDs to follow a causal chain.")]
@@ -266,7 +270,7 @@ enum Commands {
     Domains,
     #[command(about = "Audit the graph for consistency, gaps, and verification issues", long_about = "Audit: Scan the entire graph for problems and verification status.\n\nChecks:\n  • Orphan nodes (active, unreferenced, no dependencies)\n  • Pending nodes (declared but unintegrated)\n  • Statements grouped by verification status:\n      ✓✓✓ ProvenStrong (3+ PRIMARY sources)\n      ✓✓ Proven (2+ PRIMARY sources)\n      ✓ Partial (1 PRIMARY source)\n      ✗ Unproven (0 PRIMARY sources)\n  • Invalid statements (refuted claims)\n  • Deprecated nodes still referenced\n  • Gap register: zero-path relationships\n  • Weight constraint violations (must sum to 1.0)\n  • Causal-edge (because_of) health:\n      - Refuted links: edges a failed inverse test marked invalid\n      - Re-investigation flags: statements above an invalidated cause\n      - Untested links: active because_of edges with no inverse test\n      - Unverified roots: chains bottoming out below proven\n\nOutput organization:\n  1. Orphan nodes needing integration\n  2. Pending nodes (incomplete)\n  3. Gap register (missing connections)\n  4. Deprecated nodes still in use\n  5. Causal-edge health (refuted / flagged / untested / unverified roots)\n  6. Statement verification status breakdown\n  7. Invalid statements with reasons\n\nUse audit regularly to track:\n  • Verification coverage (% proven vs unproven)\n  • Integration status (orphans, pending)\n  • Consistency issues (gaps, weight violations)\n  • Deprecation problems (deprecated referenced)\n\nSemantic checks (--semantic, requires --features embeddings):\n  • Near-duplicates: unconnected node pairs with label cosine >= 0.80\n  • Label echoes: statements restating a dependency's label (cosine >= 0.75)\n    — single-concept elaborations that add no relationship\nBoth reuse the .braim/embeddings.json sidecar index and are ADVISORY.")]
     Audit {
-        #[arg(long, help = "Embedding-based checks: near-duplicate pairs and label echoes (requires --features embeddings)")]
+        #[arg(long, help = "Embedding-based checks: near-duplicate pairs and label echoes (default build; absent only with --no-default-features)")]
         semantic: bool,
     },
     #[command(about = "List all nodes (optionally filtered by domain or type)", long_about = "List: Display all nodes in the graph.\n\nExamples:\n  braim list                        # All nodes\n  braim list --domain payment       # Only 'payment' domain\n  braim list --type statement       # Only statements\n  braim list --domain acme --type atomic  # Combine filters\n\nOutput: ID, label, type, domains, source count, verification status.")]
@@ -283,19 +287,66 @@ enum Commands {
         #[arg(long, default_value = "8000", help = "Port to listen on")]
         port: u16,
     },
-    #[command(about = "Import concepts/statements from external source", long_about = "Import: Load graph data from JSON/CSV or other braim exports.\n\nUsage:\n  braim import data.json\n  braim import graph.csv --filter-domain payment\n  braim import backup.json --only-proven\n  braim import data.json --domain-map \"old:new,legacy:current\"\n\nAfter import, run: braim version save \"imported from X\"")]
+    #[command(about = "Import concepts/statements from external source", long_about = "Import: Load graph data from JSON/CSV or other braim exports.\n\nUsage:\n  braim import data.json\n  braim import graph.csv --filter-domain payment\n  braim import backup.json --only-proven\n  braim import data.json --domain-map \"old:new,legacy:current\"\n  braim import /other/.braim --full   # full-fidelity (trusted) import\n\nDefault mode treats the source as UNTRUSTED: verification resets to unproven,\nsource entities are dropped, and because_of/contradicts edges are not carried.\n\n--full is the TRUSTED self-import for consolidating your own graphs:\n  • verification status and verified_by preserved\n  • source entities imported, statement source_ids remapped\n  • because_of and contradicts edges carried (endpoints remapped)\n  • dedup hits UNION the duplicate's sources into the target and recompute\n    its status — corroboration stacks, promotion still needs distinct\n    PRIMARY types (braim ID:185/190)\n\n--only-proven admits proven AND proven_strong nodes.\n\nAfter import, run: braim version save \"imported from X\"")]
     Import {
         source: String,
         #[arg(long, help = "Only import nodes from specified domain")]
         filter_domain: Option<String>,
-        #[arg(long, help = "Only import proven statements")]
+        #[arg(long, help = "Only import proven/proven_strong statements")]
         only_proven: bool,
         #[arg(long, help = "Remap domain names during import (format: old:new,old2:new2)")]
         domain_map: Vec<String>,
+        #[arg(long, help = "Full-fidelity trusted import: preserve verification, carry source entities and because_of/contradicts edges, union duplicate sources")]
+        full: bool,
     },
     #[command(about = "Migrate legacy statement node_types to claim/fact/invalid_statement", long_about = "Migrate Node Types: Rewrite all `statement` node_type values to claim/fact/invalid_statement based on verification_status.\n\nPer BRAIM_NODE_TYPE_CLAIM_FACT_SPEC §6 — required after upgrading from versions that stored all statement-family nodes as `statement`.\n\nMapping:\n  verification_status == invalid          → invalid_statement\n  verification_status == unproven         → claim\n  verification_status in {partial, proven, proven_strong} → fact\n\nIdempotent. Safe to run multiple times.")]
     MigrateNodeTypes,
-    #[command(about = "Semantic similarity search over node labels (requires --features embeddings)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
+
+    #[command(name = "migrate-refutation", about = "Undo the pre-3.3 refutation cascade (dry by default)", long_about = "Migrate Refutation: repair nodes the OLD cascade marked invalid as collateral.\n\nUsage:\n  braim migrate-refutation           # report what would change, touch nothing\n  braim migrate-refutation --apply   # write the repair\n\nBefore BRAIM_DEPENDENCY_INHERITANCE_SPEC §3.3, invalidating a statement cascaded\n`Invalid` to every transitive dependent. Those nodes were never refuted on their\nown evidence — they were collateral, and they carry `invalid_reason:\ndepends_on_invalidated:<id>` to say so. §3.3 replaced that rule: a refuted\ndependency now leaves the cap set, and the dependent settles at whatever its own\nsources support. This command applies the new rule to nodes refuted under the\nold one.\n\nThe reason string is fully re-derivable, so nothing is lost by recomputing it\naway. Each repaired node is stamped `support_withdrawn_by` so the affected set\nstays a reviewable worklist rather than a silent verdict.\n\nDRY BY DEFAULT. Repairing hundreds of nodes without saying so would be\nindistinguishable from corrupting them (§4.5). Read the report, then --apply.\n\nIdempotent: a second run selects nothing. Checkpoint first — `braim version\nsave` — as with any bulk change.")]
+    MigrateRefutation {
+        #[arg(long, help = "Write the repair (default: report only)")]
+        apply: bool,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • floor at PARTIAL: a statement needs at least one PRIMARY source to publish,\n    so evidence-free claims stay home while single-source findings can reach\n    central and corroborate there (braim ID:253). --include-unproven removes\n    the floor entirely.\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
+    Export {
+        domain: String,
+        #[arg(long, help = "Target braim data dir (default: the central recorded by `braim init --team --central`)")]
+        to: Option<String>,
+        #[arg(long, help = "Also export unproven statements (default floor: partial, i.e. at least one PRIMARY source)")]
+        include_unproven: bool,
+        #[arg(long, help = "Remap domain names during export (format: old:new,old2:new2)")]
+        domain_map: Vec<String>,
+    },
+    #[command(about = "Set up this project for braim: local graph + agent policy hooks", long_about = "Init: bootstrap a working braim setup in one command.\n\nUsage:\n  braim init --team\n  braim init --team --central ~/.braim_central\n  braim init --team --settings .claude/settings.local.json\n\nWhat it does:\n  • Creates the local graph if absent\n  • Installs the agent policy hooks into .claude/settings.json:\n      UserPromptSubmit -> braim policy perturn      (per-turn marker logging)\n      PreCompact       -> braim policy compaction   (what to keep when compacting)\n  • Records where central lives, so `braim export <domain>` needs no --to\n\nThe hooks invoke `braim policy`, not a shell tool reading an absolute path, so\nthe same settings file works on Linux, macOS, and Windows and the policy stays\nversion-locked to the braim binary enforcing it.\n\nIdempotent: re-running reports what is already present and changes nothing.\nExisting settings and any hooks braim did not add are preserved.\n\nWhy solo-first: a teammate starting out has no graphs, so day-one value is the\nsetup that already works alone — a local graph plus the discipline hooks.\nSharing layers on once several graphs exist (braim ID:223).")]
+    Init {
+        #[arg(long, help = "Install the team agent setup (currently the only mode)")]
+        team: bool,
+        #[arg(long, help = "Path or URL of the central braim, recorded for later exports")]
+        central: Option<String>,
+        #[arg(long, help = "Settings file to write (default: .claude/settings.json)")]
+        settings: Option<String>,
+    },
+    #[command(about = "Print an agent policy payload (used by the hooks braim init installs)", long_about = "Policy: emit an agent-integration policy on stdout.\n\nUsage:\n  braim policy perturn        # UserPromptSubmit payload: per-turn marker logging\n  braim policy compaction     # PreCompact payload: keep IDs and edges, not prose\n  braim policy traits         # evidence-capture discipline, for agent memory\n\nThese are the contracts in policies/, embedded in the binary. Hooks call this\ncommand instead of reading a file, which keeps the wiring free of absolute paths\nand shell tools — portable across platforms and version-locked to this binary.")]
+    Policy {
+        name: String,
+    },
+    #[command(subcommand, about = "Dream: surface node pairs an LLM should examine for missing relations")]
+    Dream(DreamCommands),
+    #[command(about = "Fold a duplicate node into the one that survives", long_about = "MergeNodes: union two duplicate nodes into one, keeping all the evidence.\n\nUsage:\n  braim merge-nodes 42 99      # 42 survives, 99 is folded into it\n\nWhat it does:\n  • Unions the loser's sources, source entities, and verified_by into the winner\n  • Moves every reference: a node that depended on the loser now depends on the\n    winner, with weights SUMMED so a referent that cited both keeps its 1.0 total\n  • Moves because_of, contradicts, and gap-register entries, dropping self-edges\n  • Records merged_from on the winner as an audit trace, then removes the loser\n  • Recomputes the winner's verification — new PRIMARY types may promote it\n\nWhat it deliberately does NOT do:\n  • Merge the loser's dependencies into the winner. That would silently rewrite\n    what the surviving statement asserts, so any difference is REPORTED instead.\n\nRefused when: the nodes are the same, either is invalid (merging would launder\nrefuted evidence into a live node), they are of different kinds (concept vs\nstatement), or either depends on the other (related, not duplicate).\n\nThis is the union-merge the corroboration model assumes (braim ID:190/248):\nbefore it, deduplicating meant update-deps plus delete, which discarded the\nloser's sources entirely.")]
+    MergeNodes {
+        winner: u32,
+        loser: u32,
+    },
+    #[command(about = "Rename a domain across the graph", long_about = "RenameDomain: Replace a domain name on every node that carries it.\n\nUsage:\n  braim rename-domain Billing braim_demo\n\nEffect:\n  • Every node listing the old domain gets the new name (duplicates collapsed)\n  • In sharded layout, affected nodes re-home into the new domain's shard file;\n    the old current shard is pruned\n  • Versioned snapshots (*.vNNNN.json) are immutable history and keep the old name\n\nRename vs merge: renaming onto an EXISTING domain name merges the two domains —\nverify with evidence first that they mean the same thing (braim ID:244: same-name\ndomains proved to be demo vocabulary vs real billing knowledge).")]
+    RenameDomain {
+        old: String,
+        new: String,
+    },
+    #[command(about = "Convert this data dir to the sharded per-domain layout", long_about = "Shard: Convert single-file storage (current.json) to the sharded per-domain layout.\n\nLayout after conversion:\n  domains/<domain>-<hash>.json   one file per home domain (a node's home = first domains entry)\n  graph.json                     cross-domain state: dictionary, gaps, edges, counters\n  current.json.pre-shard         archived single-file snapshot (escape hatch)\n\nSemantics (braim ID:217/236):\n  • The in-memory graph stays ONE merged view — queries and traversal are unchanged.\n  • Every mutation rewrites the affected shard files; version save still writes whole-graph vNNNN.json snapshots.\n  • Domain filenames carry a deterministic hash suffix so distinct domains like 'Billing' and 'billing' never collide, including on case-insensitive filesystems (macOS/Windows).\n\nDetection is automatic: any braim command on a dir containing domains/ loads the sharded layout.")]
+    Shard,
+    #[command(about = "Semantic similarity search over node labels (default build; absent only with --no-default-features)", long_about = "Similar: Embedding-backed nearest-neighbour search over node labels.\n\nComplements `query` (concept-graph traversal): finds nodes by MEANING even with\nzero shared words, where lexical query returns nothing. Strongest as a write-time\nDEDUP check — surface a near-duplicate before adding a new node.\n\nExamples:\n  braim similar \"errors in early stages cascade into later ones\"\n  braim similar \"measuring how similar two texts are\" --top 10 --min-score 0.4\n  braim similar \"Cosine Similarity: vector angle measure\" --dedup   # dedup intent\n\nBuilds/refreshes a sidecar index at .braim/embeddings.json on first run; only\nnodes whose label changed are re-embedded thereafter. ADVISORY: it augments,\nnever overrides, the verification lifecycle. Quality is gated on clean\n'Concept: definition' labels (braim ID:6629).")]
     Similar {
         text: String,
         #[arg(long, default_value = "8", help = "Number of results to return")]
@@ -307,13 +358,15 @@ enum Commands {
         #[arg(long, help = "Dedup intent: raise the default score floor to 0.8 and flag likely duplicates")]
         dedup: bool,
     },
-    #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
+    #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n  braim meta 6318 --unset scope             # remove a key entirely\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
     Meta {
         id: u32,
-        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow)")]
+        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow)", conflicts_with_all = ["inc", "unset"])]
         set: Option<String>,
-        #[arg(long, help = "Increment a numeric key (e.g. recurrence)")]
+        #[arg(long, help = "Increment a numeric key (e.g. recurrence)", conflicts_with = "unset")]
         inc: Option<String>,
+        #[arg(long, help = "Remove a key entirely (e.g. terminal_cause)")]
+        unset: Option<String>,
     },
 
     #[command(name = "why-add", about = "Add a because_of causal edge (Five Whys)", long_about = "Why Add: record that one statement occurs because_of another (consequent → cause).\n\nUsage:\n  braim why-add 42 --because 17\n  braim why-add 42 --because 17 --source \"narrative:investigation_2026-06-19\"\n\nRules:\n  • Both endpoints must be STATEMENTS (not concepts).\n  • One outgoing because_of per statement (single cardinality). If a second cause\n    is suspected, model the competition with 'braim statement contradict'.\n  • Unweighted: each link asserts the principal cause.\n  • Cycles are rejected. Chain depth >= 7 warns; > 10 is rejected.\n  • --source must carry a typed prefix (code:|doc:|...|narrative:).\n\nThis edge is isolated from depends_on: perspective/proximity/query are unaffected.\nWalk the chain with 'braim why <id>'; validate a link with 'braim why-test <id>'.")]
@@ -362,7 +415,7 @@ enum ConceptCommands {
         depends: Option<String>,
         #[arg(long, help = "Reject concepts with duplicate sources or PRIMARY+TERTIARY mix")]
         strict_sources: bool,
-        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
     },
     #[command(about = "Delete a concept (requires --force unless unused)", long_about = "Concept Delete: Remove a concept from the graph.\n\nUsage:\n  braim concept delete 42         # Fails if concept is referenced\n  braim concept delete 42 --force # Force delete (dangerous, breaks statements)\n\nSafety: Deleting a concept breaks any statements/compounds that depend on it.\nUse --force only if you're certain no statements reference this ID.")]
@@ -408,7 +461,7 @@ enum StatementCommands {
         strict_sources: bool,
         #[arg(long, help = "Reject statements with duplicate domains")]
         strict_domains: bool,
-        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (requires --features embeddings)")]
+        #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
     },
     #[command(about = "Add verification evidence for a statement", long_about = "Statement Verify: Record evidence that supports a statement.\n\n⚠ NOTE: Verification status is now AUTO-CALCULATED from typed sources at statement creation.\nThis command is maintained for backward compatibility but is rarely needed.\n\nModern approach (preferred):\n  braim statement add \"...\" --sources \"code:a.rs,doc:b.md\" ...\n  → Status auto-calculated to PROVEN (2 PRIMARY sources)\n\nLegacy approach (still supported):\n  braim statement verify 42 wikipedia --note \"https://en.wikipedia.org/wiki/Payment\"\n  braim statement verify 42 rfc --note \"RFC 3501 section 3.2\"\n\nOld Verification Levels (deprecated, kept for audit trail):\n  • 0-1 verified_by domains: Unproven\n  • 2 verified_by domains: Partial\n  • 3+ verified_by domains: Proven\n\nUse statement add with typed sources instead. Sources determine verification automatically.")]
@@ -431,6 +484,10 @@ enum StatementCommands {
         #[arg(long, help = "Reason why statement is invalid")]
         reason: String,
     },
+    #[command(about = "Revive an invalidated statement (inverse of invalidate)", long_about = "Statement Revalidate: Clear the invalid flags on a single statement and recompute its verification_status from sources + dependency inheritance.\n\nUsage:\n  braim statement revalidate 169\n\nEffect:\n  • invalid flag, reason, and timestamp are cleared\n  • verification_status is recomputed from typed sources and valid-dependency inheritance\n  • node_type is reset accordingly (claim / fact)\n  • Does NOT cascade: revive dependents explicitly, in dependency order outward\n\nInvalid dependencies:\n  A dependency that is itself invalid is SKIPPED in the inheritance cap (not allowed to\n  re-poison this node) and reported as a warning. Re-anchor it with 'statement update-deps'\n  so the revival is durable.\n\nUse this to recover from an over-broad invalidate cascade, or when refuting evidence is withdrawn.")]
+    Revalidate {
+        id: u32,
+    },
     #[command(about = "Suggest verification sources for a statement", long_about = "Statement VerifySuggest: Find candidate verification sources for an unproven statement.\n\nProblem: Verifying statements requires agents to manually search for evidence.\nSolution: suggest recommends candidate sources based on domain context and similarity.\n\nUsage:\n  braim statement verify-suggest 42\n  braim statement verify-suggest 5\n\nOutput recommendations (by priority):\n  1. Similar verified statements in same domain\n     → If domain:payment has verified statements, show them\n     → Suggests which sources proved similar claims\n  \n  2. Code locations mentioned in statement\n     → If statement mentions \"messageService.js:110-149\"\n     → Suggests code:src/services/messageService.js:110-149\n  \n  3. Recommended source types by domain\n     → domain:payment → suggests doc: sources (spec links)\n     → domain:security → suggests config: sources (settings)\n     → domain:database → suggests schema: sources (DDL)\n\nWorkflow:\n  1. Create unproven statement: braim statement add \"...\" --sources \"narrative:assumption\" ...\n  2. Get suggestions: braim statement verify-suggest <ID>\n  3. Re-create with typed sources: braim statement add \"...\" --sources \"code:verified.rs,doc:spec.md\" ...\n  4. Verification status auto-calculates to PROVEN\n\nNote: Helps agents find evidence without manual investigation.")]
     VerifySuggest {
         id: u32,
@@ -451,10 +508,28 @@ enum StatementCommands {
         #[arg(long, help = "Replace all dependencies: \"ID:weight[,ID:weight]\" (exclusive with --add/--remove)")]
         set: Option<String>,
     },
-    #[command(about = "Attach a source entity to an existing statement", long_about = "Statement AddSource: Link a first-class source entity to a statement after creation.\n\nUsage:\n  braim statement add-source 42 --source-id 5001\n\nEffect on non-contested statements:\n  • Appends source entity to the statement's source_ids list\n  • Recomputes verification_status from all string sources + source entities\n  • A new PRIMARY-typed source can raise the verification level\n\nEffect on contested statements (Mechanism A auto-resolution):\n  • If the source is PRIMARY-typed AND the other contested statement does NOT\n    have this source, auto-resolution fires:\n      Winner (this statement) → status recomputed (likely partial/proven/proven_strong)\n      Loser  (other statement) → invalid; cascades to its dependents\n      Contradicts edge → marked resolved\n  • If the new source is on both sides (corroborates both), no auto-resolution;\n    use 'statement resolve-contradiction' instead.\n\nWorkflow:\n  braim source add \"Audit log entry\" --type transcript --location \"transcript:audit.txt:88\"\n  # → ID:5001\n  braim statement add-source 42 --source-id 5001\n  # If 42 is contested and the other side lacks source 5001 → auto-resolved")]
+    #[command(about = "Attach a source entity to an existing statement", long_about = "Statement AddSource: Link a first-class source entity to a statement after creation.\n\nUsage:\n  braim statement add-source 42 --source-id 5001\n\nEffect on non-contested statements:\n  • Appends source entity to the statement's source_ids list\n  • Recomputes verification_status from all string sources + source entities\n  • A new PRIMARY-typed source can raise the verification level\n\nEffect on contested statements (Mechanism A, report-only):\n  • If the source is PRIMARY-typed AND the other contested statement does NOT\n    have this source, that is corroboration — braim reports it, but does NOT\n    mutate either statement. Both stay contested. Accumulating unrelated\n    evidence for one side is not evidence the contradiction itself was\n    adjudicated (braim-contradiction-scoped-resolution.md).\n  • Settling it always requires an explicit call:\n      braim statement resolve-contradiction <a> <b> --winner <id> --reason \"...\"\n      braim statement resolve-contradiction <a> <b> --both-stand --reason \"...\"\n  • If the new source is on both sides (corroborates both), nothing is reported;\n    use 'statement resolve-contradiction' when ready.\n\nWorkflow:\n  braim sources add \"Audit log entry\" --type transcript --location \"transcript:audit.txt:88\"\n  # → ID:5001\n  braim statement add-source 42 --source-id 5001\n  # If 42 is contested and the other side lacks source 5001 → corroboration reported")]
     AddSource {
         id: u32,
-        #[arg(long, help = "Source entity ID to attach (from 'braim source add')")]
+        #[arg(long, help = "Source entity ID to attach (from 'braim sources add')")]
+        source_id: u32,
+    },
+    #[command(name = "update-sources", about = "Add, remove, or replace a statement's string sources", long_about = "Statement UpdateSources: Correct a statement's typed source strings in place.\n\nUsage:\n  braim statement update-sources 42 --add \"doc:spec.md:12-18\"\n  braim statement update-sources 42 --remove \"doc:spec.md:5\" --add \"doc:spec.md:12-18\"\n  braim statement update-sources 42 --set \"doc:spec.md:12-18,code:impl.rs:40-55\"\n\nPreserves the statement ID and every depends_on/because_of/contradicts edge\nreferencing it — the alternative (delete + re-add) breaks all three, and\ninvalidate is wrong for a node whose only defect is a wrong citation, not its\nbody (invalidate cascades to dependents).\n\nRules:\n  • --set is exclusive: --add and --remove are ignored when --set is provided\n  • Every new string (via --add or --set) must carry a typed prefix\n    (code:|doc:|schema:|config:|transcript:|test:|phase_N:|agent:|narrative:|\n    logic:|inference:) — rejected otherwise, same as 'statement add'\n  • --remove errors if the exact string is not currently a source\n  • Duplicate-source and PRIMARY+TERTIARY-mix issues in the RESULTING list\n    warn by default; --strict-sources makes them errors, same as 'statement add'\n  • Refused if the result would leave zero string sources AND zero attached\n    source entities (see 'statement add-source' for entities)\n  • Verification recomputes from the new sources + attached entities — can\n    demote when the last source of a PRIMARY type is removed\n  • Invalid and Contested statements keep the edit but skip the recompute\n    (matches 'statement delete-source': those states come from\n    invalidation/contradiction, not source diversity)")]
+    UpdateSources {
+        id: u32,
+        #[arg(long, help = "Add source strings: \"type:loc[,type:loc]\"")]
+        add: Option<String>,
+        #[arg(long, help = "Remove source strings by exact match: \"type:loc[,type:loc]\"")]
+        remove: Option<String>,
+        #[arg(long, help = "Replace all string sources: \"type:loc[,type:loc]\" (exclusive with --add/--remove)")]
+        set: Option<String>,
+        #[arg(long, help = "Treat duplicate-source / PRIMARY+TERTIARY-mix issues as errors")]
+        strict_sources: bool,
+    },
+    #[command(name = "delete-source", about = "Detach a source entity from a statement", long_about = "Statement DeleteSource: Remove a previously attached source entity from a statement (the inverse of add-source).\n\nUsage:\n  braim statement delete-source 42 --source-id 5001\n\nEffect:\n  • Removes the source entity from the statement's source_ids list\n  • Recomputes verification_status from the remaining string sources + source\n    entities — removing the last source of a PRIMARY type can demote the\n    statement (e.g. proven -> partial, partial -> unproven)\n  • Invalid and contested statements are left untouched: those states come\n    from invalidation/contradiction, not source diversity, so detaching a\n    source here does not revive or alter them\n\nErrors if the source ID is not currently attached to the statement.")]
+    DeleteSource {
+        id: u32,
+        #[arg(long, help = "Source entity ID to detach")]
         source_id: u32,
     },
     #[command(about = "Mark two statements as contradicting each other", long_about = "Statement Contradict: Record that two statements make incompatible claims about the same subject.\n\nUsage:\n  braim statement contradict 42 99 \\\n    --reason \"Statement 42 says 24h, statement 99 says 48h per spec_v2\"\n\n  braim statement contradict 42 99 \\\n    --reason \"Contradicted by spec_v2\" --source 5001\n\nEffect:\n  • Both statements move to 'contested' verification_status\n  • Both are hidden from default queries (use --include-contested to surface them)\n  • Neither can be auto-promoted while contested — new sources do not raise them\n  • Dependents of contested statements inherit the contested state\n\nResolution:\n  Explicit:  braim statement resolve-contradiction <winner> <loser> --winner <id> --reason \"...\"\n  → Winner: status restored to pre-contested level (or recomputed from sources)\n  → Loser:  becomes invalid, cascades to its dependents\n\nQuery contested statements:\n  braim query \"term\" --include-contested\n\nSee CONTRADICTION RESOLUTION section in 'braim --help' for full workflow.")]
@@ -466,22 +541,108 @@ enum StatementCommands {
         #[arg(long, help = "Source ID that revealed the conflict (optional)")]
         source: Option<u32>,
     },
-    #[command(about = "Resolve a contradiction between two statements", long_about = "Statement ResolveContradiction: Declare a winner and loser for an active contradiction.\n\nUsage:\n  braim statement resolve-contradiction 42 99 \\\n    --winner 42 --reason \"spec_v1 is authoritative; spec_v2 was a draft\"\n\n  braim statement resolve-contradiction 42 99 \\\n    --winner 99 --reason \"Confirmed by code review\" --source 5002\n\nArguments:\n  stmt_a, stmt_b:  The two statement IDs involved in the contradiction\n  --winner:        ID of the statement that is correct\n  --reason:        Explanation for why this side wins\n  --source:        Optional source entity ID that corroborates the winner\n\nEffect:\n  Winner:\n    • verification_status restored to pre-contested level (or recomputed from sources)\n    • node_type updated accordingly (claim / fact)\n  Loser:\n    • verification_status → invalid\n    • node_type → invalid_statement\n    • Cascade-invalidates all transitive dependents of the loser\n  Contradicts edge:\n    • Marked resolved=true with resolution_winner and resolution_source recorded\n\nPre-conditions:\n  • An unresolved 'contradicts' edge must exist between stmt_a and stmt_b\n  • Neither statement can already be invalid\n  • --winner must be one of the two statement IDs provided")]
+    #[command(about = "Resolve a contradiction between two statements", long_about = "Statement ResolveContradiction: Declare a winner and loser for an active contradiction, or mark both as standing without conflict.\n\nUsage:\n  braim statement resolve-contradiction 42 99 \\\n    --winner 42 --reason \"spec_v1 is authoritative; spec_v2 was a draft\"\n\n  braim statement resolve-contradiction 42 99 \\\n    --winner 99 --reason \"Confirmed by code review\" --source 5002\n\n  braim statement resolve-contradiction 42 99 \\\n    --both-stand --reason \"both describe the same function under different conditions\"\n\nArguments:\n  stmt_a, stmt_b:  The two statement IDs involved in the contradiction\n  --winner:        ID of the statement that is correct (mutually exclusive with --both-stand)\n  --both-stand:    Neither statement wins; both are true and just don't overlap\n  --reason:        Explanation for the resolution\n  --source:        Optional source entity ID that corroborates the winner (--winner only)\n\nEffect (--winner):\n  Winner:\n    • verification_status restored to pre-contested level (or recomputed from sources)\n    • node_type updated accordingly (claim / fact)\n  Loser:\n    • verification_status → invalid\n    • node_type → invalid_statement\n    • Cascade-invalidates all transitive dependents of the loser\n  Contradicts edge:\n    • Marked resolved=true, resolution_kind=winner, with resolution_winner/resolution_source/resolution_reason recorded\n\nEffect (--both-stand):\n  • Neither statement's verification_status, node_type, or dependents are touched\n  • Contradicts edge: marked resolved=true, resolution_kind=scoped, resolution_reason recorded\n\nPre-conditions:\n  • An unresolved 'contradicts' edge must exist between stmt_a and stmt_b\n  • Neither statement can already be invalid\n  • Exactly one of --winner or --both-stand must be given\n  • --winner must be one of the two statement IDs provided")]
     ResolveContradiction {
         stmt_a: u32,
         stmt_b: u32,
-        #[arg(long, help = "ID of the winning statement")]
-        winner: u32,
+        #[arg(long, help = "ID of the winning statement", conflicts_with = "both_stand")]
+        winner: Option<u32>,
+        #[arg(long, help = "Mark both statements as standing without conflict (scoped resolution, no winner/loser)")]
+        both_stand: bool,
         #[arg(long, help = "Reason for the resolution")]
         reason: String,
-        #[arg(long, help = "Source ID that corroborates the winner (optional)")]
+        #[arg(long, help = "Source ID that corroborates the winner (optional, --winner only)")]
         source: Option<u32>,
     },
 }
 
 #[derive(Subcommand)]
+enum DreamCommands {
+    #[command(about = "List node pairs worth an LLM's judgement", long_about = "Dream Candidates: rank unconnected node pairs that an LLM should examine for a missing relation.\n\nUsage:\n  braim dream candidates --limit 50\n  braim dream candidates --strategy shared-source,two-hop --json\n  braim dream candidates --strategy semantic --min-semantic 0.8\n\nWhy braim picks the pairs: a 3,000-node graph has ~5 million pairs, so unguided\nsampling burns an overnight budget on noise. braim does the cheap deterministic\nhalf (which pairs are worth reading); the LLM does the expensive half (whether a\nrelation is real and whether sources prove it).\n\nStrategies:\n  shared-source  both nodes cite the same PRIMARY source but were never linked\n  two-hop        A-B and B-C exist, A-C does not (transitive candidate)\n  semantic       labels semantically close yet more than two hops apart\n  gap            a registered zero-path pair a real query already wanted\n\nA pair nominated by several strategies scores higher — independent structural\nsignals agreeing is itself evidence.\n\nExcluded by default: directly linked pairs, invalid nodes, source entities,\nagent-scratch markers (--include-scratch overrides), and pairs already recorded\nin the dream ledger (--replay overrides).\n\nThis command is READ-ONLY. Dream output must land as unproven claims in a local\nworking graph and earn promotion through genuinely re-grounded PRIMARY sources,\nlike any other statement — an LLM asked whether two nodes relate will nearly\nalways say yes.\n\nRefused on graphs marked central (.braim.central): a dream is an unreviewed\nhypothesis, and an unattended central has no reviewer.")]
+    Candidates {
+        #[arg(long, default_value = "25", help = "Maximum pairs to emit")]
+        limit: usize,
+        #[arg(long, help = "Comma-separated: shared-source, two-hop, semantic, gap (default: all but semantic)")]
+        strategy: Option<String>,
+        #[arg(long, help = "Minimum cosine for the semantic strategy")]
+        min_semantic: Option<f32>,
+        #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
+        include_scratch: bool,
+        #[arg(long, help = "Reconsider pairs already recorded in the dream ledger")]
+        replay: bool,
+        #[arg(long, help = "Emit JSON for an agent loop to consume")]
+        json: bool,
+    },
+    #[command(about = "Rank load-bearing causes by how much rests on them", long_about = "Dream Constraints: rank causes by leverage — how many statements would need re-examining if this one stopped being true.\n\nUsage:\n  braim dream constraints --limit 10\n  braim dream constraints --json\n\nbraim cannot tell a constraint from any other cause — that is a judgement about\nmeaning. What it computes is the blast radius: the transitive set of statements\nreaching a cause through because_of, scaled by how well evidenced that cause is.\nAn unproven cause is discounted (relaxing an opinion is meaningless) but still\nlisted, since a high-impact assumption may be the one worth testing.\n\nThe LLM then decides which of the top entries are actually constraints and\nwhether they can be relaxed. Same split as pair-dreaming: braim picks the\ntarget deterministically, the model supplies judgement (braim ID:323).\n\nreads_as_limitation is an ADVISORY annotation only. Limitation vocabulary\nmatched 61 of 161 statements on a real graph, mostly false positives, so it is\nreported to the reader and contributes nothing to the ranking.\n\nRead-only, and refused on graphs marked .braim.central like the rest of dream.")]
+    Constraints {
+        #[arg(long, default_value = "15", help = "Maximum causes to emit")]
+        limit: usize,
+        #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
+        include_scratch: bool,
+        #[arg(long, help = "Include constraints already walked, even with nothing new since")]
+        include_walked: bool,
+        #[arg(long, help = "Emit JSON for an agent loop to consume")]
+        json: bool,
+    },
+    #[command(about = "Walk one constraint: what rests on it, what it serves, and whether it is stale", long_about = "Dream What-If: relax one constraint and see what moves.\n\nUsage:\n  braim dream whatif 186\n  braim dream whatif 186 --json\n\nPick a target with `braim dream constraints`, then walk it here. The walk goes\nboth ways: DOWN through because_of to everything resting on the constraint (what\ncomes into play if it is lifted), and UP to the root goal the constraint\nultimately serves (what the relaxation is FOR).\n\nStaleness signals come first for a reason. Whether relaxing a constraint would\nimprove anything is unprovable, but whether the constraint STILL HOLDS is an\nordinary question about current sources — and that is the half of what-if\ndreaming that yields real findings (braim ID:324). A signal is a statement\nciting the same PRIMARY source file, written later, evidenced at least as well,\nwith no contradiction linking the two yet. braim reports them and stops:\nraising a contradiction is a deliberate claim needing a reason and a source,\nnot something to infer from a shared file path.\n\nWhatever the LLM writes from the relaxation itself is a hypothesis. Tag it\n`braim meta <id> --set counterfactual=true` — export refuses those by design,\nbecause no source can prove that removing a constraint would improve an outcome\n(braim ID:322).\n\nRead-only, and refused on graphs marked .braim.central like the rest of dream.")]
+    Whatif {
+        #[arg(help = "Statement id to relax — pick one from `braim dream constraints`")]
+        id: u32,
+        #[arg(long, default_value = "5", help = "Maximum staleness signals to report")]
+        signals: usize,
+        #[arg(long, help = "Also consider nodes tagged scope=agent_scratch")]
+        include_scratch: bool,
+        #[arg(long, help = "Emit JSON for an agent loop to consume")]
+        json: bool,
+    },
+    #[command(about = "Raise something for a human to look at", long_about = "Dream Flag: put an observation in the review queue, where it survives the session.\n\nUsage:\n  braim dream flag \"merge 412 warned about deps only the loser had\" --kind merge --nodes 412,88\n  braim dream flag \"looked like a contradiction but I could not ground it\" --kind unraised\n\nA night's most review-worthy output is often not a node: a merge warning, detail\ndestroyed with a loser's label, a contradiction the adjudicator could not ground.\nThose used to go in the closing report, which lives in the model's context and\ndoes not survive compaction — so the part of the night that most needed eyes was\nthe part that evaporated (braim ID:347).\n\nThe queue lives in reviews.json beside the graph. Read it with `braim dream\nreview`, sign an item off with `braim dream reviewed <id>`.")]
+    Flag {
+        #[arg(help = "What a human should look at")]
+        note: String,
+        #[arg(long, default_value = "note", help = "merge | unraised | duplicate | rate | note")]
+        kind: String,
+        #[arg(long, help = "Node ids this concerns, comma-separated")]
+        nodes: Option<String>,
+    },
+    #[command(about = "List what a night left for a human", long_about = "Dream Review: the queue of items raised by `braim dream flag`, pending first.\n\nUsage:\n  braim dream review\n  braim dream review --all      # include items already signed off\n  braim dream review --json\n\nThis is what to read after an unattended night. It survives context compaction\nbecause it is a file beside the graph, not prose in a report.\n\nSee also: `braim list --meta scope=dream` for the nodes a session created, and\n`braim dream log` for the pair verdicts.")]
+    Review {
+        #[arg(long, help = "Include items already signed off")]
+        all: bool,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Sign a review item off", long_about = "Dream Reviewed: mark a queue item as handled.\n\nUsage:\n  braim dream reviewed 3\n  braim dream reviewed 3 --note \"wired the dependency by hand\"\n\nCleared items are kept, not deleted: what a human decided is itself worth\nkeeping, and a queue that forgets its own history cannot be audited. See them\nwith `braim dream review --all`.")]
+    Reviewed {
+        #[arg(help = "Review item id from `braim dream review`")]
+        id: u32,
+        #[arg(long, help = "What you did about it")]
+        note: Option<String>,
+    },
+    #[command(about = "Read back the pair verdicts a night recorded", long_about = "Dream Log: the adjudication ledger (dreams.json), newest first.\n\nUsage:\n  braim dream log --limit 20\n  braim dream log --since 2026-08-10\n  braim dream log --verdict verified\n  braim dream log --json\n\nThe ledger records every pair a session judged, with the note the adjudicator\nwrote. It was previously write-only from the CLI — `dream seen` put entries in\nand only the candidate generator read them back, so the reasoning behind 1939\nverdicts was reachable only with jq (braim ID:347).")]
+    Log {
+        #[arg(long, help = "Only entries recorded on or after this date (YYYY-MM-DD)")]
+        since: Option<String>,
+        #[arg(long, help = "no-relation | proposed | verified | contradiction | duplicate")]
+        verdict: Option<String>,
+        #[arg(long, default_value = "25", help = "Maximum entries to show")]
+        limit: usize,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Record a dream verdict so the pair is not re-examined", long_about = "Dream Seen: write a pair's adjudication into the dream ledger (dreams.json).\n\nUsage:\n  braim dream seen 42 99 --verdict no-relation\n  braim dream seen 42 99 --verdict proposed --note \"statement ID:150 added\"\n\nVerdicts:\n  no-relation    examined, nothing there — never offer this pair again\n  proposed       a relation was recorded as an unproven claim for review\n  verified       a relation was recorded WITH re-grounded PRIMARY sources\n  contradiction  the two nodes actually disagree; a contradicts edge was raised\n\nThe ledger is what lets successive nights advance instead of re-treading the\nsame pairs.")]
+    Seen {
+        a: u32,
+        b: u32,
+        #[arg(long, help = "no-relation | proposed | verified | contradiction")]
+        verdict: String,
+        #[arg(long, help = "Optional note (e.g. the statement id that was created)")]
+        note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SourceCommands {
-    #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim source add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim source add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n  --strict-sources: Reject if label contains a line-number suffix (default: warn)\n\nLine-number warning:\n  Labels like 'tests/oracle.txt:104-127' or 'file.rs:42' are warned by default\n  and rejected with --strict-sources. Source nodes are stable file-level identity;\n  line numbers belong in --sources metadata strings, not node labels.\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
+    #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim sources add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim sources add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n  --strict-sources: Reject if label contains a line-number suffix (default: warn)\n\nLine-number warning:\n  Labels like 'tests/oracle.txt:104-127' or 'file.rs:42' are warned by default\n  and rejected with --strict-sources. Source nodes are stable file-level identity;\n  line numbers belong in --sources metadata strings, not node labels.\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
     Add {
         label: String,
         #[arg(long, help = "Source type: code, doc, schema, config, transcript, test, phase_N, agent, narrative, logic, inference")]
@@ -575,10 +736,49 @@ fn statement_family_visible(
     }
 }
 
+/// True for commands that only read this data dir. Everything else takes the
+/// cross-process write lock before loading, so its read-modify-write cycle
+/// cannot interleave with another process's (braim ID:250).
+///
+/// Two entries deserve their reasoning:
+///   • `Proximity`/`Perspective` are deliberately ABSENT — they look like
+///     queries but register gap records and flush, so they are writers.
+///   • `Export` is present because it only READS this dir; the target central
+///     graph is opened separately with its own lock.
+fn is_read_only(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Lookup { .. }
+            | Commands::Query { .. }
+            | Commands::Node { .. }
+            | Commands::List { .. }
+            | Commands::Domains
+            | Commands::Audit { .. }
+            | Commands::Serve { .. }
+            | Commands::Similar { .. }
+            | Commands::Why { .. }
+            | Commands::Export { .. }
+            | Commands::Dream(DreamCommands::Candidates { .. })
+            | Commands::Dream(DreamCommands::Constraints { .. })
+            | Commands::Dream(DreamCommands::Whatif { .. })
+            | Commands::Dream(DreamCommands::Review { .. })
+            | Commands::Dream(DreamCommands::Log { .. })
+            | Commands::Policy { .. }
+            | Commands::Init { .. }
+            | Commands::Statement(StatementCommands::VerifySuggest { .. })
+            | Commands::Version(VersionCommands::List)
+    )
+}
+
 fn main() {
     let cli = Cli::parse();
 
-    let mut braim = match Braim::new(&cli.data_dir) {
+    let open = if is_read_only(&cli.command) {
+        Braim::new(&cli.data_dir)
+    } else {
+        Braim::open_for_write(&cli.data_dir)
+    };
+    let braim = match open {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{}", e);
@@ -586,7 +786,23 @@ fn main() {
         }
     };
 
-    let result = match cli.command {
+    // `run` OWNS the graph, so the cross-process write lock is released by Drop
+    // when it returns — on the error paths too. Exiting the process from inside
+    // a command handler skips that Drop and strands .braim.lock for the full
+    // stale window, which one missing --domains used to do (braim ID:326).
+    let result = run(cli, braim);
+
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Dispatch one command. Fails by returning `Err`, never by exiting: an early
+/// `std::process::exit` here would skip `Braim`'s Drop and leak the write lock
+/// (braim ID:326).
+fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
+    match cli.command {
         Commands::Concept(ConceptCommands::Add {
             term,
             domains,
@@ -605,8 +821,7 @@ fn main() {
             let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
             if has_dup_sources {
                 if strict_sources {
-                    eprintln!("Error: duplicate source entries detected");
-                    std::process::exit(1);
+                    return Err("Error: duplicate source entries detected".to_string());
                 } else {
                     tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
                 }
@@ -615,8 +830,7 @@ fn main() {
             // Validate PRIMARY+TERTIARY mix
             if Braim::validate_primary_tertiary_mix(&sources_list) {
                 if strict_sources {
-                    eprintln!("Error: PRIMARY and TERTIARY sources mixed on same statement");
-                    std::process::exit(1);
+                    return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
                 } else {
                     tips::emit_tip_primary_tertiary_mix(cli.quiet);
                 }
@@ -626,8 +840,7 @@ fn main() {
                 Some(d) => Some(match parse_depends(&d) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
+                        return Err(format!("{}", e));
                     }
                 }),
                 None => None,
@@ -685,8 +898,7 @@ fn main() {
         }
         Commands::Concept(ConceptCommands::Delete { id, force }) => {
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Concept ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Concept ID {} not found", id));
             }
 
             // Find dependents
@@ -703,8 +915,7 @@ fn main() {
                     eprintln!("  - ID:{}  {}", dep_id, dep_label);
                 }
                 eprintln!("");
-                eprintln!("Delete anyway? Use --force to confirm.");
-                std::process::exit(1);
+                return Err("Delete anyway? Use --force to confirm.".to_string());
             }
 
             match braim.delete_node(id) {
@@ -722,14 +933,12 @@ fn main() {
             let new_weights = match parse_depends(&weights) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             };
 
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Concept ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Concept ID {} not found", id));
             }
 
             match braim.update_weights(id, new_weights.clone()) {
@@ -739,15 +948,14 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
         Commands::Concept(ConceptCommands::UpdateDeps { id, add, remove, set }) => {
             let add_map = match add.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             let remove_ids: Option<Vec<u32>> = match remove.as_deref() {
@@ -755,19 +963,18 @@ fn main() {
                     let parsed: Result<Vec<u32>, _> = s.split(',').map(|x| x.trim().parse::<u32>()).collect();
                     match parsed {
                         Ok(v) => Some(v),
-                        Err(_) => { eprintln!("Error: --remove must be comma-separated IDs (e.g. \"3,7\")"); std::process::exit(1); }
+                        Err(_) => { return Err("Error: --remove must be comma-separated IDs (e.g. \"3,7\")".to_string()); }
                     }
                 }
                 None => None,
             };
             let set_map = match set.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             if add_map.is_none() && remove_ids.is_none() && set_map.is_none() {
-                eprintln!("Error: provide at least one of --add, --remove, or --set");
-                std::process::exit(1);
+                return Err("Error: provide at least one of --add, --remove, or --set".to_string());
             }
             match braim.update_deps(id, add_map, remove_ids, set_map) {
                 Ok(new_deps) => {
@@ -776,8 +983,7 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
@@ -797,24 +1003,21 @@ fn main() {
             }
             // Validation: inferred flag is mutually exclusive with explicit sources
             if inferred && sources.is_some() {
-                eprintln!("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.");
-                std::process::exit(1);
+                return Err("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.".to_string());
             }
 
             // Validation: reject manual "inferred" as a source value
             if !inferred && sources.is_some() {
                 let sources_str = sources.as_ref().unwrap();
                 if sources_str.contains("inferred") {
-                    eprintln!("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.");
-                    std::process::exit(1);
+                    return Err("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.".to_string());
                 }
             }
 
             let depends_map = match parse_depends(&depends) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             };
 
@@ -829,8 +1032,7 @@ fn main() {
                 (doms, sources_vec)
             } else {
                 if domains.is_none() || sources.is_none() {
-                    eprintln!("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.");
-                    std::process::exit(1);
+                    return Err("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.".to_string());
                 }
                 (parse_list(domains.as_ref().unwrap()), parse_list(sources.as_ref().unwrap()))
             };
@@ -840,8 +1042,7 @@ fn main() {
                 let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
                 if has_dup_sources {
                     if strict_sources {
-                        eprintln!("Error: duplicate source entries detected");
-                        std::process::exit(1);
+                        return Err("Error: duplicate source entries detected".to_string());
                     } else {
                         tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
                     }
@@ -850,8 +1051,7 @@ fn main() {
                 // Validate PRIMARY+TERTIARY mix (Issue 2)
                 if Braim::validate_primary_tertiary_mix(&sources_list) {
                     if strict_sources {
-                        eprintln!("Error: PRIMARY and TERTIARY sources mixed on same statement");
-                        std::process::exit(1);
+                        return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
                     } else {
                         tips::emit_tip_primary_tertiary_mix(cli.quiet);
                     }
@@ -862,8 +1062,7 @@ fn main() {
             let (has_dup_domains, dup_domain_counts) = Braim::validate_duplicate_domains(&domains_list);
             if has_dup_domains {
                 if strict_domains {
-                    eprintln!("Error: duplicate domain entries detected");
-                    std::process::exit(1);
+                    return Err("Error: duplicate domain entries detected".to_string());
                 } else if braim.distinct_domain_count() > 1 {
                     // Suppress in single-domain graphs — uniform repetition is expected
                     tips::emit_tip_duplicate_domains(&dup_domain_counts, cli.quiet);
@@ -917,8 +1116,7 @@ fn main() {
         }
         Commands::Statement(StatementCommands::Delete { id, force }) => {
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Statement ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Statement ID {} not found", id));
             }
 
             // Find dependents
@@ -935,8 +1133,7 @@ fn main() {
                     eprintln!("  - ID:{}  {}", dep_id, dep_label);
                 }
                 eprintln!("");
-                eprintln!("Delete anyway? Use --force to confirm.");
-                std::process::exit(1);
+                return Err("Delete anyway? Use --force to confirm.".to_string());
             }
 
             match braim.delete_node(id) {
@@ -976,6 +1173,22 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Statement(StatementCommands::Revalidate { id }) => {
+            match braim.revalidate_statement(id) {
+                Ok((status, invalid_deps)) => {
+                    let node = &braim.state.nodes[&id];
+                    println!("✓ Statement ID:{} revalidated", id);
+                    println!("  Status: {} {}", status.badge(), status.label());
+                    println!("  Original: {}", node.label);
+                    if !invalid_deps.is_empty() {
+                        eprintln!("⚠ still depends on invalid node(s): {:?}", invalid_deps);
+                        eprintln!("  these were skipped in the inheritance cap — re-anchor with 'braim statement update-deps {} --set ...' to make the revival durable", id);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         Commands::Statement(StatementCommands::VerifySuggest { id }) => {
             match braim.verify_suggest(id) {
                 Ok(report) => {
@@ -1010,14 +1223,12 @@ fn main() {
             let new_weights = match parse_depends(&weights) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             };
 
             if !braim.state.nodes.contains_key(&id) {
-                eprintln!("Error: Statement ID {} not found", id);
-                std::process::exit(1);
+                return Err(format!("Error: Statement ID {} not found", id));
             }
 
             match braim.update_weights(id, new_weights.clone()) {
@@ -1027,15 +1238,14 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
         Commands::Statement(StatementCommands::UpdateDeps { id, add, remove, set }) => {
             let add_map = match add.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             let remove_ids: Option<Vec<u32>> = match remove.as_deref() {
@@ -1043,19 +1253,18 @@ fn main() {
                     let parsed: Result<Vec<u32>, _> = s.split(',').map(|x| x.trim().parse::<u32>()).collect();
                     match parsed {
                         Ok(v) => Some(v),
-                        Err(_) => { eprintln!("Error: --remove must be comma-separated IDs (e.g. \"3,7\")"); std::process::exit(1); }
+                        Err(_) => { return Err("Error: --remove must be comma-separated IDs (e.g. \"3,7\")".to_string()); }
                     }
                 }
                 None => None,
             };
             let set_map = match set.as_deref().map(parse_depends) {
                 Some(Ok(m)) => Some(m),
-                Some(Err(e)) => { eprintln!("{}", e); std::process::exit(1); }
+                Some(Err(e)) => { return Err(format!("{}", e)); }
                 None => None,
             };
             if add_map.is_none() && remove_ids.is_none() && set_map.is_none() {
-                eprintln!("Error: provide at least one of --add, --remove, or --set");
-                std::process::exit(1);
+                return Err("Error: provide at least one of --add, --remove, or --set".to_string());
             }
             match braim.update_statement_deps(id, add_map, remove_ids, set_map) {
                 Ok(new_deps) => {
@@ -1066,8 +1275,7 @@ fn main() {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(1);
+                    return Err(format!("{}", e));
                 }
             }
         }
@@ -1273,9 +1481,8 @@ fn main() {
             match braim.version_list() {
                 Ok(versions) => {
                     println!("Saved versions ({}):\n", versions.len());
-                    for meta in versions {
-                        let node_count = meta.data.nodes.len();
-                        println!("  v{:04}  {} nodes {}  \"{}\"", meta.data.version, node_count, meta.saved_at, meta.description);
+                    for info in versions {
+                        println!("  v{:04}  {} nodes {}  \"{}\"", info.version, info.node_count, info.saved_at, info.description);
                     }
                     Ok(())
                 }
@@ -1348,6 +1555,31 @@ fn main() {
                         for (dep_id, weight) in &node.depends_on {
                             if let Some(dep_node) = braim.get_node(*dep_id) {
                                 println!("    ID:{}  {}  (weight: {:.4})", dep_id, dep_node.label, weight);
+                            }
+                        }
+                    }
+
+                    let contradicts: Vec<_> = braim.state.contradicts.iter()
+                        .filter(|e| e.from == id || e.to == id)
+                        .collect();
+                    if !contradicts.is_empty() {
+                        println!("  Contradicts:");
+                        for edge in contradicts {
+                            let other_id = if edge.from == id { edge.to } else { edge.from };
+                            if edge.resolved {
+                                println!("    ID:{}  resolved  resolution_kind: {}", other_id,
+                                    edge.resolution_kind.as_deref().unwrap_or("winner"));
+                                if let Some(w) = edge.resolution_winner {
+                                    println!("      winner: ID:{}", w);
+                                }
+                                if let Some(s) = edge.resolution_source {
+                                    println!("      source: ID:{}", s);
+                                }
+                                if let Some(r) = &edge.resolution_reason {
+                                    println!("      reason: {}", r);
+                                }
+                            } else {
+                                println!("    ID:{}  unresolved  reason: {}", other_id, edge.reason);
                             }
                         }
                     }
@@ -1561,8 +1793,7 @@ fn main() {
                         nodes.retain(|n| ids.contains(&n.id));
                     }
                     None => {
-                        eprintln!("--meta must be key=value (e.g. scope=cognitivex_flow)");
-                        std::process::exit(1);
+                        return Err("--meta must be key=value (e.g. scope=cognitivex_flow)".to_string());
                     }
                 }
             }
@@ -1609,19 +1840,45 @@ fn main() {
 
             Ok(())
         }
-        Commands::Meta { id, set, inc } => {
-            if let Some(kv) = set {
+        Commands::Meta { id, set, inc, unset } => {
+            if let Some(k) = unset {
+                // Loud on a key that was not there: a silent success makes a
+                // typo indistinguishable from a removal.
+                match braim.unset_meta(id, &k)? {
+                    true => println!("unset {}.metadata[{}]", id, k),
+                    false => {
+                        let node = braim.state.nodes.get(&id);
+                        let keys: Vec<&str> = node
+                            .map(|n| {
+                                let mut ks: Vec<&str> = n.metadata.keys().map(|s| s.as_str()).collect();
+                                ks.sort();
+                                ks
+                            })
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "Error: node {} has no metadata key '{}'{}",
+                            id,
+                            k,
+                            if keys.is_empty() {
+                                " (it has none at all)".to_string()
+                            } else {
+                                format!(" — it has: {}", keys.join(", "))
+                            }
+                        ));
+                    }
+                }
+            } else if let Some(kv) = set {
                 match kv.split_once('=') {
                     Some((k, v)) => match braim.set_meta(id, k, v) {
                         Ok(_) => println!("set {}.metadata[{}] = {}", id, k, v),
-                        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                        Err(e) => { return Err(format!("{}", e)); }
                     },
-                    None => { eprintln!("--set must be key=value"); std::process::exit(1); }
+                    None => { return Err("--set must be key=value".to_string()); }
                 }
             } else if let Some(k) = inc {
                 match braim.inc_meta(id, &k) {
                     Ok(n) => println!("{}.metadata[{}] = {}", id, k, n),
-                    Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                    Err(e) => { return Err(format!("{}", e)); }
                 }
             } else {
                 match braim.state.nodes.get(&id) {
@@ -1631,7 +1888,7 @@ fn main() {
                         keys.sort();
                         for k in keys { println!("  {} = {}", k, node.metadata[k]); }
                     }
-                    None => { eprintln!("Error: Node ID {} does not exist", id); std::process::exit(1); }
+                    None => { return Err(format!("Error: Node ID {} does not exist", id)); }
                 }
             }
             Ok(())
@@ -1639,7 +1896,7 @@ fn main() {
         Commands::Serve { port } => {
             serve_viewer(braim.data_dir.to_str().unwrap_or(".braim"), port)
         }
-        Commands::Import { source, filter_domain, only_proven, domain_map } => {
+        Commands::Import { source, filter_domain, only_proven, domain_map, full } => {
             let actual_source = if source.ends_with(".json") {
                 source.clone()
             } else if source.ends_with(".braim") {
@@ -1648,28 +1905,39 @@ fn main() {
                 format!("{}/.braim/current.json", source)
             };
 
-            // Parse domain mappings
+            // Parse domain mappings. Each --domain-map value may carry several
+            // comma-separated pairs — the documented "old:new,old2:new2" form.
             let mut domain_mappings = HashMap::new();
             for mapping in domain_map {
-                let parts: Vec<&str> = mapping.split(':').collect();
-                if parts.len() != 2 {
-                    eprintln!("Error: Invalid domain mapping format. Use --domain-map \"source:target\"");
-                    std::process::exit(1);
+                for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
+                    let parts: Vec<&str> = pair.split(':').collect();
+                    if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+                        return Err(format!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair));
+                    }
+                    domain_mappings.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
                 }
-                domain_mappings.insert(parts[0].to_string(), parts[1].to_string());
             }
 
             match braim.import_graph(
                 &actual_source,
                 filter_domain.as_deref(),
-                only_proven,
+                if only_proven { Some(VerificationStatus::Proven) } else { None },
                 domain_mappings,
+                full,
             ) {
                 Ok(manifest) => {
-                    println!("✓ Import complete");
+                    println!("✓ Import complete{}", if full { " (full-fidelity)" } else { "" });
                     println!("  Imported: {} nodes", manifest.imported_count);
                     println!("  Deduplicated: {} (skipped, target version kept)", manifest.deduplicated_count);
                     println!("  Filtered out: {} (by domain/status)", manifest.skipped_count);
+                    if manifest.counterfactuals_refused > 0 {
+                        println!("  Quarantined: {} counterfactual node(s) refused (braim ID:322)", manifest.counterfactuals_refused);
+                    }
+                    if full {
+                        println!("  Source entities: {} imported", manifest.sources_imported);
+                        println!("  Edges carried: {} because_of, {} contradicts", manifest.because_of_imported, manifest.contradicts_imported);
+                        println!("  Dedup targets with unioned sources: {}", manifest.sources_unioned);
+                    }
 
                     if !manifest.duplicates.is_empty() {
                         println!("\n── Duplicates found ──");
@@ -1701,8 +1969,7 @@ fn main() {
                     label, label.rfind(':').map(|i| &label[..i]).unwrap_or(&label)
                 );
                 if strict_sources {
-                    eprintln!("Error: {}", msg);
-                    std::process::exit(1);
+                    return Err(format!("Error: {}", msg));
                 } else {
                     eprintln!("⚠ {}", msg);
                 }
@@ -1718,17 +1985,67 @@ fn main() {
         }
         Commands::Statement(StatementCommands::AddSource { id, source_id }) => {
             match braim.add_source_to_statement(id, source_id) {
-                Ok(AddSourceResult { auto_resolved: true, winner_id, loser_id, winner_status, .. }) => {
+                Ok(AddSourceResult { corroborated_with: Some(other_id) }) => {
                     println!("✓ Source ID:{} attached to statement ID:{}", source_id, id);
-                    println!("  ⚡ Auto-resolved contradiction (Mechanism A):");
-                    println!("    Winner ID:{} → {}", winner_id.unwrap(), winner_status.map(|s| s.label()).unwrap_or("?"));
-                    println!("    Loser  ID:{} → invalid", loser_id.unwrap());
+                    println!("  ⚡ Corroboration reached (Mechanism A, report-only):");
+                    println!("    ID:{} now has a PRIMARY source ID:{} not shared by ID:{}", id, source_id, other_id);
+                    println!("    Contradiction remains unresolved — run 'braim statement resolve-contradiction {} {} --winner <id>|--both-stand --reason ...' to settle it", id, other_id);
                     Ok(())
                 }
-                Ok(AddSourceResult { auto_resolved: false, .. }) => {
+                Ok(AddSourceResult { corroborated_with: None }) => {
                     let node = &braim.state.nodes[&id];
                     println!("✓ Source ID:{} attached to statement ID:{}", source_id, id);
                     println!("  Verification: {} {}", node.verification_status.badge(), node.verification_status.label());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::UpdateSources { id, add, remove, set, strict_sources }) => {
+            if add.is_none() && remove.is_none() && set.is_none() {
+                return Err("Error: provide at least one of --add, --remove, or --set".to_string());
+            }
+            let add_list = add.as_ref().map(|s| parse_list(s));
+            let remove_list = remove.as_ref().map(|s| parse_list(s));
+            let set_list = set.as_ref().map(|s| parse_list(s));
+
+            // Preview the resulting list to apply the same soft checks
+            // `statement add` applies, before the real write.
+            let preview = braim.preview_statement_sources(
+                id, add_list.as_deref(), remove_list.as_deref(), set_list.as_deref(),
+            )?;
+            let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&preview);
+            if has_dup_sources {
+                if strict_sources {
+                    return Err("Error: duplicate source entries detected".to_string());
+                } else {
+                    tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
+                }
+            }
+            if Braim::validate_primary_tertiary_mix(&preview) {
+                if strict_sources {
+                    return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
+                } else {
+                    tips::emit_tip_primary_tertiary_mix(cli.quiet);
+                }
+            }
+
+            match braim.update_statement_sources(id, add_list, remove_list, set_list) {
+                Ok(new_sources) => {
+                    let node = &braim.state.nodes[&id];
+                    println!("✓ Statement ID:{} sources updated", id);
+                    println!("  sources: {:?}", new_sources);
+                    println!("  Verification: {} {}", node.verification_status.badge(), node.verification_status.label());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Statement(StatementCommands::DeleteSource { id, source_id }) => {
+            match braim.delete_source_from_statement(id, source_id) {
+                Ok(status) => {
+                    println!("✓ Source ID:{} detached from statement ID:{}", source_id, id);
+                    println!("  Verification: {} {}", status.badge(), status.label());
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -1744,7 +2061,19 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Statement(StatementCommands::ResolveContradiction { stmt_a, stmt_b, winner, reason, source }) => {
+        Commands::Statement(StatementCommands::ResolveContradiction { stmt_a, stmt_b, winner, both_stand, reason, source }) => {
+            if both_stand {
+                return match braim.resolve_contradiction_both_stand(stmt_a, stmt_b, &reason) {
+                    Ok(()) => {
+                        println!("✓ Contradiction resolved (scoped — both stand)");
+                        println!("  ID:{} and ID:{}: both true, no winner/loser", stmt_a, stmt_b);
+                        println!("  Reason: {}", reason);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            let winner = winner.ok_or_else(|| "Error: provide --winner <id> or --both-stand".to_string())?;
             let loser = if winner == stmt_a { stmt_b } else { stmt_a };
             match braim.resolve_contradiction(winner, loser, &reason, source) {
                 Ok(()) => {
@@ -1757,6 +2086,47 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::MigrateRefutation { apply, json } => {
+            let repairs = braim.migrate_refutation_cascade(apply)?;
+            if json {
+                let payload: Vec<_> = repairs.iter().map(|r| serde_json::json!({
+                    "id": r.id,
+                    "refuted_by": r.refuted_by,
+                    "label": r.label,
+                    "restored": r.restored.label(),
+                    "cause_recovered": r.cause_recovered,
+                })).collect();
+                let text = serde_json::to_string_pretty(&serde_json::json!({
+                    "applied": apply,
+                    "count": repairs.len(),
+                    "repairs": payload,
+                })).map_err(|e| format!("Failed to serialize the migration report: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            if repairs.is_empty() {
+                println!("Nothing to migrate — no node carries a depends_on_invalidated reason.");
+                return Ok(());
+            }
+            println!("{} node(s) were refuted as collateral by the pre-3.3 cascade{}:\n",
+                repairs.len(), if apply { ", now repaired" } else { " (dry run)" });
+            let mut by_status: std::collections::BTreeMap<&str, usize> = Default::default();
+            for r in &repairs {
+                *by_status.entry(r.restored.label()).or_insert(0) += 1;
+                println!("  ID:{}  invalid → {}{}", r.id, r.restored.label(),
+                    if r.cause_recovered { "   (cause ID:".to_string() + &r.refuted_by.to_string() + " is no longer refuted)" } else { String::new() });
+                println!("        {}", r.label.chars().take(110).collect::<String>());
+            }
+            println!("\nRestored to: {}", by_status.iter()
+                .map(|(k, v)| format!("{} {}", v, k)).collect::<Vec<_>>().join(", "));
+            println!("Each carries support_withdrawn_by — review with: braim list --meta support_withdrawn_by=<cause>");
+            if apply {
+                println!("\nWritten. Checkpoint: braim version save \"refutation cascade migrated\"");
+            } else {
+                println!("\nNothing was written. Checkpoint first, then: braim migrate-refutation --apply");
+            }
+            Ok(())
+        }
         Commands::MigrateNodeTypes => {
             match braim.migrate_node_types() {
                 Ok(changed) => {
@@ -1765,6 +2135,413 @@ fn main() {
                     } else {
                         println!("✓ Migrated {} node(s) to claim/fact/invalid_statement", changed);
                     }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Export { domain, to, include_unproven, domain_map } => {
+            // Fall back to the central recorded at bootstrap, so routine
+            // publishing is `braim export <domain>` with nothing to remember.
+            let to = match to.or_else(|| bootstrap::read_central_pointer(&braim.data_dir)) {
+                Some(t) => t,
+                None => {
+                    return Err(format!("Error: no target. Pass --to <dir>, or record one once with \
+                               `braim init --team --central <dir>`."));
+                }
+            };
+            let mut domain_mappings = HashMap::new();
+            for mapping in domain_map {
+                for pair in mapping.split(',').filter(|p| !p.trim().is_empty()) {
+                    let parts: Vec<&str> = pair.split(':').collect();
+                    if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+                        return Err(format!("Error: Invalid domain mapping '{}'. Use --domain-map \"source:target[,source2:target2]\"", pair));
+                    }
+                    domain_mappings.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
+                }
+            }
+            // Mappings apply before filtering, so filter on the post-map name.
+            let effective_domain = domain_mappings.get(&domain).cloned().unwrap_or_else(|| domain.clone());
+
+            // The target is mutated by this export, so it takes its own write
+            // lock; the source graph above stays read-only and unlocked.
+            match Braim::open_for_write(&to) {
+                Ok(mut target) => {
+                    match target.import_state(
+                        braim.state.clone(),
+                        Some(&effective_domain),
+                        // Floor at Partial, not Proven: one PRIMARY source is real
+                        // evidence and must be publishable, or two teammates each
+                        // holding one type can never corroborate (braim ID:253).
+                        if include_unproven { None } else { Some(VerificationStatus::Partial) },
+                        domain_mappings,
+                        true,
+                    ) {
+                        Ok(manifest) => {
+                            println!("✓ Exported domain '{}' → {}", effective_domain, to);
+                            println!("  Published: {} nodes ({} deduplicated into existing central nodes)",
+                                manifest.imported_count, manifest.deduplicated_count);
+                            println!("  Source entities: {}  Edges: {} because_of, {} contradicts",
+                                manifest.sources_imported, manifest.because_of_imported, manifest.contradicts_imported);
+                            if manifest.sources_unioned > 0 {
+                                println!("  Corroboration: {} central node(s) gained sources from this export", manifest.sources_unioned);
+                            }
+                            if manifest.counterfactuals_refused > 0 {
+                                println!("  Quarantined: {} counterfactual node(s) held back — a what-if is a hypothesis,",
+                                    manifest.counterfactuals_refused);
+                                println!("               and no source can prove one (braim ID:322).");
+                            }
+                            println!("\nCheckpoint central: braim --data-dir {} version save \"export {} from $(pwd)\"", to, effective_domain);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Dream(DreamCommands::Candidates {
+            limit,
+            strategy,
+            min_semantic,
+            include_scratch,
+            replay,
+            json,
+        }) => {
+            if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
+                return Err(format!("{}", e));
+            }
+            // Default set omits `semantic`: it needs the embedding index, which
+            // costs a model load and a full pass. Ask for it explicitly.
+            let strategies = match strategy.as_deref() {
+                None => vec![Strategy::SharedSource, Strategy::TwoHop, Strategy::RegisteredGap],
+                Some(list) => {
+                    let mut out = Vec::new();
+                    for part in list.split(',').filter(|p| !p.trim().is_empty()) {
+                        match Strategy::parse(part) {
+                            Ok(s) => out.push(s),
+                            Err(e) => {
+                                return Err(format!("{}", e));
+                            }
+                        }
+                    }
+                    out
+                }
+            };
+            let opts = DreamOptions {
+                min_semantic: min_semantic.unwrap_or(dream::DEFAULT_MIN_SEMANTIC),
+                limit,
+                include_scratch,
+                replay,
+                strategies: strategies.clone(),
+            };
+            let semantic_pairs = if strategies.contains(&Strategy::Semantic) {
+                semantic_pair_scores(&braim, &cli.data_dir, opts.min_semantic, cli.quiet)
+            } else {
+                Vec::new()
+            };
+            let found = dream::candidates(&braim, &opts, &semantic_pairs);
+            print_candidates(&found, json, limit);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Constraints { limit, include_scratch, include_walked, json }) => {
+            if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
+                return Err(format!("{}", e));
+            }
+            let found = dream::constraints(&braim, limit, include_scratch, include_walked);
+            if json {
+                // Fail loudly: a consumer piping --json into a tool must not
+                // read empty stdout plus exit 0 as "no constraints".
+                let text = serde_json::to_string_pretty(&found)
+                    .map_err(|e| format!("Failed to serialize constraints: {}", e))?;
+                println!("{}", text);
+            } else if found.shown.is_empty() {
+                if found.walked_hidden > 0 {
+                    println!("Nothing new: all {} load-bearing cause(s) have been walked and no \
+                              statement has arrived since. --include-walked to walk one again.",
+                        found.walked_hidden);
+                } else {
+                    println!("No load-bearing causes — the graph has no because_of chains to rank.");
+                }
+            } else {
+                println!("Load-bearing causes ({} of {} ranked):\n", found.shown.len(), found.ranked);
+                for c in &found.shown {
+                    println!("  {:.2}  ID:{}  [{}]{}{}", c.score, c.id, c.verification,
+                        if c.reads_as_limitation { "  reads-as-limitation" } else { "" },
+                        if c.reopened.is_some() { "  REOPENED" } else { "" });
+                    println!("        {}", c.label);
+                    println!("        why: {}", c.rationale);
+                    if let Some(r) = &c.reopened {
+                        println!("        reopened: {}", r);
+                    }
+                    println!();
+                }
+                if found.dropped() > 0 {
+                    println!("{} more ranked below the cut — raise --limit to see them.\n", found.dropped());
+                }
+                if found.walked_hidden > 0 {
+                    println!("{} already walked with nothing new since — --include-walked to see them.\n",
+                        found.walked_hidden);
+                }
+                println!("Leverage only — whether these are constraints, and whether they can be");
+                println!("relaxed, is the judgement call. Read each one before acting on it.");
+            }
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Whatif { id, signals, include_scratch, json }) => {
+            dream::refuse_if_central(&braim.data_dir)?;
+            let cf = dream::counterfactual(&braim, id, include_scratch, signals)?;
+            if json {
+                let text = serde_json::to_string_pretty(&cf)
+                    .map_err(|e| format!("Failed to serialize counterfactual: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            println!("What-if ID:{}  [{}]\n  {}\n", cf.id, cf.verification, cf.label);
+
+            // Staleness first: if the constraint is already obsolete there is no
+            // counterfactual to write, only a contradiction to raise.
+            if cf.stale_signals.is_empty() {
+                println!("Staleness: no statement cites the same source file more recently.\n");
+            } else {
+                println!("Staleness signals ({}) — read these before imagining anything:", cf.stale_signals.len());
+                for sg in &cf.stale_signals {
+                    println!("  ID:{}  [{}]  {}", sg.id, sg.verification, sg.why);
+                    println!("        {}", sg.label);
+                }
+                println!("  If one of these supersedes the constraint, that is a contradiction, not a dream:");
+                println!("  braim statement contradict {} <that_id> --reason \"...\" --source <id>\n", cf.id);
+            }
+
+            if cf.rests_on.is_empty() {
+                println!("Nothing rests on this yet — relaxing it moves nothing measurable.\n");
+            } else {
+                println!("Rests on it ({}):", cf.rests_on.len());
+                for l in &cf.rests_on {
+                    println!("  {}{} ID:{}  [{}]", "  ".repeat(l.depth - 1), "└─", l.id, l.verification);
+                    println!("  {}   {}", "  ".repeat(l.depth - 1), l.label);
+                }
+                println!();
+            }
+
+            match (&cf.root, cf.serves.len()) {
+                (Some(r), n) => {
+                    println!("Serves ({} link(s) up to the root goal):", n);
+                    for l in &cf.serves {
+                        println!("  {}↑ ID:{}  [{}]  {}", "  ".repeat(l.depth - 1), l.id, l.verification, l.label);
+                    }
+                    println!("  root: ID:{}\n", r.id);
+                }
+                (None, _) => println!("Serves: nothing records what this constraint ultimately answers to.\n"),
+            }
+
+            println!("Frame:\n{}", cf.frame);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Flag { note, kind, nodes }) => {
+            let ids = match nodes.as_deref() {
+                Some(list) => {
+                    let parsed: Result<Vec<u32>, _> =
+                        list.split(',').map(|x| x.trim().parse::<u32>()).collect();
+                    match parsed {
+                        Ok(v) => v,
+                        Err(_) => return Err("Error: --nodes must be comma-separated ids (e.g. \"412,88\")".to_string()),
+                    }
+                }
+                None => Vec::new(),
+            };
+            for id in &ids {
+                if !braim.state.nodes.contains_key(id) {
+                    return Err(format!("Error: node ID:{} does not exist — flag what is there", id));
+                }
+            }
+            let item = dream::flag(&braim.data_dir, &kind, &note, ids)?;
+            println!("✓ review item {} raised [{}]", item.id, item.kind);
+            println!("  {}", item.note);
+            if !item.nodes.is_empty() {
+                println!("  nodes: {}", item.nodes.iter().map(|i| format!("ID:{}", i))
+                    .collect::<Vec<_>>().join(", "));
+            }
+            println!("\nRead the queue: braim dream review");
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Review { all, json }) => {
+            let items = dream::pending(&braim.data_dir, all);
+            if json {
+                let text = serde_json::to_string_pretty(&items)
+                    .map_err(|e| format!("Failed to serialize the review queue: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            let open = items.iter().filter(|i| i.cleared_at.is_none()).count();
+            if items.is_empty() {
+                println!("Review queue empty — nothing a night flagged is waiting.");
+            } else {
+                println!("Review queue ({} pending{}):\n", open,
+                    if all { format!(", {} cleared", items.len() - open) } else { String::new() });
+                for i in &items {
+                    let mark = match &i.cleared_at {
+                        Some(at) => format!("  ✓ cleared {}", at),
+                        None => String::new(),
+                    };
+                    println!("  [{}] {}  raised {}{}", i.id, i.kind, i.raised_at, mark);
+                    println!("      {}", i.note);
+                    if !i.nodes.is_empty() {
+                        println!("      nodes: {}", i.nodes.iter().map(|n| format!("ID:{}", n))
+                            .collect::<Vec<_>>().join(", "));
+                    }
+                    if let Some(n) = &i.cleared_note {
+                        println!("      resolution: {}", n);
+                    }
+                    println!();
+                }
+                if open > 0 {
+                    println!("Sign one off: braim dream reviewed <id> --note \"<what you did>\"");
+                }
+            }
+            // The queue holds what has no other home; nodes have one, so point at
+            // it rather than duplicating them here.
+            let created = braim.state.nodes.values()
+                .filter(|n| n.metadata.get("scope").map(|s| s == "dream").unwrap_or(false))
+                .count();
+            if created > 0 {
+                println!("{} node(s) carry scope=dream — braim list --meta scope=dream", created);
+            }
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Reviewed { id, note }) => {
+            let item = dream::clear(&braim.data_dir, id, note)?;
+            println!("✓ review item {} signed off", item.id);
+            println!("  {}", item.note);
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Log { since, verdict, limit, json }) => {
+            if let Some(v) = &verdict {
+                const VERDICTS: [&str; 5] =
+                    ["no-relation", "proposed", "verified", "contradiction", "duplicate"];
+                if !VERDICTS.contains(&v.as_str()) {
+                    return Err(format!("Error: --verdict must be one of {} (got '{}')",
+                        VERDICTS.join(", "), v));
+                }
+            }
+            let entries = dream::log(&braim.data_dir, since.as_deref(), verdict.as_deref(), limit);
+            if json {
+                let text = serde_json::to_string_pretty(&entries)
+                    .map_err(|e| format!("Failed to serialize the ledger: {}", e))?;
+                println!("{}", text);
+                return Ok(());
+            }
+            let total = dream::load_ledger(&braim.data_dir).len();
+            if entries.is_empty() {
+                println!("No ledger entries match ({} recorded in total).", total);
+                return Ok(());
+            }
+            println!("Dream ledger ({} shown of {} recorded):\n", entries.len(), total);
+            for e in &entries {
+                println!("  {}  ID:{} ↔ ID:{}  [{}]", e.recorded_at, e.a, e.b, e.verdict);
+                if let Some(n) = &e.note {
+                    println!("      {}", n);
+                }
+            }
+            Ok(())
+        }
+        Commands::Dream(DreamCommands::Seen { a, b, verdict, note }) => {
+            if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
+                return Err(format!("{}", e));
+            }
+            match dream::record_ledger(&braim.data_dir, a, b, &verdict, note) {
+                Ok(()) => {
+                    println!("✓ Dream ledger updated: ID:{} ↔ ID:{} = {}", a, b, verdict);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Policy { name } => {
+            match bootstrap::policy_body(&name) {
+                Ok(body) => {
+                    println!("{}", body);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Init { team, central, settings } => {
+            if !team {
+                return Err("Error: pass --team (the only mode today). See `braim init --help`.".to_string());
+            }
+            let settings_path = std::path::PathBuf::from(
+                settings.unwrap_or_else(|| ".claude/settings.json".to_string()),
+            );
+            let graph_dir = braim.data_dir.clone();
+            // Constructing `braim` already created the dir; report whether it
+            // had a graph before this run rather than claiming a fresh one.
+            let graph_created = braim.state.nodes.is_empty();
+
+            match bootstrap::install_hooks(&settings_path) {
+                Ok(changes) => {
+                    println!("✓ braim is set up for this project");
+                    println!("  Graph: {} ({})", graph_dir.display(),
+                        if graph_created { "new, empty" } else { "existing" });
+                    println!("  Settings: {}", settings_path.display());
+                    for c in &changes {
+                        match c {
+                            bootstrap::Change::Added(e) =>
+                                println!("    + {} hook installed", e),
+                            bootstrap::Change::AlreadyPresent(e) =>
+                                println!("    = {} hook already present, left alone", e),
+                        }
+                    }
+                    if let Some(c) = central {
+                        match bootstrap::write_central_pointer(&graph_dir, &c) {
+                            Ok(()) => println!("  Central: {} (recorded)", c),
+                            Err(e) => eprintln!("⚠ could not record central pointer: {}", e),
+                        }
+                    }
+                    println!("\nStart a new session so the hooks load, then work as usual.");
+                    if changes.iter().any(|c| matches!(c, bootstrap::Change::Added(_))) {
+                        println!("Verify a hook any time with: braim policy perturn");
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::MergeNodes { winner, loser } => {
+            match braim.merge_nodes(winner, loser) {
+                Ok(o) => {
+                    println!("✓ Merged ID:{} into ID:{}", o.loser, o.winner);
+                    println!("  Evidence gained: {} source(s)", o.sources_added);
+                    println!("  Rewired: {} referent(s), {} edge(s)", o.referents_rewired, o.edges_rewired);
+                    println!("  Winner status: {} {}", o.new_status.badge(), o.new_status.label());
+                    if !o.dep_differences.is_empty() {
+                        eprintln!(
+                            "⚠ the merged node depended on {:?}, which ID:{} does not — NOT merged, \n  because that would change what the surviving statement asserts. Wire them \n  deliberately with 'braim statement update-deps {}' if they belong.",
+                            o.dep_differences, o.winner, o.winner
+                        );
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::RenameDomain { old, new } => {
+            match braim.rename_domain(&old, &new) {
+                Ok(touched) => {
+                    println!("✓ Domain '{}' renamed to '{}'", old, new);
+                    println!("  {} node(s) updated", touched);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Shard => {
+            match braim.shard_layout() {
+                Ok(domain_count) => {
+                    println!("✓ Converted to sharded layout");
+                    println!("  {} domain shard(s) under domains/", domain_count);
+                    println!("  Cross-domain state in graph.json");
+                    println!("  Previous single file archived as current.json.pre-shard");
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -1857,11 +2634,6 @@ fn main() {
         Commands::Similar { text, top, min_score, rebuild, dedup } => {
             run_similar(&braim, &cli.data_dir, &text, top, min_score, rebuild, dedup)
         }
-    };
-
-    if let Err(e) = result {
-        eprintln!("{}", e);
-        std::process::exit(1);
     }
 }
 
@@ -2127,7 +2899,6 @@ fn query_semantic_fallback(_braim: &Braim, _data_dir: &str, _terms: &str, quiet:
 }
 
 fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
-    use std::path::Path;
     use tiny_http::{Response, Header};
 
     let addr = format!("127.0.0.1:{}", port);
@@ -2146,8 +2917,9 @@ fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
                     .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap())
             }
             "/current.json" => {
-                let path = Path::new(data_dir).join("current.json");
-                match std::fs::read_to_string(&path) {
+                // Load through Braim so both layouts work: single-file dirs and
+                // sharded dirs (domains/ + graph.json) serve the same merged view.
+                match Braim::new(data_dir).and_then(|b| b.state_json()) {
                     Ok(content) => Response::from_string(content)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap()),
                     Err(_) => Response::from_string("{\"error\": \"Data not found\"}")
@@ -2161,4 +2933,132 @@ fn serve_viewer(data_dir: &str, port: u16) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Render the dream worklist. JSON is the agent-loop surface; the text form is
+/// for a human sanity-checking what the night will chew on.
+fn print_candidates(found: &[Candidate], json: bool, limit: usize) {
+    if json {
+        match serde_json::to_string_pretty(found) {
+            Ok(s) => println!("{}", s),
+            Err(e) => eprintln!("Failed to serialize candidates: {}", e),
+        }
+        return;
+    }
+    if found.is_empty() {
+        println!("No dream candidates — every eligible pair is already linked or adjudicated.");
+        return;
+    }
+    println!("Dream candidates ({} of max {}):\n", found.len(), limit);
+    for c in found {
+        println!(
+            "  {:.2}  [{}]  ID:{} ↔ ID:{}",
+            c.score,
+            c.strategies.join("+"),
+            c.a,
+            c.b
+        );
+        println!("        A: {}  {:?}", c.a_label, c.a_domains);
+        println!("        B: {}  {:?}", c.b_label, c.b_domains);
+        println!("        why: {}\n", c.rationale);
+    }
+    println!("Adjudicate each pair, then record it:");
+    println!("  braim dream seen <a> <b> --verdict no-relation|proposed|verified|contradiction");
+}
+
+/// All node pairs whose labels sit above `threshold` cosine. Quadratic in nodes,
+/// which is fine for a local working graph — and dreaming is refused on central,
+/// the only graph large enough for that to matter.
+#[cfg(feature = "embeddings")]
+fn semantic_pair_scores(
+    braim: &Braim,
+    data_dir: &str,
+    threshold: f32,
+    quiet: bool,
+) -> Vec<(u32, u32, f32)> {
+    use embed::{corpus, cosine, refresh_index, EmbedIndex, FastEmbedder, EMBED_SIDECAR};
+
+    let rows = corpus(braim);
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let data_path = std::path::Path::new(data_dir);
+    let mut index = EmbedIndex::load(data_path);
+    let mut embedder = match FastEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("(semantic strategy unavailable: {})", e);
+            return Vec::new();
+        }
+    };
+    match refresh_index(&mut embedder, &mut index, &rows, false) {
+        Ok(n) if n > 0 => {
+            let _ = index.save(data_path);
+            if !quiet {
+                eprintln!("(refreshed index: embedded {} node(s) -> {})", n, EMBED_SIDECAR);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("(semantic strategy unavailable: {})", e);
+            return Vec::new();
+        }
+    }
+
+    let ids: Vec<u32> = {
+        let mut v: Vec<u32> = index.vectors.keys().copied().collect();
+        v.sort();
+        v
+    };
+    let mut out = Vec::new();
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            let (a, b) = (ids[i], ids[j]);
+            if let (Some(va), Some(vb)) = (index.vectors.get(&a), index.vectors.get(&b)) {
+                let c = cosine(&va.vec, &vb.vec);
+                if c >= threshold {
+                    out.push((a, b, c));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn semantic_pair_scores(_: &Braim, _: &str, _: f32, _: bool) -> Vec<(u32, u32, f32)> {
+    eprintln!("(the semantic strategy needs the embeddings feature; this binary was built with --no-default-features)");
+    Vec::new()
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_contradiction_rejects_winner_and_both_stand_together() {
+        let result = Cli::try_parse_from([
+            "braim", "statement", "resolve-contradiction", "1", "2",
+            "--winner", "1", "--both-stand", "--reason", "x",
+        ]);
+        assert!(result.is_err(), "clap must reject --winner and --both-stand together");
+    }
+
+    #[test]
+    fn resolve_contradiction_accepts_both_stand_alone() {
+        let result = Cli::try_parse_from([
+            "braim", "statement", "resolve-contradiction", "1", "2",
+            "--both-stand", "--reason", "x",
+        ]);
+        assert!(result.is_ok(), "--both-stand alone must parse");
+    }
+
+    #[test]
+    fn resolve_contradiction_accepts_winner_alone() {
+        let result = Cli::try_parse_from([
+            "braim", "statement", "resolve-contradiction", "1", "2",
+            "--winner", "1", "--reason", "x",
+        ]);
+        assert!(result.is_ok(), "--winner alone must parse");
+    }
 }

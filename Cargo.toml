@@ -8,11 +8,19 @@ name = "braim"
 path = "src/main.rs"
 
 [features]
-# Semantic similarity (braim similar / advisory dedup). Off by default so the
-# base binary stays tiny and dependency-light; enable with
-#   cargo build --release --features embeddings
+# Semantic similarity (braim similar / audit --semantic / advisory dedup).
+# ON by default: one canonical build, so installed binaries never diverge from
+# the repo build in feature surface (two-build drift left a stale PATH binary
+# missing newer commands). Opt out for a tiny dependency-light binary with
+#   cargo build --release --no-default-features
 # Pulls fastembed (ONNX MiniLM) via rustls — no system OpenSSL required.
+default = ["embeddings"]
 embeddings = ["dep:fastembed"]
+
+[dev-dependencies]
+# Integration tests link only against dev-dependencies, so the concurrency
+# suite needs its own handle on serde_json to inspect central's files.
+serde_json = "1"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
