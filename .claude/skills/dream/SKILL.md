@@ -350,39 +350,52 @@ for nid, n in d['nodes'].items():
     deps = n.get('depends_on') or {}
     if len(deps) < 2:
         continue
-    even = 1.0 / len(deps)
-    if all(abs(v - even) < 0.01 for v in deps.values()):
-        print(nid, n.get('node_type'), n.get('label', '')[:100])
+    print(nid, n.get('node_type'), dict(deps), n.get('label', '')[:100])
 "
 ```
 
-This is a scoping choice, not a shortcut: a graph accumulates equal-split
+This is a scoping choice, not a shortcut: a graph accumulates multi-dependency
 compounds across every session it has ever had, and re-litigating all of them
 every night turns a bounded nightly pass into an unbounded standing task. Today's
 new nodes are the ones nobody has looked at yet — the same reasoning `frontier.py`
 applies to pairs applies here. A full-graph sweep is a real, separate, valuable
 thing to do (see below) — just not automatically, every night.
 
-A compound with an even split (0.5/0.5, or an even share across more than two)
-is a stronger candidate than one already asymmetric — an even split is what a
-statement gets when nobody has stated an opinion, per the same rule that governs
-writing one in the first place (see "Rules" below).
+**Every existing split is a candidate, symmetric or not — a weight is not
+evidence just because it is already asymmetric.** The original version of this
+check only flagged even splits (0.5/0.5, or an even share across more than two),
+on the theory that an even split is what a statement gets when nobody has
+stated an opinion. That theory only covers one failure mode. Nothing in this
+graph verifies that an *asymmetric* split was ever checked against its sources
+either — `update-weights`/`update-deps` accept any number that sums to 1.0, and
+several of the asymmetric splits fixed this session (422, 429, 434, 448, 452)
+were themselves wrong until read closely. An unverified 0.73/0.27 is exactly as
+untrustworthy as an unverified 0.5/0.5; treat every existing number as a claim
+nobody has re-grounded yet, not as a settled fact.
 
 **Per compound:**
 
-1. `braim node <id>` — read the current split and what it depends on.
+1. `braim node <id>` — read the current split and what it depends on. Note the
+   split, but do not treat it as informative either way — it's the thing being
+   checked, not evidence for or against itself.
 2. `braim node <dep-a>`, `braim node <dep-b>` (and any others) — read each
    dependency's own label, sources, and verification status.
 3. Open the actual cited sources — Read/Grep, not the labels. The question is
    narrow: does the compound's claim rest more on what one dependency's source
    demonstrates than the other's? A dependency that is `proven_strong` where the
    other is `partial`, or whose source is what the compound's own wording is
-   actually describing, is carrying more of the claim.
+   actually describing, is carrying more of the claim. Derive what the split
+   *should* be from this reading alone, before looking back at what it
+   currently is.
 4. **If you cannot point to the specific sentence or line that justifies a
-   different split, leave it alone.** The default here is **no-change**, for the
-   same reason the default pair verdict is `no-relation`: a plausible-sounding
-   number is exactly what an LLM asked to reweigh something will produce whether
-   or not the evidence asymmetry actually changed since the split was set.
+   different split from what you derived in step 3, leave the existing number
+   alone** — whether that number is 0.5/0.5 or 0.9/0.1. The default is
+   **no-change**, for the same reason the default pair verdict is `no-relation`:
+   a plausible-sounding number is exactly what an LLM asked to reweigh something
+   will produce whether or not the evidence asymmetry actually changed since the
+   split was set. This cuts both ways now — don't "fix" an asymmetric split
+   into a different asymmetric split just to have done something; most existing
+   splits, once checked, will turn out fine.
 5. If the sources do justify a change, write it — never by fiat, always citing
    what you read:
    ```bash
@@ -409,21 +422,22 @@ writing one in the first place (see "Rules" below).
    ```
 
 `reweighed_at` exists for the same reason `whatif_walked_at` does: without a
-mark, an even-weight compound looks like a candidate every single night even
-when nothing about its sources has changed since the last look.
+mark, any multi-dependency compound looks like a candidate every single night
+even when nothing about its sources has changed since the last look.
 
 ### Full-graph weight sweep — on request only, never part of the nightly default
 
-Dropping the today-only filter and scanning every equal-split compound the
-graph has ever accumulated is a real mode, not a bigger version of the same
-mode: on one real run it surfaced 38 candidates spanning the graph's whole
-history, most of them old demo/test/spec-bootstrap fixtures with no real
-domain content to reason about (labels like `TestB TestC` or May-era `Voice
-Charge` demo data — check `braim query` or the node's own domains for this
-before spending time on it, and skip anything that reads as fixture rather
-than fact). The real candidates among the rest are worth doing exactly the
-same per-compound procedure above on, just at a scale that does not fit a
-nightly budget.
+Dropping the today-only filter and scanning every multi-dependency compound
+the graph has ever accumulated is a real mode, not a bigger version of the
+same mode. On a ~460-node graph this candidate list is **359** nodes once the
+equal-split filter is dropped (versus 38 when it only caught even splits) — an
+order of magnitude bigger, because most of a graph's compounds are already
+asymmetric and none of them were exempt from being wrong. Some of that 359 is
+old demo/test/spec-bootstrap fixtures with no real domain content to reason
+about (labels like `TestB TestC` or May-era `Voice Charge` demo data — check
+`braim query` or the node's own domains for this before spending time on it,
+and skip anything that reads as fixture rather than fact); the rest is a real,
+multi-session audit, not a single sitting.
 
 Run this **only when invoked with `$1 = weights` / `full-weights`, or when the
 user explicitly asks for a full weight sweep or audit** — never as a default
@@ -439,14 +453,26 @@ d = json.load(open('.braim/current.json'))
 for nid, n in d['nodes'].items():
     if n.get('status') != 'active':
         continue
+    if n.get('metadata', {}).get('reweighed_at'):
+        continue
     deps = n.get('depends_on') or {}
     if len(deps) < 2:
         continue
-    even = 1.0 / len(deps)
-    if all(abs(v - even) < 0.01 for v in deps.values()):
-        print(nid, n.get('node_type'), n.get('verification_status'), n.get('label', '')[:100])
+    print(nid, n.get('node_type'), n.get('verification_status'), dict(deps), n.get('label', '')[:100])
 "
 ```
+
+`reweighed_at` is what makes this tractable across more than one invocation:
+every node checked — reweighed or deliberately left alone — gets it set (per
+step 6 above), the same way `whatif_walked_at` lets constraint-walking advance
+instead of re-offering the same list. A full sweep is a ledger to work down
+across sessions, not a single unbounded pass; treat one invocation's worth
+(however many you get through with real per-compound reading, not a rubber
+stamp) as a session's progress, and let the next full-weights invocation pick
+up where this one left off. Don't skip the mark on a fixture node just because
+it took ten seconds to dismiss — an unmarked node looks like a fresh candidate
+forever, same failure mode `braim ID:1282` already documents for the pair
+pre-pass.
 
 Weights never affect verification status — status is source-type diversity
 capped by the weakest dependency's status, not the depends_on split — so
