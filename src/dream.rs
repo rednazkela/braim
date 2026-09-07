@@ -271,6 +271,52 @@ pub fn pending(data_dir: &std::path::Path, all: bool) -> Vec<ReviewItem> {
     items
 }
 
+/// The kinds that count as rot.
+///
+/// A finding is a defect discovered in a node that is ALREADY STORED — not a
+/// correction an agent made in flight. The distinction is mechanical rather
+/// than a judgement call: a finding names an existing node id, an in-flight
+/// correction does not.
+///
+/// This matters because the obvious alternative inverts the signal. A turn that
+/// catches its own unsupported claim before asserting it is a turn where the
+/// audit worked and nothing entered the graph, so nothing rotted; counting that
+/// event makes the tally climb fastest when an agent audits hardest and sit at
+/// zero when it skips auditing entirely. Worse, a threshold anyone can see
+/// gives an agent a standing reason to find one fewer than it.
+///
+/// The four are each a documented failure mode in this graph:
+///   anchor        a cited code:/doc: anchor no longer holds what the node says
+///                 it holds (braim ID:277, ID:285, ID:333, ID:461, ID:524)
+///   reground      a node's label disagrees with the document it cites
+///                 (policies/memory_braim_traits.md:19-21, braim ID:523)
+///   independence  a promotion rests on sources not independent of each other
+///                 (braim-source-independence-and-citation-volatility.md Gap 1)
+///   unsupported   a node carries a status its current sources no longer justify
+pub const AUDIT_KINDS: [&str; 4] = ["anchor", "reground", "independence", "unsupported"];
+
+/// Pending audit-kind items, per kind, in AUDIT_KINDS order, plus the total.
+///
+/// This is the rot counter. It is a query over the queue that already exists
+/// rather than a field on the graph: reviews.json sits inside each --data-dir,
+/// so per-graph scoping is inherited, and `cleared_at` makes the count fall as
+/// findings are signed off instead of rising forever.
+pub fn audit_tally(data_dir: &std::path::Path) -> (Vec<(&'static str, usize)>, usize) {
+    let items = load_reviews(data_dir);
+    let per: Vec<(&'static str, usize)> = AUDIT_KINDS
+        .iter()
+        .map(|k| {
+            let n = items
+                .iter()
+                .filter(|i| i.cleared_at.is_none() && i.kind.trim() == *k)
+                .count();
+            (*k, n)
+        })
+        .collect();
+    let total = per.iter().map(|(_, n)| n).sum();
+    (per, total)
+}
+
 /// Ledger entries, newest first, filtered for reading back a night's work.
 pub fn log(
     data_dir: &std::path::Path,

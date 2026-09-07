@@ -601,17 +601,19 @@ enum DreamCommands {
     Flag {
         #[arg(help = "What a human should look at")]
         note: String,
-        #[arg(long, default_value = "note", help = "merge | unraised | duplicate | rate | note")]
+        #[arg(long, default_value = "note", help = "audit rot: anchor | reground | independence | unsupported — or merge | unraised | duplicate | rate | note")]
         kind: String,
         #[arg(long, help = "Node ids this concerns, comma-separated")]
         nodes: Option<String>,
     },
-    #[command(about = "List what a night left for a human", long_about = "Dream Review: the queue of items raised by `braim dream flag`, pending first.\n\nUsage:\n  braim dream review\n  braim dream review --all      # include items already signed off\n  braim dream review --json\n\nThis is what to read after an unattended night. It survives context compaction\nbecause it is a file beside the graph, not prose in a report.\n\nSee also: `braim list --meta scope=dream` for the nodes a session created, and\n`braim dream log` for the pair verdicts.")]
+    #[command(about = "List what a night left for a human", long_about = "Dream Review: the queue of items raised by `braim dream flag`, pending first.\n\nUsage:\n  braim dream review\n  braim dream review --all      # include items already signed off\n  braim dream review --json\n  braim dream review --count     # pending audit-rot tally only\n\nThis is what to read after an unattended night. It survives context compaction\nbecause it is a file beside the graph, not prose in a report.\n\n--count prints the rot counter: pending items whose kind is one of anchor,\nreground, independence or unsupported. A finding is a defect in a node that\nis already stored, never a correction an agent made in flight — counting the\nlatter would make the tally climb fastest when an agent audits hardest. The\ncount falls as findings are signed off with `braim dream reviewed`.\n\nSee also: `braim list --meta scope=dream` for the nodes a session created, and\n`braim dream log` for the pair verdicts.")]
     Review {
         #[arg(long, help = "Include items already signed off")]
         all: bool,
         #[arg(long, help = "Emit JSON")]
         json: bool,
+        #[arg(long, help = "Print the pending audit-rot tally only, for a hook to read")]
+        count: bool,
     },
     #[command(about = "Sign a review item off", long_about = "Dream Reviewed: mark a queue item as handled.\n\nUsage:\n  braim dream reviewed 3\n  braim dream reviewed 3 --note \"wired the dependency by hand\"\n\nCleared items are kept, not deleted: what a human decided is itself worth\nkeeping, and a queue that forgets its own history cannot be audited. See them\nwith `braim dream review --all`.")]
     Reviewed {
@@ -2411,7 +2413,28 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             println!("\nRead the queue: braim dream review");
             Ok(())
         }
-        Commands::Dream(DreamCommands::Review { all, json }) => {
+        Commands::Dream(DreamCommands::Review { all, json, count }) => {
+            // --count is the rot counter a Stop hook reads. It prints one
+            // machine-readable line and nothing else, so the hook needs no JSON
+            // parser and no knowledge of reviews.json's shape.
+            if count {
+                let (per, total) = dream::audit_tally(&braim.data_dir);
+                if json {
+                    let obj: serde_json::Map<String, serde_json::Value> = per
+                        .iter()
+                        .map(|(k, n)| (k.to_string(), serde_json::json!(n)))
+                        .chain(std::iter::once(("total".to_string(), serde_json::json!(total))))
+                        .collect();
+                    println!("{}", serde_json::to_string(&obj)
+                        .map_err(|e| format!("Failed to serialize the audit tally: {}", e))?);
+                } else {
+                    println!("audit_pending {}", total);
+                    for (k, n) in &per {
+                        println!("  {} {}", k, n);
+                    }
+                }
+                return Ok(());
+            }
             let items = dream::pending(&braim.data_dir, all);
             if json {
                 let text = serde_json::to_string_pretty(&items)
@@ -2452,6 +2475,15 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 .count();
             if created > 0 {
                 println!("{} node(s) carry scope=dream — braim list --meta scope=dream", created);
+            }
+            // Rot is the subset a threshold watches, so name it separately from
+            // the queue at large.
+            let (per, total) = dream::audit_tally(&braim.data_dir);
+            if total > 0 {
+                println!("{} pending audit-rot finding(s): {}", total,
+                    per.iter().filter(|(_, n)| *n > 0)
+                        .map(|(k, n)| format!("{} {}", k, n))
+                        .collect::<Vec<_>>().join(", "));
             }
             Ok(())
         }
