@@ -309,7 +309,7 @@ enum Commands {
         #[arg(long, help = "Emit JSON")]
         json: bool,
     },
-    #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • floor at PARTIAL: a statement needs at least one PRIMARY source to publish,\n    so evidence-free claims stay home while single-source findings can reach\n    central and corroborate there (braim ID:253). --include-unproven removes\n    the floor entirely.\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
+    #[command(about = "Publish a domain (plus its dependency closure) into another braim", long_about = "Export: Publish one domain from this working graph into a central braim.\n\nUsage:\n  braim export billing --to ~/.braim_central\n  braim export billing --to ~/.braim_central --include-unproven\n  braim export billing --to ~/.braim_central --domain-map \"billing:sonar_billing\"\n\nThis is the contribute flow (braim ID:232/240): issue-isolated working graphs stay\nper-task, and verified knowledge is published domain-by-domain into central.\n\nWhat crosses:\n  • the domain's nodes PLUS their full dependency closure — concepts, statements,\n    and attached source entities from other domains that the exported statements\n    stand on (self-contained vendored pack, ID:220; fixes the lossy slice ID:180)\n  • because_of and contradicts edges among the exported set\n  • full fidelity: verification status preserved, duplicate sources unioned into\n    existing central nodes so corroboration accumulates (ID:185/190)\n\nDefaults:\n  • floor at PARTIAL: a statement needs at least one PRIMARY source to publish,\n    so evidence-free claims stay home while single-source findings can reach\n    central and corroborate there (braim ID:253). --include-unproven removes\n    the floor entirely.\n  • CONTESTED statements cross regardless of the Partial floor (braim ID:2287).\n    Contested ranks below Partial, so a floored export used to filter out\n    precisely the corrections a shared graph most needs — a nine-graph export\n    once left a central with 0 contested nodes of 4222 while a superseded claim\n    stood there as a fact. A Proven-or-higher floor still excludes them.\n\nSafety:\n  • --dry-run reports the real manifest and writes nothing.\n  • merging into an existing target domain is announced, with the --domain-map\n    alternative named.\n  • arriving statements that share a PRIMARY source path with an incumbent whose\n    text differs are reported for a human to judge, never auto-contradicted.\n\nAfter export, checkpoint central: braim --data-dir <central> version save \"...\"")]
     Export {
         domain: String,
         #[arg(long, help = "Target braim data dir (default: the central recorded by `braim init --team --central`)")]
@@ -318,8 +318,10 @@ enum Commands {
         include_unproven: bool,
         #[arg(long, help = "Remap domain names during export (format: old:new,old2:new2)")]
         domain_map: Vec<String>,
+        #[arg(long, help = "Report what would cross without writing to the target")]
+        dry_run: bool,
     },
-    #[command(about = "Set up this project for braim: local graph + agent policy hooks", long_about = "Init: bootstrap a working braim setup in one command.\n\nUsage:\n  braim init --team\n  braim init --team --central ~/.braim_central\n  braim init --team --settings .claude/settings.local.json\n\nWhat it does:\n  • Creates the local graph if absent\n  • Installs the agent policy hooks into .claude/settings.json:\n      UserPromptSubmit -> braim policy perturn      (per-turn marker logging)\n      PreCompact       -> braim policy compaction   (what to keep when compacting)\n  • Records where central lives, so `braim export <domain>` needs no --to\n\nThe hooks invoke `braim policy`, not a shell tool reading an absolute path, so\nthe same settings file works on Linux, macOS, and Windows and the policy stays\nversion-locked to the braim binary enforcing it.\n\nIdempotent: re-running reports what is already present and changes nothing.\nExisting settings and any hooks braim did not add are preserved.\n\nWhy solo-first: a teammate starting out has no graphs, so day-one value is the\nsetup that already works alone — a local graph plus the discipline hooks.\nSharing layers on once several graphs exist (braim ID:223).")]
+    #[command(about = "Set up this project for braim: local graph + agent policy hooks", long_about = "Init: bootstrap a working braim setup in one command.\n\nUsage:\n  braim init --team\n  braim init --team --central ~/.braim_central\n  braim init --team --settings .claude/settings.local.json\n\nWhat it does:\n  • Creates the local graph if absent\n  • Installs the agent policy hooks into .claude/settings.json:\n      UserPromptSubmit -> braim policy perturn      (per-turn marker logging)\n      UserPromptSubmit -> braim policy traits       (verbatim/inferred/unknown marker discipline)\n      PreCompact       -> braim policy compaction   (what to keep when compacting)\n  • Records where central lives, so `braim export <domain>` needs no --to\n\nThe hooks invoke `braim policy`, not a shell tool reading an absolute path, so\nthe same settings file works on Linux, macOS, and Windows and the policy stays\nversion-locked to the braim binary enforcing it.\n\nIdempotent: re-running reports what is already present and changes nothing.\nExisting settings and any hooks braim did not add are preserved.\n\nWhy solo-first: a teammate starting out has no graphs, so day-one value is the\nsetup that already works alone — a local graph plus the discipline hooks.\nSharing layers on once several graphs exist (braim ID:223).")]
     Init {
         #[arg(long, help = "Install the team agent setup (currently the only mode)")]
         team: bool,
@@ -2140,7 +2142,7 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Export { domain, to, include_unproven, domain_map } => {
+        Commands::Export { domain, to, include_unproven, domain_map, dry_run } => {
             // Fall back to the central recorded at bootstrap, so routine
             // publishing is `braim export <domain>` with nothing to remember.
             let to = match to.or_else(|| bootstrap::read_central_pointer(&braim.data_dir)) {
@@ -2167,6 +2169,23 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             // lock; the source graph above stays read-only and unlocked.
             match Braim::open_for_write(&to) {
                 Ok(mut target) => {
+                    // Domain-collision warning (ID:2289 defect 4). Merging into an
+                    // existing target domain is legitimate — corroboration is the
+                    // point — but it was silent, and five distinct `billing`
+                    // domains once landed in one central with no notice.
+                    let existing_in_domain = target.state.nodes.values()
+                        .filter(|n| n.domains.contains(&effective_domain))
+                        .count();
+                    if existing_in_domain > 0 {
+                        println!("⚠ Domain '{}' already exists in the target with {} node(s).",
+                            effective_domain, existing_in_domain);
+                        println!("  This export merges into it. Use --domain-map \"{}:<new_name>\" to keep them separate.",
+                            domain);
+                    }
+                    // Dry run computes the full manifest in memory and suppresses
+                    // every write, so the figures below are what an actual export
+                    // would do rather than a prediction of it.
+                    target.dry_run = dry_run;
                     match target.import_state(
                         braim.state.clone(),
                         Some(&effective_domain),
@@ -2178,6 +2197,9 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                         true,
                     ) {
                         Ok(manifest) => {
+                            if dry_run {
+                                println!("DRY RUN — nothing was written to {}", to);
+                            }
                             println!("✓ Exported domain '{}' → {}", effective_domain, to);
                             println!("  Published: {} nodes ({} deduplicated into existing central nodes)",
                                 manifest.imported_count, manifest.deduplicated_count);
@@ -2191,7 +2213,31 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                                     manifest.counterfactuals_refused);
                                 println!("               and no source can prove one (braim ID:322).");
                             }
-                            println!("\nCheckpoint central: braim --data-dir {} version save \"export {} from $(pwd)\"", to, effective_domain);
+                            if manifest.contested_admitted > 0 {
+                                println!("  Corrections: {} contested statement(s) crossed — disputed evidence is",
+                                    manifest.contested_admitted);
+                                println!("               still evidence, and the dispute is what the target lacks (ID:2287).");
+                            }
+                            if manifest.domainless_admitted > 0 {
+                                println!("  Note: {} closure node(s) carry no domain of their own; they arrive reachable",
+                                    manifest.domainless_admitted);
+                                println!("        by id but invisible to `list --domain` and reported by `audit`.");
+                            }
+                            if !manifest.potential_conflicts.is_empty() {
+                                println!("\n⚠ {} arriving statement(s) share a PRIMARY source with an existing target",
+                                    manifest.potential_conflicts.len());
+                                println!("  node whose text differs. NOT auto-raised — read them and decide:");
+                                for (new_id, old_id, path) in manifest.potential_conflicts.iter().take(10) {
+                                    println!("    ID:{} vs ID:{}  ({})", new_id, old_id, path);
+                                }
+                                if manifest.potential_conflicts.len() > 10 {
+                                    println!("    ... and {} more", manifest.potential_conflicts.len() - 10);
+                                }
+                                println!("  Settle one with: braim --data-dir {} statement contradict <a> <b> --reason \"...\"", to);
+                            }
+                            if !dry_run {
+                                println!("\nCheckpoint central: braim --data-dir {} version save \"export {} from $(pwd)\"", to, effective_domain);
+                            }
                             Ok(())
                         }
                         Err(e) => Err(e),

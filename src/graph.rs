@@ -621,11 +621,28 @@ pub struct ImportManifest {
     /// on them. Reported rather than silently dropped: a quarantine nobody sees
     /// is indistinguishable from a bug.
     pub counterfactuals_refused: usize,
+    /// Contested statements admitted by the ID:2287 exemption. Surfaced so the
+    /// operator can see that corrections crossed rather than assuming a clean
+    /// export moved only settled knowledge.
+    pub contested_admitted: usize,
+    /// Nodes admitted through dependency closure that carry no domain of their
+    /// own. They arrive reachable by id but invisible to `list --domain`, and
+    /// `audit` reports them as orphans (ID:2289 defect 5).
+    pub domainless_admitted: usize,
+    /// Arriving statements that share a PRIMARY source location with an existing
+    /// target node whose text differs. Reported, never auto-raised: whether two
+    /// statements about one file actually conflict is a judgement, and a
+    /// contradiction raised by a batch importer is a contradiction nobody read.
+    pub potential_conflicts: Vec<(u32, u32, String)>,
     pub id_mappings: HashMap<u32, u32>,
     pub duplicates: Vec<DuplicateRecord>,
 }
 
 pub struct Braim {
+    /// When set, mutating operations compute and report but never write to
+    /// disk. Used by `export --dry-run` so an operator can see the real
+    /// manifest before committing a shared graph to it (ID:2289 defect 3).
+    pub dry_run: bool,
     pub data_dir: PathBuf,
     pub state: GraphState,
     /// Number of nodes that had a legacy `statement` node_type rewritten
@@ -1116,6 +1133,7 @@ impl Braim {
         let dependents = Self::build_dependents(&state);
 
         Ok(Braim {
+            dry_run: false,
             data_dir: path,
             state,
             legacy_node_types_migrated: legacy_count,
@@ -2358,6 +2376,11 @@ impl Braim {
     }
 
     fn flush(&mut self) -> Result<(), String> {
+        // Dry run computes everything and writes nothing, so `export --dry-run`
+        // reports the real manifest instead of an estimate (ID:2289 defect 3).
+        if self.dry_run {
+            return Ok(());
+        }
         if self.data_dir.join("domains").is_dir() {
             return self.flush_sharded();
         }
@@ -3358,6 +3381,37 @@ impl Braim {
     }
 
     pub fn version_save(&mut self, description: &str) -> Result<u32, String> {
+        // Clobber guard (ID:1343, ID:2289 defect 6). version_restore rewinds the
+        // counter along with the state, so the next save lands on a slot that is
+        // already occupied and write_atomic renames straight over it with no
+        // existence check — which is how a 1348-node comparison snapshot was
+        // replaced by a 1333-node checkpoint under one slot number. Refuse
+        // instead, and name the way forward.
+        // Keyed on the version NUMBER, not a filename: a sharded graph never
+        // writes v<NNNN>.json at the root — it writes graph.v<NNNN>.json, per-
+        // domain shard snapshots and an index entry — so a filename check
+        // silently passed on exactly the layout a central uses, and a rewound
+        // save appended a DUPLICATE v0020 to the index. Checking both the index
+        // and the flat file covers sharded and unsharded alike.
+        let candidate = self.state.version + 1;
+        let taken_in_index = self
+            .read_versions_index()
+            .iter()
+            .any(|e| e.version == candidate);
+        let flat = self.data_dir.join(format!("v{:04}.json", candidate));
+        if taken_in_index || flat.exists() {
+            return Err(format!(
+                "Error: version {} already exists in {}.\n\
+                 The counter was rewound by a restore, so saving here would shadow that \
+                 checkpoint with no way back.\n\
+                 Run `braim --data-dir {} version list` to see it, then either restore to the \
+                 newest version first, or retire the old checkpoint deliberately.",
+                candidate,
+                self.data_dir.display(),
+                self.data_dir.display()
+            ));
+        }
+
         self.state.version += 1;
         let version_num = self.state.version;
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -4017,6 +4071,11 @@ impl Braim {
         // hypothesis is a hypothesis.
         let counterfactuals_refused = Self::strip_counterfactuals(&mut source_state);
 
+        // Ids already in the target before this import. The conflict scan needs
+        // this because `id_mappings` also records dedup hits, so an incumbent
+        // node would otherwise count as "arrived" and cancel its own comparison.
+        let preexisting: HashSet<u32> = self.state.nodes.keys().copied().collect();
+
         let mut id_mappings: HashMap<u32, u32> = HashMap::new();
         let mut duplicates: Vec<DuplicateRecord> = Vec::new();
         let mut imported_count = 0;
@@ -4059,8 +4118,38 @@ impl Braim {
         // everything. Export defaults to a Partial floor so a statement with one
         // PRIMARY source can publish and corroborate (braim ID:253); import
         // --only-proven passes Proven.
-        let meets_floor =
-            |s: VerificationStatus| min_status.map_or(true, |m| s.rank() >= m.rank());
+        //
+        // CONTESTED EXEMPTION (braim ID:2287). Contested ranks 2, below Partial
+        // at 3, so a floored export used to filter out precisely the statements
+        // a shared graph most needs. A contested statement is not weakly
+        // evidenced — it is one whose evidence was good enough to be disputed,
+        // and its dispute is the correction the target is missing. Measured: a
+        // nine-graph export left central with 0 contested nodes of 4222 while a
+        // superseded claim stood there as an active fact. Contested is therefore
+        // admitted whenever the floor is at or below Partial; a caller asking
+        // for Proven or higher still excludes it.
+        let meets_floor = |s: VerificationStatus| match min_status {
+            None => true,
+            Some(m) => {
+                s.rank() >= m.rank()
+                    || (s == VerificationStatus::Contested
+                        && m.rank() <= VerificationStatus::Partial.rank())
+            }
+        };
+
+        // Census of what the admission rules let through, computed before the
+        // import loops so the figures describe the decision rather than its
+        // side effects.
+        let contested_admitted = source_state.nodes.values()
+            .filter(|n| in_domain_scope(n)
+                && n.verification_status == VerificationStatus::Contested
+                && meets_floor(n.verification_status))
+            .count();
+        let domainless_admitted = source_state.nodes.values()
+            .filter(|n| in_domain_scope(n)
+                && meets_floor(n.verification_status)
+                && n.domains.is_empty())
+            .count();
 
         // Collect nodes by type for ordered processing; sorted by id so import
         // results don't depend on HashMap iteration order.
@@ -4412,6 +4501,61 @@ impl Braim {
             }
         }
 
+        // Arrival-time conflict scan (ID:2289 defect 2). Export carried
+        // contradicts edges among the exported set but never asked whether an
+        // arriving node disagreed with one already here, so a stale target node
+        // could keep standing while its correction landed beside it unnoticed.
+        // The key is the PRIMARY source PATH, not the prose: two statements
+        // about one file need not share a content word. Reported only — raising
+        // a contradiction is a judgement, and one raised by a batch importer is
+        // one nobody read.
+        let primary_path = |src: &str| -> Option<String> {
+            let (ty, rest) = src.split_once(':')?;
+            match ty {
+                "code" | "doc" | "schema" | "config" | "transcript" | "test" => {
+                    Some(rest.split(':').next().unwrap_or(rest).to_string())
+                }
+                _ => None,
+            }
+        };
+        let mut potential_conflicts: Vec<(u32, u32, String)> = Vec::new();
+        {
+            // Genuinely new nodes only: mapped in by this import AND absent from
+            // the target beforehand.
+            let arrived: HashSet<u32> = id_mappings.values().copied()
+                .filter(|id| !preexisting.contains(id))
+                .collect();
+            let mut by_path: HashMap<String, Vec<u32>> = HashMap::new();
+            for node in self.state.nodes.values() {
+                if !node.node_type.is_statement_family() {
+                    continue;
+                }
+                for src in &node.sources {
+                    if let Some(path) = primary_path(src) {
+                        by_path.entry(path).or_default().push(node.id);
+                    }
+                }
+            }
+            for (path, ids) in &by_path {
+                for &new_id in ids.iter().filter(|i| arrived.contains(i)) {
+                    for &old_id in ids.iter().filter(|i| preexisting.contains(i)) {
+                        let differs = match (self.state.nodes.get(&new_id), self.state.nodes.get(&old_id)) {
+                            (Some(a), Some(b)) => a.label != b.label,
+                            _ => false,
+                        };
+                        let already_linked = self.state.contradicts.iter().any(|e| {
+                            (e.from == new_id && e.to == old_id) || (e.from == old_id && e.to == new_id)
+                        });
+                        if differs && !already_linked {
+                            potential_conflicts.push((new_id, old_id, path.clone()));
+                        }
+                    }
+                }
+            }
+            potential_conflicts.sort();
+            potential_conflicts.dedup();
+        }
+
         self.flush()?;
 
         Ok(ImportManifest {
@@ -4423,6 +4567,9 @@ impl Braim {
             deduplicated_count,
             skipped_count,
             counterfactuals_refused,
+            contested_admitted,
+            domainless_admitted,
+            potential_conflicts,
             id_mappings,
             duplicates,
         })
@@ -5150,6 +5297,93 @@ mod defect_tests {
         let updated = b.update_statement_sources(s, None, Some(vec!["narrative:claim".into()]), None).unwrap();
         assert!(updated.is_empty());
         assert_eq!(b.state.nodes[&s].verification_status, VerificationStatus::Partial, "the entity alone still verifies");
+    }
+
+    #[test]
+    fn export_floor_admits_contested_so_corrections_can_reach_central() {
+        // ID:2287: Contested ranks 2, below Partial at 3, so a floored export
+        // used to drop precisely the statements a shared graph needs most. A
+        // nine-graph export left one central with 0 contested nodes of 4222.
+        let mut work = temp_braim("export_contested_work");
+        let mut central = temp_braim("export_contested_central");
+        work.add_concept("Alpha: a", vec!["billing".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        work.add_concept("Beta: b", vec!["billing".into()], vec!["code:b.rs:1".into()], None).unwrap();
+        let a = work.add_statement("toggle ships", vec!["billing".into()], vec!["code:svc.rs:10".into()], [(1u32, 0.6), (2u32, 0.4)].into_iter().collect(), true).unwrap();
+        let b = work.add_statement("toggle cancelled", vec!["billing".into()], vec!["code:svc.rs:10".into()], [(1u32, 0.7), (2u32, 0.3)].into_iter().collect(), true).unwrap();
+        work.contradict_statements(a, b, "ships vs cancelled", None).unwrap();
+        assert_eq!(work.state.nodes[&a].verification_status, VerificationStatus::Contested);
+
+        let m = central.import_state(work.state.clone(), Some("billing"), Some(VerificationStatus::Partial), HashMap::new(), true).unwrap();
+        assert_eq!(m.contested_admitted, 2, "both sides of the dispute must cross");
+        assert_eq!(m.contradicts_imported, 1, "and the edge that links them");
+    }
+
+    #[test]
+    fn export_floor_still_excludes_contested_when_asked_for_proven() {
+        let mut work = temp_braim("export_contested_proven_work");
+        let mut central = temp_braim("export_contested_proven_central");
+        work.add_concept("Alpha: a", vec!["billing".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        work.add_concept("Beta: b", vec!["billing".into()], vec!["code:b.rs:1".into()], None).unwrap();
+        let a = work.add_statement("x", vec!["billing".into()], vec!["code:svc.rs:10".into()], [(1u32, 0.6), (2u32, 0.4)].into_iter().collect(), true).unwrap();
+        let b = work.add_statement("not x", vec!["billing".into()], vec!["code:svc.rs:10".into()], [(1u32, 0.7), (2u32, 0.3)].into_iter().collect(), true).unwrap();
+        work.contradict_statements(a, b, "x vs not x", None).unwrap();
+        let m = central.import_state(work.state.clone(), Some("billing"), Some(VerificationStatus::Proven), HashMap::new(), true).unwrap();
+        assert_eq!(m.contested_admitted, 0, "a Proven floor is an explicit ask and still excludes contested");
+    }
+
+    #[test]
+    fn import_reports_conflicts_against_incumbents_sharing_a_primary_path() {
+        // ID:2289 defect 2: export carried contradicts edges among the exported
+        // set but never asked whether an arrival disagreed with what was here.
+        let mut work = temp_braim("conflict_work");
+        let mut central = temp_braim("conflict_central");
+        work.add_concept("Alpha: a", vec!["billing".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        work.add_concept("Beta: b", vec!["billing".into()], vec!["code:b.rs:1".into()], None).unwrap();
+        work.add_statement("the toggle is being built", vec!["billing".into()], vec!["code:svc.rs:10".into()], [(1u32, 0.6), (2u32, 0.4)].into_iter().collect(), true).unwrap();
+        central.import_state(work.state.clone(), Some("billing"), Some(VerificationStatus::Partial), HashMap::new(), true).unwrap();
+
+        let mut work2 = temp_braim("conflict_work2");
+        work2.add_concept("Alpha: a", vec!["billing".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        work2.add_concept("Beta: b", vec!["billing".into()], vec!["code:b.rs:1".into()], None).unwrap();
+        work2.add_statement("the toggle was cancelled and never shipped", vec!["billing".into()], vec!["code:svc.rs:99".into()], [(1u32, 0.55), (2u32, 0.45)].into_iter().collect(), true).unwrap();
+        let m = central.import_state(work2.state.clone(), Some("billing"), Some(VerificationStatus::Partial), HashMap::new(), true).unwrap();
+        assert!(!m.potential_conflicts.is_empty(), "differing text on the same PRIMARY path must be reported");
+        assert!(m.potential_conflicts.iter().any(|(_, _, p)| p == "svc.rs"));
+    }
+
+    #[test]
+    fn version_save_refuses_to_clobber_a_snapshot_after_a_restore() {
+        // ID:1343: restore rewinds the counter with the state, so the next save
+        // landed on an occupied slot and write_atomic renamed straight over it.
+        let mut b = temp_braim("clobber_guard");
+        b.add_concept("Alpha: a", vec!["d".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        b.version_save("first").unwrap();
+        b.version_save("second").unwrap();
+        b.version_restore(1).unwrap();
+        let err = b.version_save("would clobber").unwrap_err();
+        assert!(err.contains("already exists"), "got: {}", err);
+        assert!(b.data_dir.join("v0002.json").exists(), "the snapshot must survive");
+    }
+
+    #[test]
+    fn version_save_guard_also_covers_the_sharded_layout() {
+        // A sharded graph writes graph.v<NNNN>.json plus shard snapshots and an
+        // index entry, never v<NNNN>.json at the root, so a filename-only guard
+        // passed straight through and appended a duplicate version number.
+        let mut b = temp_braim("clobber_guard_sharded");
+        b.add_concept("Alpha: a", vec!["d".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        fs::create_dir_all(b.data_dir.join("domains")).unwrap();
+        b.version_save("first").unwrap();
+        b.version_save("second").unwrap();
+        assert!(!b.data_dir.join("v0002.json").exists(), "sharded graphs write no flat snapshot");
+        b.version_restore(1).unwrap();
+        let err = b.version_save("would shadow v2").unwrap_err();
+        assert!(err.contains("already exists"), "got: {}", err);
+        let versions: Vec<u32> = b.read_versions_index().iter().map(|e| e.version).collect();
+        let mut sorted = versions.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(versions.len(), sorted.len(), "index must hold no duplicate version numbers");
     }
 
     #[test]
