@@ -28,8 +28,8 @@ const TRAITS: &str = include_str!("../policies/memory_braim_traits.md");
 pub fn policy_body(name: &str) -> Result<String, String> {
     match name.trim().to_lowercase().replace('_', "-").as_str() {
         "perturn" | "per-turn" | "logging" => Ok(PERTURN.to_string()),
-        "compaction" | "precompact" => Ok(wrap_precompact(COMPACTION)),
-        "traits" | "memory" => Ok(TRAITS.to_string()),
+        "compaction" | "precompact" => Ok(wrap_hook_context("PreCompact", COMPACTION)),
+        "traits" | "memory" => Ok(wrap_hook_context("UserPromptSubmit", TRAITS)),
         other => Err(format!(
             "Error: unknown policy '{}' (expected perturn, compaction, or traits)",
             other
@@ -37,12 +37,14 @@ pub fn policy_body(name: &str) -> Result<String, String> {
     }
 }
 
-/// The compaction rule ships as prose; a PreCompact hook wants the same
-/// `additionalContext` envelope the per-turn payload already uses.
-fn wrap_precompact(body: &str) -> String {
+/// Compaction and traits both ship as prose; each hook wants the same
+/// `additionalContext` envelope the per-turn (perturn) payload already uses,
+/// so the harness parses it as structured hookSpecificOutput instead of
+/// falling back to treating raw stdout as plain text.
+fn wrap_hook_context(event: &str, body: &str) -> String {
     let payload = json!({
         "hookSpecificOutput": {
-            "hookEventName": "PreCompact",
+            "hookEventName": event,
             "additionalContext": body
         }
     });
@@ -63,9 +65,13 @@ pub struct BootstrapReport {
     pub central: Option<String>,
 }
 
-/// True when some hook of `event` already invokes `braim policy`, so re-running
-/// the bootstrap is idempotent instead of stacking duplicate injections.
-fn has_braim_hook(settings: &Value, event: &str) -> bool {
+/// True when some hook of `event` already invokes this specific `braim policy
+/// <policy>`, so re-running the bootstrap is idempotent instead of stacking
+/// duplicate injections. Matched per (event, policy) rather than per event
+/// alone, since one event (UserPromptSubmit) can carry more than one braim
+/// policy hook (perturn + traits).
+fn has_braim_hook(settings: &Value, event: &str, policy: &str) -> bool {
+    let needle = format!("braim policy {}", policy);
     settings
         .get("hooks")
         .and_then(|h| h.get(event))
@@ -79,7 +85,7 @@ fn has_braim_hook(settings: &Value, event: &str) -> bool {
                         hooks.iter().any(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(|c| c.contains("braim policy"))
+                                .map(|c| c.contains(&needle))
                                 .unwrap_or(false)
                         })
                     })
@@ -136,13 +142,15 @@ pub fn install_hooks(settings_path: &Path) -> Result<Vec<Change>, String> {
 
     let wanted = [
         ("UserPromptSubmit", "perturn", "Injecting per-turn braim logging discipline"),
+        ("UserPromptSubmit", "traits", "Injecting braim evidence-capture traits discipline"),
         ("PreCompact", "compaction", "Injecting braim compaction discipline"),
     ];
 
     let mut changes = Vec::new();
     for (event, policy, status) in wanted {
-        if has_braim_hook(&settings, event) {
-            changes.push(Change::AlreadyPresent(event.to_string()));
+        let label = format!("{} ({})", event, policy);
+        if has_braim_hook(&settings, event, policy) {
+            changes.push(Change::AlreadyPresent(label));
             continue;
         }
         let entry = hook_entry(event, policy, status);
@@ -158,7 +166,7 @@ pub fn install_hooks(settings_path: &Path) -> Result<Vec<Change>, String> {
             .as_array_mut()
             .ok_or_else(|| format!("Error: settings.hooks.{} is not an array", event))?
             .push(entry);
-        changes.push(Change::Added(event.to_string()));
+        changes.push(Change::Added(label));
     }
 
     if changes.iter().any(|c| matches!(c, Change::Added(_))) {
@@ -229,23 +237,39 @@ mod tests {
     }
 
     #[test]
-    fn install_creates_both_hooks_and_is_idempotent() {
+    fn traits_prose_is_wrapped_in_a_hook_envelope() {
+        // Same envelope as compaction (braim ID:39): unwrapped markdown made
+        // the harness fall back to plain-text injection instead of parsing
+        // structured hookSpecificOutput.
+        let v: Value = serde_json::from_str(&policy_body("traits").unwrap()).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+        assert!(v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("EVIDENCE_CAPTURE_DISCIPLINE"));
+    }
+
+    #[test]
+    fn install_creates_all_hooks_and_is_idempotent() {
         let dir = temp("install");
         let settings = dir.join("settings.json");
 
         let first = install_hooks(&settings).unwrap();
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 3);
         assert!(first.iter().all(|c| matches!(c, Change::Added(_))));
 
         let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "braim policy perturn");
+        let ups = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "perturn + traits both live under UserPromptSubmit");
+        assert_eq!(ups[0]["hooks"][0]["command"], "braim policy perturn");
+        assert_eq!(ups[1]["hooks"][0]["command"], "braim policy traits");
         assert_eq!(v["hooks"]["PreCompact"][0]["hooks"][0]["command"], "braim policy compaction");
 
         // Re-running must not stack duplicates.
         let second = install_hooks(&settings).unwrap();
         assert!(second.iter().all(|c| matches!(c, Change::AlreadyPresent(_))));
         let v2: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v2["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        assert_eq!(v2["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -273,9 +297,10 @@ mod tests {
         assert_eq!(v["model"], "opus", "unrelated settings survive");
         assert_eq!(v["permissions"]["allow"][0], "WebSearch");
         let ups = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 2, "the existing hook is kept and braim's is appended");
+        assert_eq!(ups.len(), 3, "the existing hook is kept and both braim hooks are appended");
         assert_eq!(ups[0]["hooks"][0]["command"], "echo mine", "foreign hook untouched");
         assert_eq!(ups[1]["hooks"][0]["command"], "braim policy perturn");
+        assert_eq!(ups[2]["hooks"][0]["command"], "braim policy traits");
     }
 
     #[test]
