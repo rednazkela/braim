@@ -1230,7 +1230,8 @@ impl Braim {
             ingested_by,
             source_ids: vec![],
             pre_contested_status: None,
-            metadata: HashMap::new(),
+            // SIC ID:609 — born with the run marker when BRAIM_RUN_ID is set.
+            metadata: run_id_metadata(),
         };
         self.state.nodes.insert(id, node);
         let lower = label.to_lowercase();
@@ -2479,7 +2480,8 @@ impl Braim {
             ingested_by: None,
             source_ids: vec![],
             pre_contested_status: None,
-            metadata: HashMap::new(),
+            // SIC ID:609 — born with the run marker when BRAIM_RUN_ID is set.
+            metadata: run_id_metadata(),
         };
 
         self.state.nodes.insert(id, node);
@@ -2827,7 +2829,10 @@ impl Braim {
 
         // §3.3.4 — withdrawn support is recorded on the node so the affected
         // set is a reviewable worklist, not a silent verdict.
-        let mut initial_metadata: HashMap<String, String> = HashMap::new();
+        // SIC ID:609 — start from the run marker so a statement written by an
+        // agent that dies before its own bookkeeping is still findable via
+        // `braim list --meta run_id=<id>`.
+        let mut initial_metadata: HashMap<String, String> = run_id_metadata();
         if !refuted_deps.is_empty() {
             initial_metadata.insert(
                 "support_withdrawn_by".to_string(),
@@ -6150,5 +6155,60 @@ mod defect_tests {
             .unwrap();
         assert!(!edge.resolved, "the contradiction remains unresolved");
         assert!(edge.resolution_kind.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIC ID:609 — a phase agent that dies mid-run leaves unmarked partial writes.
+// ---------------------------------------------------------------------------
+// A 429 rate limit killed the first AB43474-F3 phase-04 amendment agent after
+// it had already written nodes 554-561 with no selection statement, no meta and
+// no because_of edges (ID:605). The retry had to find them by inspection and
+// re-ground each one before it could continue.
+//
+// Stamping every node created while BRAIM_RUN_ID is set turns that archaeology
+// into a query: `braim list --meta run_id=<prior>`. The stamp is written by the
+// store, not by the agent, so an agent that dies before its own bookkeeping
+// still leaves the marker behind.
+
+/// The `run_id` metadata a node should be born with, given the raw env value.
+/// Pure so the parsing rules are testable without mutating the environment.
+pub(crate) fn run_id_metadata_from(raw: Option<String>) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+    if let Some(run) = raw {
+        let trimmed = run.trim();
+        if !trimmed.is_empty() {
+            metadata.insert("run_id".to_string(), trimmed.to_string());
+        }
+    }
+    metadata
+}
+
+/// `run_id` metadata for the current process. Empty when BRAIM_RUN_ID is unset,
+/// so an unstamped node is indistinguishable from one created before this
+/// existed — no migration needed.
+pub(crate) fn run_id_metadata() -> HashMap<String, String> {
+    run_id_metadata_from(std::env::var("BRAIM_RUN_ID").ok())
+}
+
+#[cfg(test)]
+mod run_id_stamp_tests {
+    use super::run_id_metadata_from;
+
+    #[test]
+    fn unset_stamps_nothing() {
+        assert!(run_id_metadata_from(None).is_empty());
+    }
+
+    #[test]
+    fn empty_and_whitespace_stamp_nothing() {
+        assert!(run_id_metadata_from(Some(String::new())).is_empty());
+        assert!(run_id_metadata_from(Some("   ".to_string())).is_empty());
+    }
+
+    #[test]
+    fn a_run_id_is_stamped_trimmed() {
+        let m = run_id_metadata_from(Some("  AB43474-F3-04  ".to_string()));
+        assert_eq!(m.get("run_id").map(String::as_str), Some("AB43474-F3-04"));
     }
 }

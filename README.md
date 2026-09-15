@@ -4,6 +4,8 @@
 
 @[The graph lives in cwd/.braim (override with --data-dir) and persists to current.json] source: braim --help REQUIRED RULES:1
 
+@[--data-dir reads BRAIM_DATA_DIR] source: code:src/main.rs Cli::data_dir `#[arg(global = true, long, env = "BRAIM_DATA_DIR", default_value = ".braim")]` — precedence is explicit flag, then env var, then the cwd-relative default.
+
 Serves high-quality context to an LLM with an agent-agnostic, multi-source, cross-session approach: a fully traceable, verifiable context window that an agent cannot silently corrupt.
 
 ---
@@ -205,6 +207,26 @@ braim list --meta scope=agent_scratch       # filter by metadata
 ```
 
 #[The scope=agent_scratch pattern keeps agent reasoning markers in the main graph but filterable out of discovery] based_on: @[meta set/list] + @[default facts-only queries already hide 0-PRIMARY claims]
+
+### Environment
+
+| Variable | Effect |
+|---|---|
+| `BRAIM_DATA_DIR` | Store path for every command. Beaten by an explicit `--data-dir`, beats the cwd-relative `.braim` default. Pin it and a stray `cd` stops re-pointing the graph. |
+| `BRAIM_RUN_ID` | Stamps `run_id=<value>` metadata on every node created by the process. |
+| `BRAIM_NO_TIPS` | Suppresses `braim tip:` lines on stderr (same as `--quiet`). |
+
+```bash
+export BRAIM_DATA_DIR=/abs/path/.braim      # cwd no longer selects the store
+BRAIM_RUN_ID=task-04-a1 braim statement add ...
+braim list --meta run_id=task-04-a1          # everything that run wrote
+```
+
+@[Every node created while BRAIM_RUN_ID is set carries run_id metadata] source: code:src/graph.rs run_id_metadata, applied at all three Node construction sites (source, concept, statement)
+
+#[An agent killed mid-run leaves a queryable partial set rather than orphans, because the stamp is written by the store and not by the agent's own bookkeeping] based_on: @[run_id_metadata at the construction sites](code:src/graph.rs) + @[the 429 that killed the AB43474-F3 phase-04 amendment after nodes 554-561](ID:605)
+
+@[When the store came from the cwd-relative default and another .braim sits in the cwd chain, braim names the alternates on stderr] source: code:src/tips.rs emit_tip_ambiguous_store
 
 ### Maintenance
 

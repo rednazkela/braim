@@ -198,7 +198,15 @@ FOR AGENTS:\n\
       'braim concept update-deps <id> --add/--remove/--set' to preserve node ID\n\
       and all referencing statements.")]
 struct Cli {
-    #[arg(global = true, long, default_value = ".braim")]
+    /// SIC ID:608 — the default ".braim" is RELATIVE, so the store silently
+    /// follows the shell's cwd. On 2026-09-11 a `cd /home/magnimus/sonar &&`
+    /// prefix appended nodes 28-36 to that directory's 27-node store instead
+    /// of the session store one level down at sonar/sonar/.braim, and the
+    /// 390-node graph holding the real history was never read. Reading
+    /// BRAIM_DATA_DIR pins the store for a whole session regardless of cwd;
+    /// clap precedence keeps an explicit --data-dir winning over the env var,
+    /// which in turn beats the cwd-relative default.
+    #[arg(global = true, long, env = "BRAIM_DATA_DIR", default_value = ".braim")]
     data_dir: String,
 
     #[arg(global = true, long, help = "Suppress tips and non-error stderr output")]
@@ -776,6 +784,12 @@ fn is_read_only(cmd: &Commands) -> bool {
 
 fn main() {
     let cli = Cli::parse();
+
+    // SIC ID:608 — when the store came from the cwd-relative default and
+    // another .braim sits in the cwd chain, say so before writing anything.
+    // The 2026-09-11 wrong-store write produced no signal at all; every
+    // command looked like it had succeeded.
+    tips::emit_tip_ambiguous_store(&cli.data_dir, cli.quiet);
 
     let open = if is_read_only(&cli.command) {
         Braim::new(&cli.data_dir)
