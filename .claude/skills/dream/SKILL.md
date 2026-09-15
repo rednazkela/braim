@@ -506,6 +506,48 @@ one of them used to be report-only:
 Nodes need no flag: they are already findable with `braim list --meta
 scope=dream`. Flag the things that are **not** nodes.
 
+## Clearing the audit-rot queue
+
+`braim dream flag` takes two families of `--kind`, and the five above are only
+one of them. The other four are **audit rot**, raised by the per-turn audit
+rather than by a night run:
+
+| kind | what was found |
+|---|---|
+| `anchor` | a node's own state is wrong — stale status, a tie that no longer holds |
+| `reground` | the node's label disagrees with the source it cites |
+| `independence` | a claim rests on a source that cannot refute it |
+| `unsupported` | a claim carries no source that establishes it |
+
+`braim_stop_gate.sh` blocks at `BRAIM_AUDIT_THRESHOLD` (default 5) with *"Run a
+dream session now, scoped to review items: …"*. That is this procedure, and it
+is the only thing that lowers the counter.
+
+**The clearing procedure, per item:**
+
+1. `braim dream review` — read the item and the node ids it names.
+2. **Gather evidence before deciding.** Re-read the SOURCE the node cites, not
+   the node's label. A label is a pointer; it can carry an upstream error, and
+   re-citing it is how a wrong figure survives.
+3. Decide, and act:
+   - label disagrees with its source → fix the node (`braim meta <id> --set
+     correction="…"`, or `statement invalidate` when the claim itself is refuted)
+   - the item is right but the node is superseded → record `superseded_by`
+   - the item does not hold → say so in the note; a finding you did not act on
+     is not tidied away by resolving it
+4. `braim dream reviewed <id> --note "<what you decided and why>"`
+
+**Delegate the gathering, never the deciding.** Step 2 is open-the-file-and-quote
+work: mechanical, verifiable in one command, and carrying no authority over what
+the evidence means. Spawn ONE `dream-probe` (haiku) at the start of the session
+and message it per item rather than spawning per item — a spawn costs ~42.6k
+tokens, a follow-up message ~681. Steps 3 and 4 stay with you: they change the
+graph, so they belong to the tier that will be held to them.
+
+A probe returns quoted text and an `agree: yes|no|NOT FOUND`. If it reports
+NOT FOUND, that is evidence, not a failure to try — treat a missing citation as
+the finding.
+
 Reading the queue back, on any later session or after any compaction:
 
 ```bash

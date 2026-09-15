@@ -31,6 +31,31 @@ msg=$(echo "$input" | jq -r '.last_assistant_message // ""')
 
 # Case-insensitive, whole-phrase matches only - short list, reviewed for
 # false-positive risk before adding anything new.
+# ---------------------------------------------------------------------------
+# Hand the reply back with every refusal.
+# ---------------------------------------------------------------------------
+# An instruction with no content attached is what produced braim ID:1931
+# (profserv, recurrence 4): the rewrite answers the gate and drops the
+# deliverable. Echo what was written so the rewrite edits it rather than
+# replacing it. Override the cap with BRAIM_STOP_ECHO_LIMIT.
+BRAIM_STOP_ECHO_LIMIT="${BRAIM_STOP_ECHO_LIMIT:-4000}"
+
+emit_last_reply() {
+  [ -n "$msg" ] || return 0
+  n=$(printf '%s' "$msg" | wc -c)
+  printf -- '\n---- YOUR PREVIOUS REPLY (%s bytes) ----\n' "$n" >&2
+  if [ "$n" -le "$BRAIM_STOP_ECHO_LIMIT" ]; then
+    printf -- '%s\n' "$msg" >&2
+  else
+    half=$(( BRAIM_STOP_ECHO_LIMIT / 2 ))
+    printf '%s' "$msg" | head -c "$half" >&2
+    printf -- '\n[... %s bytes elided ...]\n' "$(( n - BRAIM_STOP_ECHO_LIMIT ))" >&2
+    printf '%s' "$msg" | tail -c "$half" >&2
+    printf -- '\n' >&2
+  fi
+  printf -- '---- END OF YOUR PREVIOUS REPLY ----\n%s\n' "$1" >&2
+}
+
 BLOCKLIST=(
   "i apologize"
   "i'm sorry for"
@@ -54,6 +79,7 @@ done
 
 if [ -n "$hit" ]; then
   echo "Response contains filler phrase matching '$hit'. This is a narrow, curated blocklist of superfluous filler (not a hedge-word ban - genuine uncertainty should still be marked via ?[unknown], not suppressed). Rewrite without it and continue." >&2
+  emit_last_reply "Rewrite THAT content. Every finding, citation, table and verdict line survives the rewrite; only the flagged wording changes. Do not replace it with a shorter unrelated answer, and never answer a gate with a compliance tag alone."
   exit 2
 fi
 

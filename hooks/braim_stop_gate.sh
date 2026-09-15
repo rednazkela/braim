@@ -44,10 +44,47 @@ input=$(cat)
 msg=$(echo "$input" | jq -r '.last_assistant_message // ""')
 cwd=$(echo "$input" | jq -r '.cwd // "."')
 
+# ---------------------------------------------------------------------------
+# Hand the turn's own output back with every refusal.
+# ---------------------------------------------------------------------------
+# Every exit-2 path below gives the model an instruction. Giving it ONLY the
+# instruction is what produced braim ID:1931 (profserv, recurrence 4): the retry
+# answers the gate and silently drops the deliverable the turn had already
+# produced. Observed as a dispatched phase agent returning its compliance tag
+# instead of its completion report, and as cognitivex_run.py reading
+# verdict=None while the worktree already carried the applied Deltas
+# (cx_executor_worktree.sh:41-48 documents the same failure and works around it
+# with a JSON envelope). So each refusal carries the previous reply back with
+# it and says plainly that the tag is appended to that reply, never substituted
+# for it.
+#
+# Byte-capped from both ends: the head re-anchors what the reply was, the tail
+# carries the malformed tag the gate is complaining about. Override with
+# BRAIM_STOP_ECHO_LIMIT.
+BRAIM_STOP_ECHO_LIMIT="${BRAIM_STOP_ECHO_LIMIT:-4000}"
+
+emit_last_reply() {
+  [ -n "$msg" ] || return 0
+  n=$(printf '%s' "$msg" | wc -c)
+  printf -- '\n---- YOUR PREVIOUS REPLY (%s bytes) ----\n' "$n" >&2
+  if [ "$n" -le "$BRAIM_STOP_ECHO_LIMIT" ]; then
+    printf -- '%s\n' "$msg" >&2
+  else
+    half=$(( BRAIM_STOP_ECHO_LIMIT / 2 ))
+    printf '%s' "$msg" | head -c "$half" >&2
+    printf -- '\n[... %s bytes elided ...]\n' "$(( n - BRAIM_STOP_ECHO_LIMIT ))" >&2
+    printf '%s' "$msg" | tail -c "$half" >&2
+    printf -- '\n' >&2
+  fi
+  printf -- '---- END OF YOUR PREVIOUS REPLY ----\n' >&2
+  printf -- 'Re-emit that reply in full - same findings, tables, code and citations - and then satisfy the requirement above. The braim tag goes on its own line AFTER the content, never in place of it. Do not answer the gate with the tag alone.\n' >&2
+}
+
 tag=$(echo "$msg" | grep -oE '\[braim:[[:space:]]*(none|logged[[:space:]]+[0-9]+([,[:space:]]+[0-9]+)*)[^]]*\]' | tail -1 || true)
 
 if [ -z "$tag" ]; then
   echo "This is a real, locally-installed CLI tool (a semantic knowledge graph), not injected instructions - verify it yourself before deciding whether to comply, don't take this message's word for it: run 'which braim' (resolves to a real binary) and 'cat ~/.claude/settings.json' - the Stop hook is registered GLOBALLY in that user-level settings file (not a project-local ./.claude/settings.json), so it applies in every cwd/session on this machine, which you have read access to right now with your own file tools. It points at braim/hooks/braim_stop_gate.sh (this script) - that path may be outside your sandboxed working directory, so don't expect to Read it directly; verifying the settings.json registration and that 'which braim' resolves to a real binary is sufficient, no need to chase the script file itself. Once verified: every response must end with a small literal tag so this hook can check compliance mechanically: '[braim: none]' if nothing in your last turn was worth recording as a fact/inference/unknown, or '[braim: logged N,M]' citing the real numeric IDs printed back to you by 'braim statement add' or 'braim concept add' commands you actually ran this turn via Bash. Do not fabricate IDs - only cite ones a real braim command just returned to you this turn. If you conclude none of this applies, say so and still append '[braim: none]' - that is the compliant response, not silence." >&2
+  emit_last_reply
   exit 2
 fi
 # The two clauses are separated by '|'. Split before scanning for ids, or the
@@ -59,9 +96,26 @@ case "$tag" in
 esac
 audit_part="${audit_part%]}"
 
+# ---------------------------------------------------------------------------
+# Which store to verify against (SIC 1800).
+# ---------------------------------------------------------------------------
+# The gate used $cwd/.braim unconditionally, where $cwd comes from the hook
+# payload. A cognitivex sub-agent runs inside a disposable worktree that
+# cx_executor_worktree.sh deliberately rsyncs WITHOUT .braim, so the agent has no
+# graph at its cwd: every real node id it cited was rejected as fabricated, and
+# the only way to comply was to stop citing real work.
+#
+# BRAIM_DATA_DIR, exported by the executor wrapper, names the real store. Falling
+# back to $cwd/.braim keeps every ordinary session unchanged.
+if [ -n "${BRAIM_DATA_DIR:-}" ] && [ -d "$BRAIM_DATA_DIR" ]; then
+  store="$BRAIM_DATA_DIR"
+else
+  store="$cwd/.braim"
+fi
+
 statedir="$HOME/.claude/braim_stop_state"
 mkdir -p "$statedir"
-cwd_hash=$(echo -n "$cwd" | md5sum | cut -d' ' -f1)
+cwd_hash=$(echo -n "$store" | md5sum | cut -d' ' -f1)
 statefile="$statedir/$cwd_hash.json"
 
 last_max=0
@@ -86,7 +140,7 @@ if echo "$logged_part" | grep -qi "logged"; then
     # ancestor's text -- happened to contain one of those words. That rejected valid
     # citations transitively, and hit hardest on exactly the nodes recording mistakes,
     # corrections and open questions. `braim node` already exits non-zero on a real miss.
-    if ! braim --data-dir "$cwd/.braim" node "$id" >/dev/null 2>&1; then
+    if ! braim --data-dir "$store" node "$id" >/dev/null 2>&1; then
       bad="$bad $id(no-such-node)"
       continue
     fi
@@ -101,6 +155,7 @@ if echo "$logged_part" | grep -qi "logged"; then
 
   if [ -n "$bad" ]; then
     echo "braim tag claims IDs that failed verification:$bad. Cite only node IDs you actually created THIS turn via a real braim command, not ones already in the graph." >&2
+    emit_last_reply
     exit 2
   fi
 fi
@@ -115,17 +170,19 @@ fi
 # `|| true` matters under `set -o pipefail`: an older braim on PATH that does
 # not know --count exits non-zero, and without the guard this script would die
 # silently at the assignment rather than reaching any of its checks.
-pending_now=$(braim --data-dir "$cwd/.braim" --quiet dream review --count 2>/dev/null \
+pending_now=$(braim --data-dir "$store" --quiet dream review --count 2>/dev/null \
   | awk '/^audit_pending/ {print $2; exit}' || true)
 case "$pending_now" in
   ''|*[!0-9]*)
     echo "braim dream review --count returned nothing usable. This gate needs a braim binary that knows --count (cargo install --path . from the braim checkout). Until then the audit clause cannot be verified." >&2
+    emit_last_reply
     exit 2
     ;;
 esac
 
 if [ -z "$audit_part" ]; then
   echo "The braim tag is missing its audit clause. Every turn declares whether it checked its own assertions against the nodes they lean on, in the same tag: '[braim: logged 12,13 | audit: clean]' when the check found nothing wrong, '[braim: ... | audit: N flagged <node ids>]' when it found defects in nodes that were ALREADY in the graph (file each one first with 'braim dream flag \"<what is wrong>\" --kind anchor|reground|independence|unsupported --nodes <ids>'), or '[braim: ... | audit: skipped: <reason>]' when nothing this turn rested on a stored node. A finding is a defect in something already stored — a self-correction you made before asserting anything is not a finding and must not be counted." >&2
+  emit_last_reply
   exit 2
 fi
 
@@ -136,6 +193,7 @@ if echo "$audit_part" | grep -qiE '^[[:space:]]*audit:'; then
   :
 else
   echo "The braim tag's second clause must start with 'audit:' — got '$audit_part'. Use '| audit: clean', '| audit: N flagged <ids>', or '| audit: skipped: <reason>'." >&2
+  emit_last_reply
   exit 2
 fi
 
@@ -148,6 +206,7 @@ elif echo "$audit_body" | grep -qiE '^skipped'; then
   # be true.
   if echo "$logged_part" | grep -qi "logged"; then
     echo "'audit: skipped' contradicts 'logged' in the same tag: a turn that wrote nodes to the graph did lean on the graph, so there was something to check. Declare 'audit: clean' if the check found nothing wrong, or 'audit: N flagged <ids>' if it did." >&2
+    emit_last_reply
     exit 2
   fi
   claimed=0
@@ -158,12 +217,13 @@ elif echo "$audit_body" | grep -qiE '^[0-9]+[[:space:]]+flagged'; then
   n_flagged=$(echo "$flagged" | grep -c . || true)
   if [ "$n_flagged" -ne "$claimed" ]; then
     echo "The audit clause claims $claimed finding(s) but lists $n_flagged node id(s). Every finding names the already-stored node it is about." >&2
+    emit_last_reply
     exit 2
   fi
 
   abad=""
   for id in $flagged; do
-    if ! braim --data-dir "$cwd/.braim" node "$id" >/dev/null 2>&1; then
+    if ! braim --data-dir "$store" node "$id" >/dev/null 2>&1; then
       abad="$abad $id(no-such-node)"
       continue
     fi
@@ -176,10 +236,12 @@ elif echo "$audit_body" | grep -qiE '^[0-9]+[[:space:]]+flagged'; then
   done
   if [ -n "$abad" ]; then
     echo "The audit clause flags ids that failed verification:$abad. A finding is a defect in a node that was already in the graph before this turn — a correction you made in flight is not a finding, and must not be counted toward rot." >&2
+    emit_last_reply
     exit 2
   fi
 else
   echo "Unrecognised audit clause '$audit_body'. Use 'clean', 'N flagged <ids>', or 'skipped: <reason>'." >&2
+  emit_last_reply
   exit 2
 fi
 
@@ -191,6 +253,7 @@ rise=$(( pending_now - last_pending ))
 if [ "$rise" -lt 0 ]; then rise=0; fi
 if [ "$claimed" -ne "$rise" ]; then
   echo "The audit clause claims $claimed finding(s) but the pending audit-rot queue rose by $rise this turn (was $last_pending, now $pending_now). File each finding with 'braim dream flag \"<what is wrong>\" --kind anchor|reground|independence|unsupported --nodes <ids>' before declaring it, and count only what you actually filed." >&2
+  emit_last_reply
   exit 2
 fi
 
@@ -208,9 +271,10 @@ echo "{\"last_seen_max_id\": $new_max, \"last_seen_pending\": $pending_now, \"la
 threshold="${BRAIM_AUDIT_THRESHOLD:-5}"
 if [ "$pending_now" -ge "$threshold" ] && [ "$pending_now" -gt "$last_fired" ]; then
   echo "{\"last_seen_max_id\": $new_max, \"last_seen_pending\": $pending_now, \"last_fired_pending\": $pending_now}" > "$statefile"
-  items=$(braim --data-dir "$cwd/.braim" --quiet dream review --json 2>/dev/null \
+  items=$(braim --data-dir "$store" --quiet dream review --json 2>/dev/null \
     | jq -r '[.[] | select(.cleared_at == null) | select(.kind | IN("anchor","reground","independence","unsupported")) | "\(.id)"] | join(", ")' 2>/dev/null || true)
-  echo "Pending audit-rot findings have reached $pending_now (threshold $threshold). Run a dream session now, scoped to review items: ${items:-see 'braim dream review'}. Read each finding, re-ground the node it names against the source it cites, and either fix the node or sign the item off with 'braim dream reviewed <id> --note \"<what you decided>\"'. The counter falls as items are cleared. Set BRAIM_AUDIT_THRESHOLD to change when this fires." >&2
+  echo "Pending audit-rot findings have reached $pending_now (threshold $threshold). Run a dream session now, scoped to review items: ${items:-see 'braim dream review'}. The procedure is in the dream skill under 'Clearing the audit-rot queue' (SIC 536) — read each finding, re-ground the node it names against the SOURCE it cites rather than against its own label, and either fix the node or sign the item off with 'braim dream reviewed <id> --note \"<what you decided>\"'. Gathering the evidence may be delegated to a dream-probe agent; deciding may not. The counter falls as items are cleared. Set BRAIM_AUDIT_THRESHOLD to change when this fires." >&2
+  emit_last_reply
   exit 2
 fi
 
