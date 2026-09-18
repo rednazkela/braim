@@ -3968,12 +3968,41 @@ impl Braim {
 
         node.verified_by.insert(domain.to_string(), note);
 
-        let num_verifications = node.verified_by.len();
-        node.verification_status = match num_verifications {
-            0 | 1 => VerificationStatus::Unproven,
-            2 => VerificationStatus::Partial,
-            _ => VerificationStatus::Proven,
-        };
+        // braim ID:810 — this used to assign verification_status from the
+        // verified_by COUNT: unproven at 0 or 1, partial at 2, proven at 3+.
+        // That is a second scale for a field the rest of the codebase derives
+        // from PRIMARY source-type diversity (proven at 2 types, proven_strong
+        // at 3+), and it overwrote rather than combined. The first verification
+        // recorded against any proven_strong statement therefore rewrote it to
+        // unproven — the act of corroborating destroyed the corroboration. The
+        // trap was unsprung only because the command had never been run: 0 of
+        // 806 active nodes carried a verified_by entry when this was found.
+        //
+        // A verification is PROVENANCE — a named domain reviewed this and left
+        // a note — not a promotion channel. braim already has a promotion
+        // channel for a human's check: record what was checked as a typed
+        // source (`braim sources add --type test`) and attach it with
+        // `statement add-source`, which is what raises status legitimately.
+        // So recording a verification now leaves status exactly as the sources
+        // and the dependency cap determine it, using the same computation every
+        // other write path uses.
+        //
+        // Contested and invalid statuses are governed by contradiction and
+        // invalidation rather than by source diversity, so they are left alone
+        // here for the same reason delete_source_from_statement leaves them.
+        let is_contested = node.verification_status == VerificationStatus::Contested;
+        let is_invalid = node.verification_status == VerificationStatus::Invalid;
+
+        if !is_contested && !is_invalid {
+            let new_status = {
+                let stmt = self.state.nodes.get(&statement_id).unwrap();
+                let entity_types = self.fetch_source_entity_types(&stmt.source_ids);
+                Self::calculate_verification_status_from_all_sources(&stmt.sources, &entity_types)
+            };
+            let stmt = self.state.nodes.get_mut(&statement_id).unwrap();
+            stmt.verification_status = new_status;
+            stmt.node_type = NodeType::from_verification_status(new_status);
+        }
 
         self.flush()?;
         Ok(())
@@ -5321,6 +5350,71 @@ mod defect_tests {
         let m = central.import_state(work.state.clone(), Some("billing"), Some(VerificationStatus::Partial), HashMap::new(), true).unwrap();
         assert_eq!(m.contested_admitted, 2, "both sides of the dispute must cross");
         assert_eq!(m.contradicts_imported, 1, "and the edge that links them");
+    }
+
+    #[test]
+    fn verifying_a_statement_never_lowers_its_source_derived_status() {
+        // braim ID:810. verify_statement assigned status from the verified_by
+        // COUNT, so the first verification recorded against a proven statement
+        // rewrote it to unproven — corroboration destroying corroboration.
+        // Two PRIMARY types from different categories is proven; a verification
+        // is provenance and must leave that alone.
+        let mut b = temp_braim("verify_does_not_demote");
+        b.add_concept("Alpha: a", vec!["billing".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        b.add_concept("Beta: b", vec!["billing".into()], vec!["code:b.rs:1".into()], None).unwrap();
+        let s = b.add_statement(
+            "the loader writes one row per record",
+            vec!["billing".into()],
+            vec!["code:svc.rs:10".into(), "test:svc_test.rs:4".into()],
+            [(1u32, 0.6), (2u32, 0.4)].into_iter().collect(),
+            true,
+        ).unwrap();
+        assert_eq!(
+            b.state.nodes[&s].verification_status,
+            VerificationStatus::Proven,
+            "code + test are two PRIMARY categories, so the statement starts proven"
+        );
+
+        b.verify_statement(s, "billing", Some("reviewed by the billing owner".into())).unwrap();
+
+        assert_eq!(
+            b.state.nodes[&s].verified_by.len(),
+            1,
+            "the verification is recorded as provenance"
+        );
+        assert_eq!(
+            b.state.nodes[&s].verification_status,
+            VerificationStatus::Proven,
+            "and it does NOT demote the statement it verifies"
+        );
+        assert_eq!(
+            b.state.nodes[&s].node_type,
+            NodeType::from_verification_status(VerificationStatus::Proven),
+            "node_type stays in step with the status it is derived from"
+        );
+    }
+
+    #[test]
+    fn verifying_a_contested_statement_leaves_the_contest_alone() {
+        // Contested is governed by contradiction, not by source diversity, so a
+        // verification must not quietly recompute it back to proven.
+        let mut b = temp_braim("verify_leaves_contested");
+        b.add_concept("Alpha: a", vec!["billing".into()], vec!["code:a.rs:1".into()], None).unwrap();
+        b.add_concept("Beta: b", vec!["billing".into()], vec!["code:b.rs:1".into()], None).unwrap();
+        let deps: std::collections::HashMap<u32, f64> = [(1u32, 0.6), (2u32, 0.4)].into_iter().collect();
+        let x = b.add_statement("x holds", vec!["billing".into()], vec!["code:svc.rs:10".into(), "test:t.rs:1".into()], deps.clone(), true).unwrap();
+        let y = b.add_statement("x does not hold", vec!["billing".into()], vec!["code:svc.rs:10".into(), "doc:d.md:2".into()], deps, true).unwrap();
+        b.contradict_statements(x, y, "x vs not x", None).unwrap();
+        assert_eq!(b.state.nodes[&x].verification_status, VerificationStatus::Contested);
+
+        b.verify_statement(x, "billing", None).unwrap();
+
+        assert_eq!(
+            b.state.nodes[&x].verification_status,
+            VerificationStatus::Contested,
+            "a verification does not resolve a contradiction"
+        );
+        assert_eq!(b.state.nodes[&x].verified_by.len(), 1, "but it is still recorded");
     }
 
     #[test]
