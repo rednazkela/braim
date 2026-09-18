@@ -36,14 +36,42 @@ slipped, not that the graph is unusually rich.
 
 ## Setup
 
+Read the mechanical report BEFORE generating candidates. `braim audit` computes
+six worklists with no judgement at all, and dreaming used to invoke it nowhere —
+so every pass re-derived by hand what was already printed, and two of its
+sections had no reader whatsoever:
+
 ```bash
-braim dream candidates --limit <N> --json          # the worklist
-braim dream candidates --strategy semantic --json  # highest precision first
+braim audit                                       # the mechanical report — run this first
+braim dream candidates --limit <N> --json         # the worklist
+braim dream candidates --strategy semantic --json # highest precision first
 ```
 
-Spend the budget **semantic first, then shared-source, then two-hop**: measured
-on a real 714-node graph those yielded 30 / 148 / 5135 candidates respectively,
-so two-hop is a reserve, not a starting point.
+What each audit section is worth to a session:
+
+| section | use it for |
+|---|---|
+| Orphan nodes | pair candidates the generators structurally cannot surface — an unreferenced node is far from everything, so semantic and two-hop both miss it |
+| Pending nodes | declared and unintegrated; either wire them or say why not |
+| Gap register | zero-path pairs already registered as worth investigating — a candidate list somebody else wrote |
+| Deprecated still referenced | a live citation of something retired |
+| Refuted causal links | the output of causal re-grounding, and the input to the next one |
+| Statements flagged for re-investigation | **a standing worklist, see below** |
+
+`braim audit` exits 0 whatever it finds, so read its sections; do not test its
+status.
+
+**The orphan row is not theoretical.** A platform-design run produced six
+sibling frames under one parent and `--strategy semantic` returned zero
+candidates touching any of them — the generator excludes pairs closer than two
+hops, and siblings sharing a parent are exactly that. Audit saw them; the
+candidate generators could not.
+
+Spend the candidate budget **semantic first, then shared-source, then two-hop**:
+measured on a real 714-node graph those yielded 30 / 148 / 5135 candidates
+respectively, so two-hop is a reserve, not a starting point. The exception is a
+freshly authored frame set, where shared-source goes first — see the causal
+re-grounding and label-shape passes for why proximity inverts there.
 
 Dreaming is refused on graphs marked `.braim.central` — a dream is an unreviewed
 hypothesis and an unattended central has no reviewer. Work on a local graph.
@@ -663,6 +691,64 @@ one of them used to be report-only:
 Nodes need no flag: they are already findable with `braim list --meta
 scope=dream`. Flag the things that are **not** nodes.
 
+## Clearing the re-investigation backlog
+
+`braim dream flag` is not the only queue. When a cause is invalidated, braim
+marks every statement that rested on it and prints them under **"Statements
+flagged for re-investigation (cause invalidated below)"**. Those entries are a
+worklist with the same shape as audit rot and, until this section existed, no
+reader at all: nine sat on this graph citing a single invalidated cause, some
+for weeks, because the flag is raised automatically and cleared by nobody.
+
+This backlog GROWS from dreaming's own work. Causal re-grounding refutes links
+on purpose, and every refutation marks that link's dependents. A pass that
+produces flags and never clears them is a pass that manufactures debt.
+
+**Per flagged statement:**
+
+1. `braim node <id>` and read the cause that was invalidated. The flag says the
+   ground moved; it does not say the statement is wrong.
+2. Ask the narrow question: **does this statement still hold on its own
+   sources?** A statement whose cause was refuted but whose own evidence stands
+   is fine — it was mis-parented, not mistaken.
+3. Act on the answer:
+   - **holds on its own sources** → re-parent it to the real cause, or mark it
+     `terminal_cause=true` if it has none. Same rule as causal re-grounding:
+     do NOT invent a parent to fill the hole.
+   - **held only because its cause held** → `braim statement invalidate <id>
+     --reason "<the cause it rested on was refuted, and its own sources do not
+     carry it>"`. This is the case the flag exists for.
+   - **cannot be settled from this checkout** → `braim dream flag` it with kind
+     `anchor` and say what evidence would settle it.
+4. Clear it, and record what you decided. **braim raises this flag with a
+   metadata key of its own, `because_of_reinvestigate`, and `braim audit` reads
+   THAT key — not any marker a skill invents.** Setting a `reinvestigated_at`
+   alone leaves the count exactly where it was; verified by doing it and
+   watching nine stay nine.
+   ```bash
+   braim meta <id> --set reinvestigated_note="<what you decided and why>"
+   braim meta <id> --set reinvestigated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   braim meta <id> --unset because_of_reinvestigate    # this is what clears it
+   ```
+   The note and the timestamp are for the next reader; the unset is what lowers
+   the count. Do the unset LAST, so an interrupted session leaves the flag up
+   rather than clearing an item it never decided.
+
+   This differs from every other withholding marker in this skill —
+   `whatif_walked_at`, `reweighed_at`, `label_shape_at`, `causal_regrounded_at`
+   are read by the skill's own scripts, which is why inventing them works. This
+   queue is braim's, so clearing it is braim's key.
+
+**Budget it like the other passes**: two or three a session. A backlog that
+accumulated over weeks does not need clearing in one night, and the statements
+at the bottom of it have been wrong-or-fine for that long already.
+
+**Expect "still holds" to be the common verdict.** An invalidated cause is
+evidence about the EDGE, not about the node. Treating the flag as a verdict on
+the statement is how a correct finding gets invalidated for its parent's sins —
+the same collateral damage that multi-claim labels cause, arriving by a
+different route.
+
 ## Clearing the audit-rot queue
 
 `braim dream flag` takes two families of `--kind`, and the five above are only
@@ -783,6 +869,11 @@ in the graph, the ledger, or the review queue before you write a word of it:
 - label shape: how many nodes the check offered, how many held one claim and
   were simply marked, and every node flagged for decomposition with the claims
   you could separate out of it
+- the audit read at Setup: what each section held going in, so a section that
+  grew during the session is visible against where it started
+- re-investigation flags cleared: which statements, and whether each still held
+  on its own sources or fell with its cause — those are different outcomes and
+  a count of "cleared" hides which one happened
 - causal edges tested: which ones, the verdict on each, and any reassignment —
   kept separate from the confirmations, since a PASS is the expected outcome
 - what to review: `braim dream review` first — it is the only place the
