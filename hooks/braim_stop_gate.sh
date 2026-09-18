@@ -162,6 +162,62 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# Edge disclosure: a turn that wrote a subgraph must SAY what the subgraph is.
+# ---------------------------------------------------------------------------
+# Added 2026-09-18 on operator instruction, after a session in which the reply
+# ended '[braim: logged 747,748,749,750]' and the body named no relationship at
+# all. A bare id list is a receipt, not a description: the reader learns that
+# four nodes exist and nothing about which depends on which, which caused which,
+# or what weight any edge carries. The graph holds that structure; the reply was
+# throwing it away on the last line.
+#
+# This enforces the ask directly. When a turn logs two or more NEW nodes, the
+# body must (1) mention each logged id outside the tag, and (2) carry at least
+# one relationship marker per logged node. A genuinely parentless node discloses
+# with the word "terminal" — that is a relationship claim too, and a checkable
+# one, since the graph records terminal_cause.
+#
+# Deliberately NOT enforced for a single logged node: one node has no internal
+# structure to describe, and demanding an edge would push toward inventing one.
+edge_ids=""
+edge_count=0
+if echo "$logged_part" | grep -qi "logged"; then
+  edge_ids=$(echo "$logged_part" | grep -oE '[0-9]+')
+  edge_count=$(echo "$edge_ids" | grep -c . || true)
+fi
+
+if [ "$edge_count" -ge 2 ]; then
+  # The body is the reply minus the tag line, so a tag that happened to contain
+  # an arrow cannot satisfy the check on its own.
+  body=$(printf '%s' "$msg" | grep -vF "$tag" || true)
+
+  missing_ids=""
+  for id in $edge_ids; do
+    if ! printf '%s' "$body" | grep -qE "(^|[^0-9])$id([^0-9]|$)"; then
+      missing_ids="$missing_ids $id"
+    fi
+  done
+
+  # One marker vocabulary, matched case-insensitively. Arrows cover the compact
+  # edge-list form; the words cover prose.
+  markers=$(printf '%s' "$body" \
+    | grep -oiE '(->|→|depends[_ ]?on|depends|because[_ ]?of|based[_ ]?on|terminal)' \
+    | grep -c . || true)
+
+  if [ -n "$missing_ids" ]; then
+    echo "The braim tag cites node(s)$missing_ids that appear nowhere in the reply body. A tag is a receipt, not a description: every node this turn created must be discussed where the reader can see what it says and how it connects, not only counted on the last line." >&2
+    emit_last_reply
+    exit 2
+  fi
+
+  if [ "$markers" -lt "$edge_count" ]; then
+    echo "This turn logged $edge_count nodes but the reply body carries only $markers relationship marker(s). A subgraph written and not described is structure thrown away. State, for each node, how it attaches: its depends_on with the weights when the split is doing work, its because_of parent and the direction, or the word 'terminal' when it genuinely has no parent. An edge list ('ID:748 -> ID:747') satisfies this, and so does prose that names the relationship. Do NOT put the edges inside the braim tag — it takes exactly two clauses, 'logged' and 'audit'." >&2
+    emit_last_reply
+    exit 2
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # The audit clause.
 # ---------------------------------------------------------------------------
 # Read the rot counter first: `braim dream review --count` prints
