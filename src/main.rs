@@ -471,6 +471,8 @@ enum StatementCommands {
         strict_sources: bool,
         #[arg(long, help = "Reject statements with duplicate domains")]
         strict_domains: bool,
+        #[arg(long, help = "Last resort: allow a single sentence up to 400 chars when it genuinely will not fit in 250. Never relaxes the one-sentence rule or the named-but-unwired check")]
+        loose_label: bool,
         #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
     },
@@ -1014,6 +1016,7 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             assume,
             strict_sources,
             strict_domains,
+            loose_label,
             check_dupes,
         }) => {
             if check_dupes {
@@ -1084,6 +1087,61 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 } else if braim.distinct_domain_count() > 1 {
                     // Suppress in single-domain graphs — uniform repetition is expected
                     tips::emit_tip_duplicate_domains(&dup_domain_counts, cli.quiet);
+                }
+            }
+
+            // Label shape and unwired references (Issue 4) — ENFORCED BY DEFAULT.
+            // Limits are this graph's own founding convention over 461 single-sentence
+            // statements: p90 248 chars, p99 370, max 407 (braim ID:2396).
+            {
+                let (chars, sentences, named) = Braim::validate_label_shape(&text);
+                let cap = if loose_label { 400 } else { 250 };
+
+                if sentences > 1 {
+                    return Err(format!(
+                        "Error: label carries {} sentences. A statement label states ONE claim — put the evidence in --sources and the reasoning in a dependent statement. --loose-label does NOT relax this.",
+                        sentences
+                    ));
+                }
+                if chars > cap {
+                    return Err(format!(
+                        "Error: label is {} chars, over the {} limit.{}",
+                        chars,
+                        cap,
+                        if loose_label {
+                            " Already using --loose-label; the claim needs splitting, not more room."
+                        } else {
+                            " If the single sentence genuinely will not fit, --loose-label raises the cap to 400 — last resort, not routine."
+                        }
+                    ));
+                }
+                if !named.is_empty() {
+                    let list = named
+                        .iter()
+                        .map(|id| format!("ID:{}", id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let missing: Vec<u32> = named
+                        .iter()
+                        .copied()
+                        .filter(|id| !depends_map.contains_key(id))
+                        .collect();
+                    return Err(format!(
+                        "Error: label names [{}]. A node id belongs in --depends, never in the label — the edge is the reference, and repeating it in prose makes a relationship the graph cannot traverse, weight or contradict. Rewrite the sentence to name the thing rather than its id{}. --loose-label does NOT relax this.",
+                        list,
+                        if missing.is_empty() {
+                            String::from("; all of them are already dependencies")
+                        } else {
+                            format!(
+                                ", and add {} to --depends",
+                                missing
+                                    .iter()
+                                    .map(|id| id.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ));
                 }
             }
 

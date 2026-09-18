@@ -864,6 +864,69 @@ impl Braim {
         has_primary && has_tertiary
     }
 
+    /// Label shape: a statement label carries ONE claim and names NO node ids.
+    /// A reference to another node belongs in --depends, where it is an edge the
+    /// graph can traverse, weight and contradict; repeating it in prose is at
+    /// best redundant and at worst a relationship that exists only in text.
+    /// Returns (chars, sentences, every node id named in the label).
+    /// Measured on the profserv graph: its founding 479 statements never
+    /// exceeded 407 chars and were all single sentences, while half of all
+    /// statements naming a node id failed to depend on it, leaving 724
+    /// relationships in prose instead of in the graph.
+    pub fn validate_label_shape(text: &str) -> (usize, usize, Vec<u32>) {
+        let chars = text.chars().count();
+
+        let mut sentences = 0usize;
+        let mut pending = false;
+        let mut prev_end = false;
+        for c in text.chars() {
+            if c == '.' || c == '!' || c == '?' {
+                prev_end = true;
+                pending = true;
+            } else if c.is_whitespace() {
+                if prev_end && pending {
+                    sentences += 1;
+                    pending = false;
+                }
+                prev_end = false;
+            } else {
+                prev_end = false;
+            }
+        }
+        if pending {
+            sentences += 1;
+        }
+        if sentences == 0 && !text.trim().is_empty() {
+            sentences = 1;
+        }
+
+        let mut named: Vec<u32> = Vec::new();
+        let bytes: Vec<char> = text.chars().collect();
+        let mut i = 0usize;
+        while i + 3 <= bytes.len() {
+            if bytes[i] == 'I' && bytes[i + 1] == 'D' && bytes[i + 2] == ':' {
+                let mut j = i + 3;
+                let mut num = String::new();
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    num.push(bytes[j]);
+                    j += 1;
+                }
+                if !num.is_empty() {
+                    if let Ok(id) = num.parse::<u32>() {
+                        if !named.contains(&id) {
+                            named.push(id);
+                        }
+                    }
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        named.sort_unstable();
+        (chars, sentences, named)
+    }
+
     pub fn validate_duplicate_domains(domains: &[String]) -> (bool, std::collections::HashMap<String, usize>) {
         let mut counts = std::collections::HashMap::new();
 

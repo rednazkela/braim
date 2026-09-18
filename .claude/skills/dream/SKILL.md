@@ -661,8 +661,16 @@ failed inverse test)" — so a FAIL you record is visible to every later session
 without needing this pass to run again.
 
 Report the edges tested, the verdicts, and the reassignments separately from
-the no-changes. As with weights, **no-change is the expected outcome** and a
-session that tested three edges and confirmed all three has done the work.
+the confirmations.
+
+**Unlike weights, no-change is NOT the expected outcome at the top of this
+ranking** — and the first session to run it went two-for-two on failures.
+That is the discriminator working, not a slipped prior: it selects edges whose
+parent carries no evidential weight in the child, which is the population where
+the inverse test is most likely to fail. Expect confirmations further down the
+list, where the corroborators (id gap, shared hour) are doing more of the
+scoring than the gate is. If you are failing edges you reached by scrolling
+past the top few, re-read the prior at the head of this skill.
 
 ## Anything a human must see goes in the review queue
 
