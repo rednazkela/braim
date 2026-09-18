@@ -479,6 +479,163 @@ capped by the weakest dependency's status, not the depends_on split — so
 retuning a split cannot promote or demote anything. It changes how much of a
 compound's identity each dependency is read as carrying, nothing else.
 
+## Label shape: one claim per statement, on an absolute threshold
+
+A statement's label is what `braim query` returns and what `statement
+contradict` operates on. Both of those break the same way when the label
+carries several claims instead of one: retrieval pays for prose the graph
+exists to compress, and a node asserting five things can only be contested
+wholesale, dragging its true sentences down with its false one. That is the
+Boolean-conjunction gap (braim ID:2352) showing up as a data problem rather
+than a modelling one — a paragraph label IS an implicit AND with no way to
+address its parts.
+
+Run this **after** the pairs, in the same slot as weight tuning, and keep it to
+the same budget of two or three:
+
+```bash
+python3 <skill-dir>/label_shape.py .braim 10
+```
+
+The threshold is **absolute: more than 400 characters AND more than two
+sentences**. It used to be the graph's own p90, and that was wrong in a way
+worth keeping written down — a relative threshold is self-defeating on a
+drifting graph, because every paragraph written raises p90 and raises the bar
+for catching the next one. Measured on profserv it offered 6 of 49 recent
+nodes while their median sat below the threshold it computed (braim ID:2375).
+
+The absolute numbers are derived, not picked. This graph's founding convention
+over its first 479 statements was **one sentence and at most 407 characters,
+without a single exception**, so >2 sentences is already twice the widest thing
+that convention ever produced. The script prints that founding measurement on
+every run so the threshold stays auditable against the graph it is applied to.
+Nodes already carrying `label_shape_at` are withheld, the same way
+`whatif_walked_at` and `reweighed_at` withhold their own.
+
+**Per node offered:**
+
+1. `braim node <id>` — read the whole label.
+2. **Count the claims, not the sentences.** A long label stating ONE claim with
+   its figures inline is not a violation; four sentences elaborating a single
+   assertion are fine. The violation is a label a reader could split into parts
+   that would need separate contradiction.
+3. If it is one claim, mark it and move on — that is the expected outcome and
+   costs nothing:
+   ```bash
+   braim meta <id> --set label_shape_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   ```
+4. If it is several claims, flag it and mark it. Dreaming may not edit a
+   statement's text, so decomposition is the human's call, not yours:
+   ```bash
+   braim dream flag "ID:<id> carries <n> separable claims in one label: <name them>. Decomposing needs <k> statements with the evidence moved to typed sources" \
+     --kind note --nodes <id>
+   braim meta <id> --set label_shape_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   ```
+
+**This is `note`, never audit rot.** The four audit kinds are about a claim's
+grounding — whether its source says what it says, whether that source could
+have refuted it. Label shape is about form, and a badly shaped label can be
+perfectly well grounded. Filing it as `unsupported` inflates the rot counter
+with something no evidence check can clear (braim ID:2358).
+
+Two traps, both measured:
+
+- **Do not cherry-pick the baseline, and do not let the drift set it either.**
+  Comparing recent writes against an early slice makes drift look like a
+  personal regression; comparing them against the whole graph lets the drift
+  hide inside its own average. The founding convention is the fixed point, and
+  the count that matters is per-month: 177 of 189 over-threshold nodes came
+  from 2026-08 (braim ID:2358), which no relative threshold would have shown.
+- **Long labels help dedup, they do not hurt it.** `braim similar` on a full
+  draft label surfaced a duplicate at 0.860; the one-sentence distillation of
+  the same claim scored 0.555 and missed it entirely. Shortening the label is
+  the right goal for retrieval and contradiction, and the wrong lever for
+  duplicates — run the dedup check on the draft text, never on a summary of it
+  (braim ID:2359).
+
+## Causal re-grounding: test the edges, never only add them
+
+Every other pass reads because_of and none repairs it. Dreaming's own procedure
+names `why-add` twice and `why-test` and `why-remove` not at all, so a wrong
+parent it meets is a parent it keeps — while `constraints` ranks by how many
+statements rest on a node through those same edges, nine and ten levels deep.
+A causal chain built cheaply therefore does not just sit in the graph: it
+inflates whatever sits at its head into a load-bearing constraint, which is the
+exact thing what-if exists to find.
+
+This is the repair pass. It is the only mode that touches an existing edge, and
+like weight tuning it defaults to leaving things alone.
+
+**Scope is the same as weight tuning's**: two or three edges a session, run
+after the pairs. A full sweep is a real thing to do on request, not nightly.
+
+```bash
+python3 <skill-dir>/suspect_edges.py .braim 10
+```
+
+The ranking is one discriminator with two corroborators, and the discriminator
+was measured before it was trusted. When an author writes "this happened
+because of that", the cause is usually also one of the reasons the node exists,
+so the parent appears in the child's `depends_on` — true for 303 of 340 edges
+on this graph. The other 37 assert a cause while the node is built out of
+something else entirely. Those rank; the rest are withheld.
+
+**What was tried first and rejected, because the same trap waits for anyone
+who re-derives this.** Ranking on id gap and shared creation hour — the shape
+of writing a parent immediately before its child — flagged 282 of 340 edges,
+and its top three hits were genuine sequential reasoning chains. A real cause
+very often IS written just before its consequent. Proximity marks the normal
+shape of thinking, not a defect, and a ranker that flags 83% of a graph has
+told you nothing. Both signals survive only as corroboration on an edge already
+suspect for standing outside `depends_on`.
+
+**Per edge:**
+
+1. `braim node <child>` and `braim node <parent>` — read both, and read the
+   child's dependency set. The question is narrow: does the child still hold
+   if the parent had never been true?
+2. Run the test braim already implements, and record it either way:
+   ```bash
+   braim why-test <child>          # the cause is confirmed
+   braim why-test <child> --fail   # the consequent stands without it
+   ```
+   A PASS is a result. It lands in `test_source`, withholds the edge from every
+   future run of this pass, and is the outcome you should expect most often.
+3. Only on a FAIL, reassign. **A failed test already marks the link invalid**
+   — it prints "causal link marked invalid; statements unchanged" and the edge
+   drops out of every later pass on its own, so `why-remove` is NOT a step here.
+   That command is for detaching a link you want to reassign without having
+   refuted it, which this pass never does.
+   ```bash
+   braim why-add <child> --because <the real cause> --source "narrative:regrounded-<YYYY-MM-DD>"
+   # or, when there is no cause and the node is an observation:
+   braim meta <child> --set terminal_cause=true
+   ```
+   **Do not invent a parent to replace the one you removed.** A node with no
+   real cause is terminal, and `terminal_cause=true` says so honestly. Reaching
+   for the next plausible node is how the original bad edge was written.
+4. Mark it, whatever the outcome:
+   ```bash
+   braim meta <child> --set causal_regrounded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   ```
+   Use the full timestamp, for the same reason `whatif_walked_at` does.
+
+**Flag rather than reassign when the real parent is not in the graph.** A
+consequent whose actual cause was never written is a gap, not a bad edge:
+
+```bash
+braim dream flag "<child> has no cause in the graph; its stated parent fails the inverse test" \
+  --kind anchor --nodes <child>,<parent>
+```
+
+`braim audit` reports refuted links under "Refuted causal links (because_of
+failed inverse test)" — so a FAIL you record is visible to every later session
+without needing this pass to run again.
+
+Report the edges tested, the verdicts, and the reassignments separately from
+the no-changes. As with weights, **no-change is the expected outcome** and a
+session that tested three edges and confirmed all three has done the work.
+
 ## Anything a human must see goes in the review queue
 
 The closing report lives in the model's context and does not survive
@@ -576,7 +733,12 @@ braim dream log --verdict verified
 - Never `--force`, never delete a node, never resolve a contradiction, never
   edit an existing statement's text. Dreaming adds hypotheses and consolidates
   duplicates; it does not rewrite established knowledge.
-- `update-weights` is the one existing-statement mutation dreaming is allowed.
+- `update-weights` and the causal-edge trio (`why-test`, `why-remove`, then a
+  replacement `why-add`) are the only mutations of existing structure dreaming
+  is allowed. Neither touches a statement's text. A failed `why-test` invalidates
+  the link itself, so `why-remove` is never needed after one; detaching a cause
+  you have not tested is the same unforced judgement the pass exists to undo,
+  and dreaming does not do it.
   It changes a `depends_on` split, never a statement's text, and only through
   the cited-evidence procedure in "Weight tuning" above — never a bare number
   chosen because it "feels" more balanced now than it did when it was written.
@@ -618,6 +780,11 @@ in the graph, the ledger, or the review queue before you write a word of it:
 - compounds reweighed: which ones, the before/after split, and the specific
   evidence that justified each change — and how many candidates you looked at
   but left alone, since no-change is the expected outcome here too
+- label shape: how many nodes the check offered, how many held one claim and
+  were simply marked, and every node flagged for decomposition with the claims
+  you could separate out of it
+- causal edges tested: which ones, the verdict on each, and any reassignment —
+  kept separate from the confirmations, since a PASS is the expected outcome
 - what to review: `braim dream review` first — it is the only place the
   report-only observations live — then `braim list --meta scope=dream` for the
   nodes, and `braim list --meta counterfactual=true` for the hypotheses, which
