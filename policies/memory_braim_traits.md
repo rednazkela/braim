@@ -70,5 +70,5 @@ too high.
   concepts, decompose it — separate atomics plus a compound grouping them.
 - CONTRADICTION: when two statements disagree, `braim statement contradict`
   (both become contested) and resolve via a third PRIMARY source (Mechanism A,
-  via `braim source add` + `statement add-source --source-id`). Never pick a
+  via `braim sources add` + `statement add-source --source-id`). Never pick a
   winner unilaterally.

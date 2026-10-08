@@ -1,0 +1,4 @@
+# Graph and pack files must keep LF bytes on every platform: manifest integrity
+# is a sha256 over file bytes (braim ID:226) and pack diffs must be stable.
+# autocrlf rewriting on Windows checkout would break both.
+*.json text eol=lf

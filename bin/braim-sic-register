@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Cross-store SIC register (SIC 534).
+
+The escalation meta-loop and 03_task.yaml step_5 both speak of "the open-SIC
+register" as if it were one list. It is not: braim resolves its store from the
+shell cwd, so SICs land in whichever store the session happened to sit in. On
+2026-09-15 they were spread across three, and a phase that ran the prescribed
+read reported "register empty; none recurring" while ten open SICs including one
+at recurrence 4 sat in the other two.
+
+Two filters, both load-bearing:
+  * label prefix  -- `status` is overloaded. In one store 65 nodes carried
+    status=open and only 4 were SICs; filtering on status alone over-reports the
+    backlog by an order of magnitude (SIC-adjacent finding, braim ID:667).
+  * status        -- open and escalated are live; actioned and completed are not.
+
+Exit 1 when any live SIC is at or over the escalation threshold, so a caller can
+gate on it: `braim-sic-register --escalated-only || handle_escalations`.
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+
+PREFIX = "system_improvement_candidate"
+LIVE = {"open", "escalated"}
+DEFAULT_ROOTS = [os.path.expanduser("~")]
+
+
+# Stores under these path segments are throwaway by construction: disposable
+# executor worktrees and per-run scratch. They are SKIPPED and the skip is
+# REPORTED, never silent — an unreported omission is the partial view this
+# register exists to eliminate.
+EPHEMERAL = (".cx-exec-tmp", os.path.join(".claude", "worktrees"), os.path.join(".claude", "jobs"), ".scratch")
+
+
+def stores(roots):
+    """Every store under `roots` that holds a graph, plus the ephemeral ones skipped.
+
+    os.walk rather than glob: `glob("**")` does not descend into dot-directories,
+    so it silently missed 5 of 21 stores on this machine — the same partial-view
+    failure in miniature.
+    """
+    real, skipped = [], []
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            if ".braim" in dirnames:
+                store = os.path.join(dirpath, ".braim")
+                if os.path.exists(os.path.join(store, "current.json")):
+                    (skipped if any(e in store for e in EPHEMERAL) else real).append(store)
+            # do not descend into build/vendor trees; they hold no graphs
+            dirnames[:] = [d for d in dirnames if d not in ("node_modules", "target", "vendor", ".git")]
+    return sorted(real), sorted(skipped)
+
+
+def sics(store):
+    path = os.path.join(store, "current.json")
+    try:
+        doc = json.load(open(path))
+    except Exception:
+        return []
+    nodes = doc.get("nodes", {}) if isinstance(doc, dict) else {}
+    if not isinstance(nodes, dict):
+        return []
+    out = []
+    for nid, node in nodes.items():
+        if not isinstance(node, dict):
+            continue
+        label = node.get("label") or ""
+        meta = node.get("metadata") or {}
+        if not label.lower().startswith(PREFIX):
+            continue
+        status = (meta.get("status") or "unset").lower()
+        try:
+            rec = int(meta.get("recurrence", 1))
+        except (TypeError, ValueError):
+            rec = 1
+        out.append({
+            "store": store,
+            "id": nid,
+            "status": status,
+            "recurrence": rec,
+            "scope": meta.get("scope") or "unscoped",
+            "affected_feature": meta.get("affected_feature") or "",
+            "label": label,
+        })
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="List system improvement candidates across every local braim store.")
+    ap.add_argument("--root", action="append", default=None, help="Search root (repeatable; default $HOME)")
+    ap.add_argument("--all", action="store_true", help="Include actioned/completed, not only live ones")
+    ap.add_argument("--escalated-only", action="store_true", help="Only those at or over --threshold")
+    ap.add_argument("--threshold", type=int, default=int(os.environ.get("CX_ESCALATION_THRESHOLD", "2")))
+    ap.add_argument("--json", action="store_true", help="Machine-readable output")
+    a = ap.parse_args()
+
+    scanned, skipped = stores(a.root or DEFAULT_ROOTS)
+    found = []
+    for store in scanned:
+        found.extend(sics(store))
+
+    live = [s for s in found if a.all or s["status"] in LIVE]
+    over = [s for s in live if s["recurrence"] >= a.threshold and s["status"] in LIVE]
+    shown = over if a.escalated_only else live
+    shown.sort(key=lambda s: (-s["recurrence"], s["store"], int(s["id"]) if str(s["id"]).isdigit() else 0))
+
+    if a.json:
+        print(json.dumps({"threshold": a.threshold, "stores_scanned": len(scanned),
+                          "stores_skipped_ephemeral": skipped, "live": len(live),
+                          "over_threshold": len(over), "sics": shown}, indent=2))
+    else:
+        if not shown:
+            print("no SICs matched" if not a.all else "no SICs found")
+        for s in shown:
+            flag = "  ** OVER THRESHOLD **" if s["recurrence"] >= a.threshold and s["status"] in LIVE else ""
+            print(f"[{s['status']}] rec={s['recurrence']} scope={s['scope']}  {s['store']} ID:{s['id']}{flag}")
+            print(f"    {s['label'][:160]}")
+        print(f"\nstores scanned: {len(scanned)}   live SICs: {len(live)}   at/over threshold {a.threshold}: {len(over)}")
+        if skipped:
+            print(f"ephemeral stores skipped ({len(skipped)}): " + ", ".join(os.path.relpath(x, os.path.expanduser("~")) for x in skipped))
+
+    return 1 if over else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
