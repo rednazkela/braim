@@ -169,17 +169,46 @@ is the step that separates a verdict from a guess, and it is where the overnight
 tokens should go. A node label is a pointer, not evidence: if the label and the
 source document disagree, the document wins.
 
-**3. Choose exactly one verdict.**
+**3. Name the obvious — then discard it.**
+State the shallowest shared category in one line and mark it rejected:
+taxonomic. This step is mandatory and its output is always rejected — naming
+the obvious explicitly is what stops it from becoming the answer by default.
 
-| Verdict | When |
-|---|---|
-| `no-relation` | the default — nothing specific connects them, **or** the relation is real but already asserted by an existing statement, in which case say so in the note rather than restating it |
-| `duplicate` | both assert the same thing about the same subject |
-| `contradiction` | both are about the same subject and cannot both be true |
-| `proposed` | a real relation, but you could not verify it in sources |
-| `verified` | a real relation AND you read PRIMARY sources that establish it |
+**4. Sweep at least four lenses before proposing anything.**
+Examine the pair through a minimum of four of these, noting one line each —
+including the lenses that come up empty: structural / role, causal,
+historical / genetic, contrastive, boundary, contradiction, compositional. A
+role-mapping ('A is the successor of 9 in hexadecimal') beats a surface match
+('both are alphanumeric') because it maps position, not category.
 
-**4. Act on the verdict.**
+**5. Generate at least three candidates, then select.**
+Never store the first relation found — the first is retrieval, not discovery.
+From at least three candidates, select by specificity (holds for this pair and
+few others), not by order of generation or eloquence.
+
+**6. Null-model test.**
+Before storing, ask: would this relation hold for most random pairs drawn from
+the same two domains? If yes, reject as generic. The shallower the common
+ancestor of the two nodes' domains, the higher the bar the relation must clear.
+
+**7. Consequence requirement — storable relations must be falsifiable.**
+A dreamed relation enters the graph only as an artifact that can collide with
+evidence later: a `because_of` candidate with its inverse test named, a
+`contradicts` edge, a merge/duplicate proposal, a `gap` with `evidence_needed`
+stated, or a new `?[claim]` stating what would promote or kill it. If nothing
+would prove the relation wrong and it predicts nothing, it is not stored.
+
+**8. Choose exactly one verdict.**
+
+| Verdict | When | Kind |
+|---|---|---|
+| `no-relation` | the default — nothing specific connects them, **or** the relation is real but already asserted by an existing statement, in which case say so in the note rather than restating it | nothing above taxonomy |
+| `duplicate` | both assert the same thing about the same subject | merge / duplicate proposal |
+| `contradiction` | both are about the same subject and cannot both be true | contradicts edge |
+| `proposed` | a real relation, but you could not verify it in sources | because_of candidate / gap / new `?[claim]` |
+| `verified` | a real relation AND you read PRIMARY sources that establish it | — |
+
+**9. Act on the verdict.**
 
 `no-relation` — no graph write.
 
@@ -211,6 +240,11 @@ braim statement add "<relation in one sentence>" \
 braim meta <new-id> --set scope=dream
 braim meta <new-id> --set terminal_cause=true
 ```
+A `gap` from the pair protocol carries the same way, with the evidence that
+would close it stated on the node:
+```bash
+braim meta <new-id> --set evidence_needed="<what would promote or refute this>"
+```
 
 `verified` — same, but cite the sources you actually read:
 ```bash
@@ -237,11 +271,26 @@ one session came from querying the new finding's own wording, or from skipping
 the check because the finding came straight off a file read (braim ID:1233,
 ID:1284). The path is the reliable key, so the check runs on the path.
 
-**5. Record it**, always, whatever the verdict:
+**10. Record it**, always, whatever the verdict:
 ```bash
-braim dream seen <a> <b> --verdict <verdict> --note "<one line>"
+braim dream seen <a> <b> --verdict <verdict> --note "stored <kind> <id>: <one line>"
+braim dream seen <a> <b> --verdict no-relation --note "nothing above taxonomy: <one line>"
+```
+`verified` has no kind, so its note reads `stored <id>: <one line>`.
+Print the declaration for the report:
+```
+pair(A,B): stored <kind> <id>
+pair(A,B): nothing above taxonomy
 ```
 This is what stops the next session re-treading the same pair.
+
+**Interaction with the rot loop.** A stored relation whose specificity claim
+fails later review — it turns out to hold generically — is audit rot, and it
+is filed as `independence` ('a claim rests on a source that cannot refute it'),
+not `unsupported` ('a claim carries no source that establishes it'): the
+sources did establish the relation, they just did not rule out anything
+specific. The incentive to inflate dream output is answered by the same rot
+counter that answers every other inflation.
 
 ## What-if: relax a constraint
 
