@@ -285,7 +285,7 @@ pub fn pending(data_dir: &std::path::Path, all: bool) -> Vec<ReviewItem> {
 /// zero when it skips auditing entirely. Worse, a threshold anyone can see
 /// gives an agent a standing reason to find one fewer than it.
 ///
-/// The four are each a documented failure mode in this graph:
+/// The five are each a documented failure mode in this graph:
 ///   anchor        a cited code:/doc: anchor no longer holds what the node says
 ///                 it holds (braim ID:277, ID:285, ID:333, ID:461, ID:524)
 ///   reground      a node's label disagrees with the document it cites
@@ -293,7 +293,19 @@ pub fn pending(data_dir: &std::path::Path, all: bool) -> Vec<ReviewItem> {
 ///   independence  a promotion rests on sources not independent of each other
 ///                 (braim-source-independence-and-citation-volatility.md Gap 1)
 ///   unsupported   a node carries a status its current sources no longer justify
-pub const AUDIT_KINDS: [&str; 4] = ["anchor", "reground", "independence", "unsupported"];
+///   tool-bypass   a session grepped instead of using rctags on an indexed path
+///                 and the route gate recorded it. Filed by the Stop gate, ONE
+///                 item per threshold crossing of the bypass ledger, never one
+///                 per bypass: raw bypass volume is not rot, since the hint
+///                 system itself licenses grep for comments, strings and
+///                 unindexed files. The dream session classifies each logged
+///                 command as licensed (sign off) or defection (a symbol lookup
+///                 grep'd — a real finding, wired to the node the grep fed).
+///
+/// This crate has no [lib] target, so tests/audit_rot_loop.rs and the
+/// user-facing literals in src/main.rs and src/stop_gate.rs spell this list out
+/// by hand; adding a kind here means editing them too.
+pub const AUDIT_KINDS: [&str; 5] = ["anchor", "reground", "independence", "unsupported", "tool-bypass"];
 
 /// Pending audit-kind items, per kind, in AUDIT_KINDS order, plus the total.
 ///
@@ -749,6 +761,11 @@ pub struct Counterfactual {
 ///
 /// PRIMARY sources only: a shared narrative tag says two statements were written
 /// in the same session, not that they describe the same artifact.
+///
+/// Symbol anchors (`code:<file>:<symbol>`, the shape src/anchor.rs
+/// `parse_symbol_anchor` defines) need no special case: the trailing segment
+/// is trimmed like a line number. Keep it a string trim — never canonicalize
+/// or resolve the path here, strict equality is the anchor contract.
 fn primary_path(source: &str) -> Option<String> {
     let (ty, location) = Braim::parse_source(source);
     if ty.tier() != "PRIMARY" {

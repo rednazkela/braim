@@ -83,13 +83,13 @@ fn an_empty_queue_reports_zero_rot_with_every_kind_named() {
     seed(s.dir());
     assert_eq!(tally(s.dir()), 0);
     let (_, out) = braim(s.dir(), &["dream", "review", "--count"]);
-    for kind in ["anchor", "reground", "independence", "unsupported"] {
+    for kind in ["anchor", "reground", "independence", "unsupported", "tool-bypass"] {
         assert!(out.contains(kind), "--count must name {} even at zero: {}", kind, out);
     }
 }
 
 #[test]
-fn only_the_four_audit_kinds_count_toward_rot() {
+fn only_the_five_audit_kinds_count_toward_rot() {
     let s = Scratch::new("kinds");
     seed(s.dir());
 
@@ -102,12 +102,12 @@ fn only_the_four_audit_kinds_count_toward_rot() {
     }
     assert_eq!(tally(s.dir()), 0, "non-audit kinds must not raise the rot counter");
 
-    for kind in ["anchor", "reground", "independence", "unsupported"] {
+    for kind in ["anchor", "reground", "independence", "unsupported", "tool-bypass"] {
         let (ok, out) = braim(s.dir(), &["dream", "flag", "a real defect in a stored node",
             "--kind", kind, "--nodes", "1"]);
         assert!(ok, "flag {}: {}", kind, out);
     }
-    assert_eq!(tally(s.dir()), 4);
+    assert_eq!(tally(s.dir()), 5);
 }
 
 #[test]
@@ -171,5 +171,6 @@ fn the_json_tally_carries_every_kind_and_a_total() {
     assert_eq!(v["independence"], 1);
     assert_eq!(v["reground"], 0);
     assert_eq!(v["unsupported"], 0);
+    assert_eq!(v["tool-bypass"], 0);
     assert_eq!(v["total"], 2);
 }

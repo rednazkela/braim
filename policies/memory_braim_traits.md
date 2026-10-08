@@ -42,6 +42,28 @@ perhaps, unacceptable, scope creep, vendor lock, overkill, operational
 complexity, infrastructure overhead, time cost, too expensive, too slow,
 too high.
 
+## Retrieval discipline (rctags-indexed repos)
+
+- In an rctags-indexed repo, code reads go through rctags: `rctags query
+  <term>` to locate, `rctags load <file> <start> <end>` for slices. Reading a
+  whole source file requires a declared reason (architecture review,
+  whole-file refactor) in the turn tag's prose. A bare grep-family command
+  under an indexed root is denied by the PreToolUse route gate; prefixing it
+  with `RCTAGS_BYPASS=1` lets it through and the gate records the bypass.
+- When rctags emits a hint, follow the hint before any fallback. A miss hint
+  that licenses grep IS the grep permission; grep without either a hint
+  license or a logged bypass is the behaviour the route gate and the Stop
+  gate's `tool-bypass` review item exist to surface.
+- Never conclude a symbol is absent from a bare miss alone — the miss hint
+  reports index coverage; absence claims cite it (e.g. `@[0 matches among 326
+  symbols across 7 files] source: rctags query <term>`). rctags indexes
+  functions only for Rust: a struct, const or field name misses by kind, not
+  by absence — confirm with `rctags load` or a declared-reason grep.
+- Statements about code in an indexed repo cite symbol anchors
+  (`code:<file>:<symbol>`, `<file>` relative to the indexed root), never raw
+  line numbers; `braim audit` resolves them and lists the ones whose symbol is
+  gone.
+
 ## Graph discipline
 
 - FACT GATE: before asserting `@[fact]`, `braim lookup` it — reuse if it

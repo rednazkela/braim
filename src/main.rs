@@ -1,7 +1,10 @@
+mod anchor;
 mod bootstrap;
 mod dream;
 mod graph;
 mod manifest;
+mod route_gate;
+mod stop_gate;
 mod tips;
 // Without the embeddings feature the module compiles but only its pure helpers
 // are reachable from tests; suppress dead-code noise in that configuration.
@@ -33,7 +36,12 @@ REQUIRED RULES:\n\
      multiplicatively along paths; query/perspective/proximity scores depend on them.\n\
 10. When two statements about the same subject disagree, mark them contested\n\
     via 'statement contradict' rather than asserting one as fact. Resolve via\n\
-    a third PRIMARY source (auto) or 'statement resolve-contradiction' (manual).\n\n\
+    a third PRIMARY source (auto) or 'statement resolve-contradiction' (manual).\n\
+11. Statements about code in an rctags-indexed repo cite symbol anchors —\n\
+    code:<file>:<symbol>, <file> relative to the indexed root, <symbol> an\n\
+    identifier (e.g. code:src/graph.rs:from_verification_status) — never raw\n\
+    line numbers. 'braim audit' resolves them through rctags and lists the\n\
+    ones whose symbol no longer exists.\n\n\
 SOURCE TYPES (verification determined by PRIMARY type diversity):\n\
   PRIMARY (independent evidence):   code:, doc:, schema:, config:, transcript:, test:\n\
   SECONDARY (derived or contextual): phase_N:, agent:, narrative:\n\
@@ -329,11 +337,11 @@ enum Commands {
         #[arg(long, help = "Report what would cross without writing to the target")]
         dry_run: bool,
     },
-    #[command(about = "Set up this project for braim: local graph + agent policy hooks", long_about = "Init: bootstrap a working braim setup in one command.\n\nUsage:\n  braim init --team\n  braim init --team --central ~/.braim_central\n  braim init --team --settings .claude/settings.local.json\n\nWhat it does:\n  • Creates the local graph if absent\n  • Installs the agent policy hooks into .claude/settings.json:\n      UserPromptSubmit -> braim policy perturn      (per-turn marker logging)\n      UserPromptSubmit -> braim policy traits       (verbatim/inferred/unknown marker discipline)\n      PreCompact       -> braim policy compaction   (what to keep when compacting)\n  • Records where central lives, so `braim export <domain>` needs no --to\n\nThe hooks invoke `braim policy`, not a shell tool reading an absolute path, so\nthe same settings file works on Linux, macOS, and Windows and the policy stays\nversion-locked to the braim binary enforcing it.\n\nIdempotent: re-running reports what is already present and changes nothing.\nExisting settings and any hooks braim did not add are preserved.\n\nWhy solo-first: a teammate starting out has no graphs, so day-one value is the\nsetup that already works alone — a local graph plus the discipline hooks.\nSharing layers on once several graphs exist (braim ID:223).")]
+    #[command(about = "Set up this project for braim: local graph + agent policy hooks", long_about = "Init: bootstrap a working braim setup in one command.\n\nUsage:\n  braim init\n  braim init --settings .claude/settings.local.json\n  braim init --team --central ~/.braim_central\n\nWhat it does, standalone (no flags):\n  • Creates the local graph if absent\n  • Installs the agent policy hooks into .claude/settings.json:\n      UserPromptSubmit -> braim policy perturn      (per-turn marker logging)\n      UserPromptSubmit -> braim policy traits       (verbatim/inferred/unknown marker discipline)\n      PreCompact       -> braim policy compaction   (what to keep when compacting)\n      Stop             -> braim stop-gate           (enforce the per-turn declaration)\n\n--team additionally records where central lives, so `braim export <domain>`\nneeds no --to. --central requires --team: recording a central pointer is the\nteam-sharing step layered on top of the solo setup, not the default.\n\nAll four hooks invoke a bare `braim` subcommand, not a shell tool reading an\nabsolute path, so the same settings file works on Linux, macOS, and Windows\nand every hook stays version-locked to the braim binary enforcing it.\n\nIdempotent: re-running reports what is already present and changes nothing.\nExisting settings and any hooks braim did not add are preserved.\n\nWhy solo-first: a teammate starting out has no graphs, so day-one value is the\nsetup that already works alone — a local graph plus the discipline hooks.\nSharing (--team --central) layers on once several graphs exist (braim ID:223).")]
     Init {
-        #[arg(long, help = "Install the team agent setup (currently the only mode)")]
+        #[arg(long, help = "Enable central export for this graph; required to pass --central")]
         team: bool,
-        #[arg(long, help = "Path or URL of the central braim, recorded for later exports")]
+        #[arg(long, help = "Path or URL of the central braim, recorded for later exports (requires --team)")]
         central: Option<String>,
         #[arg(long, help = "Settings file to write (default: .claude/settings.json)")]
         settings: Option<String>,
@@ -342,6 +350,10 @@ enum Commands {
     Policy {
         name: String,
     },
+    #[command(about = "Stop hook: enforce the per-turn braim declaration (installed by braim init)", long_about = "StopGate: verify the [braim: ...] tag on the turn that just ended, and block Stop (exit 2) if it is missing, malformed, cites ids that don't check out, or omits required disclosure.\n\nReads the Stop hook's JSON payload from stdin (the `last_assistant_message` field) — nothing is taken from argv, so the wiring `braim init` installs is a bare `braim stop-gate` command, no path, no bash, no jq.\n\nChecks, in order:\n  1. a well-formed tag exists: '[braim: none]' or '[braim: logged N,M ...]'\n  2. every logged id resolves in this graph AND is new since the last check\n  3. logging 2+ new nodes requires the reply body to name each id and carry\n     at least one relationship marker per node (depends_on/because_of/\n     based_on/an arrow/'terminal') — a tag is a receipt, not a description\n  4. an 'audit:' clause (clean / N flagged <ids> / skipped: <reason>) whose\n     claimed finding count matches the actual rise in pending audit-rot\n     items ('braim dream review')\n  5. when pending audit-rot reaches a threshold (default 5, BRAIM_AUDIT_THRESHOLD\n     to change it), blocks once more asking for a dream session scoped to the\n     pending items\n\nState (last id seen, last pending count, last threshold fired) persists per\ngraph at ~/.claude/braim_stop_state/<md5 of the data dir>.json — the same\nlocation and format `hooks/braim_stop_gate.sh` used, so switching from that\nscript to this command keeps continuity rather than resetting the counters.\n\nSee braim-audit-rot-loop.md for the audit-clause design.")]
+    StopGate,
+    #[command(about = "PreToolUse hook on Bash: route code search through rctags (installed by braim init)", long_about = "RouteGate: deny a grep-family command (grep|rg|egrep|fgrep|ag) whose cwd sits inside an rctags-indexed tree, with the replacement command in the denial.\n\nReads the PreToolUse hook's JSON payload from stdin (tool_input.command and cwd). ALWAYS exits 0: a deny is a permissionDecision JSON on stdout, never a nonzero exit, so a stale binary's exit 2 on an unknown subcommand can never be mistaken for a decision.\n\n  RCTAGS_BYPASS=1 grep ...   passes, and the gate appends the command to\n                             <root>/.rctags/bypass.log (the Stop gate files one\n                             tool-bypass review item per threshold crossing)\n  rctags unhealthy/missing   fails open; logged to <root>/.rctags/route_gate_health.log")]
+    RouteGate,
     #[command(subcommand, about = "Dream: surface node pairs an LLM should examine for missing relations")]
     Dream(DreamCommands),
     #[command(about = "Fold a duplicate node into the one that survives", long_about = "MergeNodes: union two duplicate nodes into one, keeping all the evidence.\n\nUsage:\n  braim merge-nodes 42 99      # 42 survives, 99 is folded into it\n\nWhat it does:\n  • Unions the loser's sources, source entities, and verified_by into the winner\n  • Moves every reference: a node that depended on the loser now depends on the\n    winner, with weights SUMMED so a referent that cited both keeps its 1.0 total\n  • Moves because_of, contradicts, and gap-register entries, dropping self-edges\n  • Records merged_from on the winner as an audit trace, then removes the loser\n  • Recomputes the winner's verification — new PRIMARY types may promote it\n\nWhat it deliberately does NOT do:\n  • Merge the loser's dependencies into the winner. That would silently rewrite\n    what the surviving statement asserts, so any difference is REPORTED instead.\n\nRefused when: the nodes are the same, either is invalid (merging would launder\nrefuted evidence into a live node), they are of different kinds (concept vs\nstatement), or either depends on the other (related, not duplicate).\n\nThis is the union-merge the corroboration model assumes (braim ID:190/248):\nbefore it, deduplicating meant update-deps plus delete, which discarded the\nloser's sources entirely.")]
@@ -611,7 +623,7 @@ enum DreamCommands {
     Flag {
         #[arg(help = "What a human should look at")]
         note: String,
-        #[arg(long, default_value = "note", help = "audit rot: anchor | reground | independence | unsupported — or merge | unraised | duplicate | rate | note")]
+        #[arg(long, default_value = "note", help = "audit rot: anchor | reground | independence | unsupported | tool-bypass — or merge | unraised | duplicate | rate | note")]
         kind: String,
         #[arg(long, help = "Node ids this concerns, comma-separated")]
         nodes: Option<String>,
@@ -779,6 +791,8 @@ fn is_read_only(cmd: &Commands) -> bool {
             | Commands::Dream(DreamCommands::Log { .. })
             | Commands::Policy { .. }
             | Commands::Init { .. }
+            | Commands::StopGate
+            | Commands::RouteGate
             | Commands::Statement(StatementCommands::VerifySuggest { .. })
             | Commands::Version(VersionCommands::List)
     )
@@ -1769,6 +1783,18 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 }
             }
 
+            println!("\n── Stale symbol anchors (code:<file>:<symbol> whose symbol rctags no longer finds) ──");
+            if !report.symbol_anchors_checked {
+                println!("  rctags unavailable — symbol anchors not checked");
+            } else if report.stale_symbol_anchors.is_empty() {
+                println!("  none");
+            } else {
+                println!("  rctags indexes functions only — verify kind before filing");
+                for (id, source) in &report.stale_symbol_anchors {
+                    println!("  ✗ ID:{}  {}", id, source);
+                }
+            }
+
             let statements: Vec<_> = braim.state.nodes.values()
                 .filter(|n| n.node_type.is_statement_family())
                 .collect();
@@ -2616,9 +2642,24 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 Err(e) => Err(e),
             }
         }
+        Commands::StopGate => {
+            // Exits directly rather than returning Err: this command is
+            // read-only (Braim::new, no cross-process lock held), and its
+            // exit code is meaningful to the Stop hook protocol (0 allow, 2
+            // block) — the generic Err path in main() always exits 1, which
+            // would silently downgrade every block into a no-op refusal.
+            std::process::exit(stop_gate::run(&braim));
+        }
+        Commands::RouteGate => {
+            // Same shape as StopGate: read-only dispatch (no lock to strand on
+            // the direct exit) and an exit code the hook protocol owns. The
+            // code is always 0 here; the generic Err path's exit 1 would be
+            // read by Claude Code as a hook failure, not a decision.
+            std::process::exit(route_gate::run(&braim));
+        }
         Commands::Init { team, central, settings } => {
-            if !team {
-                return Err("Error: pass --team (the only mode today). See `braim init --help`.".to_string());
+            if central.is_some() && !team {
+                return Err("Error: --central requires --team (central export is the team-sharing step, not the standalone default). Run `braim init` alone, or `braim init --team --central <path>`. See `braim init --help`.".to_string());
             }
             let settings_path = std::path::PathBuf::from(
                 settings.unwrap_or_else(|| ".claude/settings.json".to_string()),
@@ -2628,7 +2669,15 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             // had a graph before this run rather than claiming a fresh one.
             let graph_created = braim.state.nodes.is_empty();
 
-            match bootstrap::install_hooks(&settings_path) {
+            // The route gate is only worth installing when the tool it
+            // redirects to answers healthy from this project right now; the
+            // gate re-probes on every call, but an install-time failure gets a
+            // hint instead of a hook.
+            let project_dir = std::env::current_dir()
+                .map_err(|e| format!("Error: cannot read the current directory: {}", e))?;
+            let rctags = bootstrap::check_rctags_health(&project_dir);
+
+            match bootstrap::install_hooks(&settings_path, rctags.is_ok()) {
                 Ok(changes) => {
                     println!("✓ braim is set up for this project");
                     println!("  Graph: {} ({})", graph_dir.display(),
@@ -2641,6 +2690,13 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                             bootstrap::Change::AlreadyPresent(e) =>
                                 println!("    = {} hook already present, left alone", e),
                         }
+                    }
+                    match &rctags {
+                        Ok(bin) => match bootstrap::write_rctags_pointer(&graph_dir, bin) {
+                            Ok(()) => println!("  rctags: {} (recorded)", bin.display()),
+                            Err(e) => eprintln!("⚠ could not record rctags pointer: {}", e),
+                        },
+                        Err(hint) => println!("  ⚠ {}", hint),
                     }
                     if let Some(c) = central {
                         match bootstrap::write_central_pointer(&graph_dir, &c) {

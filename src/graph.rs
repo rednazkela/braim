@@ -541,6 +541,15 @@ pub struct AuditReport {
     /// Terminal root-cause statements of a because_of chain whose verification
     /// is below `proven`: chains that bottom out without solid evidence.
     pub unverified_roots: Vec<Node>,
+    /// `(node id, source string)` for every statement citation of the shape
+    /// `code:<file>:<symbol>` whose symbol rctags no longer finds at exactly
+    /// that file (src/anchor.rs). Candidates for a human or dream session to
+    /// file as `anchor` findings — nothing is auto-filed, and rctags indexes
+    /// functions only, so a struct/const name here is not rot.
+    pub stale_symbol_anchors: Vec<(u32, String)>,
+    /// False when rctags could not be resolved or run, so an empty
+    /// `stale_symbol_anchors` is "not checked" rather than "clean".
+    pub symbol_anchors_checked: bool,
 }
 
 /// A single candidate source returned by `verify_suggest`.
@@ -3418,6 +3427,8 @@ impl Braim {
         reinvestigate_flagged.sort_by_key(|n| n.id);
         unverified_roots.sort_by_key(|n| n.id);
 
+        let (stale_symbol_anchors, symbol_anchors_checked) = self.stale_symbol_anchors();
+
         AuditReport {
             orphans,
             pending,
@@ -3427,7 +3438,51 @@ impl Braim {
             reinvestigate_flagged,
             untested_causal_links,
             unverified_roots,
+            stale_symbol_anchors,
+            symbol_anchors_checked,
         }
+    }
+
+    /// Resolve every statement's `code:<file>:<symbol>` citation through
+    /// rctags. Fail-open like the route gate: no rctags, or no indexed root
+    /// above this store's project directory, means `(empty, false)` — never a
+    /// finding. Line-anchored, absolute, file-only and old-shape citations
+    /// are skipped by `anchor::parse_symbol_anchor` before any tool call.
+    fn stale_symbol_anchors(&self) -> (Vec<(u32, String)>, bool) {
+        use crate::anchor::{self, Resolution};
+        let rctags = match crate::bootstrap::resolve_rctags(&self.data_dir) {
+            Some(b) => b,
+            None => return (Vec::new(), false),
+        };
+        let project = self
+            .data_dir
+            .canonicalize()
+            .ok()
+            .and_then(|d| d.parent().map(|p| p.to_path_buf()));
+        let root = match project.and_then(|p| crate::route_gate::rctags_root_for(&p)) {
+            Some(r) => r,
+            None => return (Vec::new(), false),
+        };
+        let mut cache: HashMap<String, Result<Resolution, String>> = HashMap::new();
+        let mut stale = Vec::new();
+        let mut tool_failed = false;
+        for node in self.state.nodes.values() {
+            if !node.node_type.is_statement_family() {
+                continue;
+            }
+            for source in &node.sources {
+                let res = cache
+                    .entry(source.clone())
+                    .or_insert_with(|| anchor::resolve_source(&rctags, &root, source));
+                match res {
+                    Ok(Resolution::NotFound) => stale.push((node.id, source.clone())),
+                    Ok(Resolution::Found(..)) | Ok(Resolution::Skipped(_)) => {}
+                    Err(_) => tool_failed = true,
+                }
+            }
+        }
+        stale.sort();
+        (stale, !tool_failed)
     }
 
     fn versions_index_path(&self) -> PathBuf {
@@ -4606,6 +4661,10 @@ impl Braim {
         // about one file need not share a content word. Reported only — raising
         // a contradiction is a judgement, and one raised by a batch importer is
         // one nobody read.
+        // Symbol anchors (`code:<file>:<symbol>`, defined in
+        // src/anchor.rs::parse_symbol_anchor) key correctly here as-is: the
+        // first `:`-segment is the file. Do not canonicalize or resolve the
+        // path — strict string equality is the anchor contract.
         let primary_path = |src: &str| -> Option<String> {
             let (ty, rest) = src.split_once(':')?;
             match ty {
