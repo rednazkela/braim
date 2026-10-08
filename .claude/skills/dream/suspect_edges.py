@@ -42,7 +42,16 @@ if not os.path.exists(path):
     sys.exit(f"no graph at {path}")
 graph = json.load(open(path))
 nodes = graph.get("nodes", {})
-edges = [e for e in graph.get("because_of", []) if not e.get("invalid")]
+def _live(nid):
+    n = nodes.get(str(nid)) or {}
+    return (n.get("status") == "active"
+            and n.get("node_type") != "invalid_statement"
+            and n.get("verification_status") not in ("contested", "invalid"))
+
+# review item 195: skip edges whose either endpoint is invalid, inactive or contested —
+# those edges are dead or unadjudicable and only consumed the per-tick budget
+edges = [e for e in graph.get("because_of", []) if not e.get("invalid")
+         and _live(e.get("from")) and _live(e.get("to"))]
 
 GAP_NEAR = 3          # "the previous thing written", from the measured median of 2
 SAME_HOUR = 13        # ISO prefix length through the hour: 2026-09-18T19

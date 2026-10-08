@@ -246,11 +246,21 @@ braim migrate-refutation         # repair pre-3.3 refutation-cascade collateral 
 ### Getting set up
 
 ```bash
-braim init --team --central ~/.braim_central   # local graph + agent policy hooks
-braim policy perturn                           # what the hooks inject
+braim init                                     # standalone: local graph + 4 agent policy hooks
+braim init --team --central ~/.braim_central   # + records central for later `braim export`
+braim policy perturn                           # what the injecting hooks emit
+braim stop-gate                                # what the Stop hook runs (reads stdin, exits 0/2)
 ```
 
-@[init installs UserPromptSubmit and PreCompact hooks that call `braim policy`, so the settings file carries no absolute paths or shell tools and works unchanged on Linux, macOS, and Windows] source: code:src/bootstrap.rs install_hooks
+@[init installs UserPromptSubmit (perturn, traits), PreCompact (compaction), and Stop (stop-gate) hooks, all bare `braim` subcommands with no absolute paths or shell tools, so the settings file works unchanged on Linux, macOS, and Windows] source: code:src/bootstrap.rs install_hooks
+
+@[--team is required only to pass --central; bare `braim init` installs all four hooks and creates the local graph without it] source: code:src/main.rs Commands::Init handler
+
+@[`braim stop-gate` verifies the `[braim: ...]` tag on the reply that just ended and exits 2 to block Stop when it is missing, cites ids that don't check out, omits required edge disclosure, or misstates the audit clause against the real pending audit-rot count; it replaces `hooks/braim_stop_gate.sh` (bash + jq + a path into this checkout) with the same checks emitted from the binary] source: code:src/stop_gate.rs
+
+@[Stop-gate state (last id seen, last pending count, last threshold fired) persists at `~/.claude/braim_stop_state/<md5 of the data dir>.json` — the same location and shape the bash version used, so switching to the native command keeps continuity] source: code:src/stop_gate.rs state_dir, load_state
+
+@[`stop-gate` checks the Stop hook payload's `stop_hook_active` field first and allows unconditionally when it is true, capping this gate at one block per turn; this check was absent from both this port and the `hooks/braim_stop_gate.sh` it replaces until it was added after an observed lockup] source: code:src/stop_gate.rs run(), Claude Code hooks reference (Stop input: stop_hook_active)
 
 @[The merge is safe: existing settings and foreign hooks are preserved, re-running is idempotent, and an unparseable settings file is refused rather than clobbered] source: test:src/bootstrap.rs
 
