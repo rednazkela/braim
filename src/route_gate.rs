@@ -210,7 +210,7 @@ fn rctags_is_healthy(root: &Path, data_dir: &Path) -> Result<(), String> {
 
 fn deny_json(root: &Path) -> String {
     let reason = format!(
-        "rctags-indexed repo ({}). Symbol lookup:\n  rctags query <term>\nSlice read:\n  rctags load <file> <start> <end>\nComments / string literals / unindexed files are grep's territory: rerun your exact command prefixed with RCTAGS_BYPASS=1 — the bypass is recorded.",
+        "rctags-indexed repo ({}). Symbol lookup:\n  rctags query <term>\nSlice read:\n  rctags load <file> <start> <end>\nConceptual search, when you do not know the name:\n  ccc search \"<what it does>\"\nComments / string literals / unindexed files are grep's territory: rerun your exact command prefixed with RCTAGS_BYPASS=1 — the bypass is recorded.",
         root.display()
     );
     json!({
@@ -355,6 +355,23 @@ mod tests {
         assert!(has_bypass_token("cat f | RCTAGS_BYPASS=1 grep x"));
         assert!(!has_bypass_token("RCTAGS_BYPASS=10 grep x"));
         assert!(!has_bypass_token("grep RCTAGS_BYPASS=1x"));
+    }
+
+    #[test]
+    fn deny_message_names_every_channel_the_agent_may_use_instead_of_grep() {
+        // The denial is the only place an agent is told where to go instead.
+        // Naming rctags alone sent conceptual searches ("where do we do
+        // something like X") back to grep via the bypass, because exact lookup
+        // genuinely could not answer them.
+        let reason = deny_json(Path::new("/repo"));
+        for channel in ["rctags query", "rctags load", "ccc search"] {
+            assert!(
+                reason.contains(channel),
+                "denial must name `{}`; got: {}",
+                channel,
+                reason
+            );
+        }
     }
 
     #[test]
