@@ -178,15 +178,34 @@ fn the_route_enforcement_loop_closes_end_to_end() {
     assert_eq!(decision(&out).as_deref(), Some("deny"), "{}", out);
     assert!(!bypass_log.exists());
 
-    // (3) five declared bypasses pass and are logged by the gate.
+    // (3) the one-shot bypass permit: unearned by default, armed only by a
+    // genuine rctags call, consumed by exactly one bypass, then denied again
+    // until rctags is used once more.
+    let (code, out, _) = run(&["route-gate"], &pretool("RCTAGS_BYPASS=1 grep -rn foo src/", &src), &src, &[]);
+    assert_eq!(code, 0);
+    assert_eq!(decision(&out).as_deref(), Some("deny"), "no prior rctags use: unearned bypass must be denied, {}", out);
+    assert!(!bypass_log.exists(), "a denied bypass writes no ledger line");
+
     for _ in 0..5 {
+        // Arm: a real rctags call, independent of whether it is grep-family.
+        let (code, _, err) = run(&["route-gate"], &pretool("rctags query present_fn", &src), &src, &[]);
+        assert_eq!(code, 0, "{}", err);
+
+        // Spend: the first bypass after that arm succeeds.
         let (code, out, _) = run(&["route-gate"], &pretool("RCTAGS_BYPASS=1 grep -rn foo src/", &src), &src, &[]);
         assert_eq!(code, 0);
-        assert!(decision(&out).is_none(), "a bypass is allowed: {}", out);
+        assert!(decision(&out).is_none(), "the earned bypass is allowed: {}", out);
+
+        // The permit is gone: an immediate second bypass is denied again,
+        // with no second rctags call in between.
+        let (code, out, _) = run(&["route-gate"], &pretool("RCTAGS_BYPASS=1 grep -rn bar src/", &src), &src, &[]);
+        assert_eq!(code, 0);
+        assert_eq!(decision(&out).as_deref(), Some("deny"), "a second bypass without a new rctags call must be denied, {}", out);
     }
     let l = lines(&bypass_log);
-    assert_eq!(l.len(), 5);
+    assert_eq!(l.len(), 5, "only the 5 EARNED bypasses are logged, not the denied attempts: {:?}", l);
     assert!(l.iter().all(|x| x.ends_with("\tRCTAGS_BYPASS=1 grep -rn foo src/")), "{:?}", l);
+    assert!(!tmp.join(".rctags").join("bypass_permit").exists(), "the last permit was consumed, none left armed");
 
     // (4) rctags down: a bare grep fails open, to the health log only.
     let (code, out, _) = run(&["route-gate"], &pretool("grep foo", &src), &src, &[("RCTAGS_STUB_MODE", "broken")]);

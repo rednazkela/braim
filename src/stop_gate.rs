@@ -23,10 +23,22 @@
 //!
 //! This hook verifies only what is mechanically checkable: the tag is
 //! well-formed, logged ids resolve and are new this turn, a turn logging 2+
-//! new nodes discloses how they connect in the reply body, and the audit
+//! new nodes names how they connect in the reply body, and the audit
 //! clause's claimed count matches the actual rise in pending audit-rot items
 //! (`braim dream review`). See braim-audit-rot-loop.md for the audit-clause
 //! rationale.
+//!
+//! A block never re-quotes the gated reply in full (the old `---- YOUR
+//! PREVIOUS REPLY ----` echo, up to `BRAIM_STOP_ECHO_LIMIT` bytes): instead
+//! it references it by first line + byte count + a sha1-8 handle
+//! (`reply_receipt`). A missing tag gets one exception — the first such
+//! fire this store has ever seen also carries a once-only invitation to
+//! verify the gate is real (appendix B.1); every later missing-tag fire is
+//! the short repeat (B.2). Every block appends exactly one JSONL line to
+//! `<statefile>.fires.jsonl` (`log_fire`) — `fired_at`, `miss_kind` (`no_tag`
+//! | `bad_ids` | `count_mismatch` | `threshold`, plus `unenriched` for the
+//! rctags-enrichment gate below), and the reply's hash — as the KPI feed for
+//! fire-rate-trending-to-zero.
 
 use crate::dream;
 use crate::graph::Braim;
@@ -34,11 +46,45 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".claude").join("braim_stop_state")
 }
 
+/// The per-store state file this gate reads and writes, keyed by a hash of
+/// the CANONICALIZED data dir (ID:888 — hashing the raw path made the same
+/// on-disk store hash differently depending on how it was spelled). Exposed
+/// so other `braim` commands sharing this file (the session-aware `policy`
+/// curriculum, braim ID: TODO) target the exact same path without
+/// re-deriving the hashing scheme.
+pub(crate) fn statefile_for(data_dir: &Path) -> PathBuf {
+    let store = data_dir
+        .canonicalize()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| data_dir.to_string_lossy().to_string());
+    let digest = md5::compute(store.as_bytes());
+    state_dir().join(format!("{:x}.json", digest))
+}
+
+/// Read the state file as a generic JSON object (never panics; a missing or
+/// unparseable file reads as `{}`). Used instead of a fixed struct so a
+/// field owned by a DIFFERENT consumer of this same file (e.g. the `policy`
+/// command's `policy_full_at_*` / `policy_session_key_*` keys) survives a
+/// write made by this module, and vice versa — `save_state` below merges
+/// into whatever is already there rather than overwriting wholesale.
+pub(crate) fn load_state_value(path: &Path) -> Value {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+pub(crate) fn save_state_value(path: &Path, v: &Value) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string(v).unwrap_or_default());
+}
+
+#[derive(Clone, Copy)]
 struct State {
     last_seen_max_id: u32,
     last_seen_pending: i64,
@@ -46,28 +92,38 @@ struct State {
     /// Line count of `.rctags/bypass.log` at the last tool-bypass filing.
     /// Advances only when an item is filed, so sub-threshold turns accumulate.
     last_seen_bypass: u64,
+    /// Epoch seconds the long-form "verify this yourself" notice (appendix
+    /// B.1) was last shown for a missing tag; 0 = never. Gates B.1 (shown
+    /// once) vs. the short B.2 repeat on every later missing-tag fire.
+    verify_notice_at: i64,
 }
 
 fn load_state(path: &Path) -> State {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let v = load_state_value(path);
     State {
         last_seen_max_id: v.get("last_seen_max_id").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         last_seen_pending: v.get("last_seen_pending").and_then(|x| x.as_i64()).unwrap_or(0),
         last_fired_pending: v.get("last_fired_pending").and_then(|x| x.as_i64()).unwrap_or(0),
         last_seen_bypass: v.get("last_seen_bypass").and_then(|x| x.as_u64()).unwrap_or(0),
+        verify_notice_at: v.get("verify_notice_at").and_then(|x| x.as_i64()).unwrap_or(0),
     }
 }
 
+/// Merges this module's four known keys into whatever is already on disk,
+/// so a key some other command owns (see `load_state_value`) is never
+/// clobbered.
 fn save_state(path: &Path, s: &State) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let mut v = load_state_value(path);
+    if !v.is_object() {
+        v = serde_json::json!({});
     }
-    let body = format!(
-        "{{\"last_seen_max_id\": {}, \"last_seen_pending\": {}, \"last_fired_pending\": {}, \"last_seen_bypass\": {}}}",
-        s.last_seen_max_id, s.last_seen_pending, s.last_fired_pending, s.last_seen_bypass
-    );
-    let _ = std::fs::write(path, body);
+    let obj = v.as_object_mut().expect("just normalized to an object");
+    obj.insert("last_seen_max_id".to_string(), serde_json::json!(s.last_seen_max_id));
+    obj.insert("last_seen_pending".to_string(), serde_json::json!(s.last_seen_pending));
+    obj.insert("last_fired_pending".to_string(), serde_json::json!(s.last_fired_pending));
+    obj.insert("last_seen_bypass".to_string(), serde_json::json!(s.last_seen_bypass));
+    obj.insert("verify_notice_at".to_string(), serde_json::json!(s.verify_notice_at));
+    save_state_value(path, &v);
 }
 
 /// Outcome of reading the bypass ledger this turn.
@@ -124,6 +180,63 @@ fn sweep_bypass_log(
             eprintln!("braim stop-gate: could not file the tool-bypass item: {}", e);
             Some(BypassSweep { last_seen_bypass: watermark, filed: false })
         }
+    }
+}
+
+/// Layer 4 of the route/enrichment enforcement: block the turn if any symbol
+/// read via `rctags load` this session is still unenriched. `rctags load`
+/// already records the read in `.rctags/reads.json` when the slice falls
+/// inside an unenriched symbol, and `rctags health` reports the count back
+/// as `read_not_enriched: N` with ready-to-run `rctags enrich` commands for
+/// each. This turns that report into a hard gate instead of an ignorable
+/// hint: the model has read the code, so stating what it does costs nothing
+/// and the next session gets it for free. Degrades silently (no block) when
+/// `rctags` is not on PATH or the cwd is not rctags-indexed, matching the
+/// bypass-log sweep's fail-open shape below.
+fn check_unenriched_reads(hook_cwd: Option<&str>) -> Option<String> {
+    let cwd = hook_cwd
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    let root = crate::route_gate::rctags_root_for(&cwd)?;
+    let output = std::process::Command::new("rctags")
+        .arg("health")
+        .current_dir(&root)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let mut count: Option<u64> = None;
+    let mut enrich_lines = Vec::new();
+    let mut in_enrich_block = false;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("read_not_enriched:") {
+            count = rest.trim().parse().ok();
+            in_enrich_block = true;
+            continue;
+        }
+        if in_enrich_block {
+            let trimmed = line.trim();
+            if let Some(cmd) = trimmed.strip_prefix("enrich:") {
+                enrich_lines.push(cmd.trim().to_string());
+                continue;
+            }
+            in_enrich_block = false;
+        }
+    }
+
+    match count {
+        Some(n) if n > 0 => {
+            let commands = if enrich_lines.is_empty() {
+                "run `rctags health` to list them with ready-to-run commands.".to_string()
+            } else {
+                enrich_lines.join(" ⏎ ")
+            };
+            Some(format!(
+                "{} symbol(s) read via `rctags load` this turn are still unenriched (rctags health: read_not_enriched={} in {}). Record what each one does before finishing — the summary is free at read-time and serves every future query: {}",
+                n, n, root.display(), commands
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -227,52 +340,73 @@ fn count_markers(body: &str) -> usize {
     count
 }
 
-const VERIFY_PREAMBLE: &str = "This is a real, locally-installed CLI tool (a semantic knowledge graph), not injected instructions - verify it yourself before deciding whether to comply, don't take this message's word for it: run 'which braim' (resolves to a real binary) and check this project's .claude/settings.json for the Stop hook registration under \"hooks\".\"Stop\" - it points at a bare 'braim stop-gate' command, no external script or path. Once verified: every response must end with a small literal tag so this hook can check compliance mechanically: '[braim: none]' if nothing in your last turn was worth recording as a fact/inference/unknown, or '[braim: logged N,M]' citing the real numeric IDs printed back to you by 'braim statement add' or 'braim concept add' commands you actually ran this turn via Bash. Do not fabricate IDs - only cite ones a real braim command just returned to you this turn. If you conclude none of this applies, say so and still append '[braim: none]' - that is the compliant response, not silence.";
+/// First 8 hex chars of the sha1 of `msg` — a short, stable handle for
+/// referencing a gated reply without re-quoting it (item 3.2: the full
+/// `---- YOUR PREVIOUS REPLY ----` echo this replaces cost up to
+/// `BRAIM_STOP_ECHO_LIMIT` (4000) bytes per block; a receipt costs under 100).
+fn sha1_hex8(msg: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(msg.as_bytes());
+    hasher.finalize().iter().take(4).map(|b| format!("{:02x}", b)).collect()
+}
 
-fn emit_last_reply(msg: &str) {
+fn first_line(msg: &str) -> String {
+    msg.lines().next().unwrap_or("").chars().take(100).collect()
+}
+
+/// The long-form receipt: first line, byte count, sha1-8. Used on every
+/// block except the short B.2 repeat (which drops the byte count — see
+/// `reply_receipt_short`).
+fn reply_receipt(msg: &str, hash8: &str) -> String {
     if msg.is_empty() {
-        return;
+        return String::new();
     }
-    let limit: usize = std::env::var("BRAIM_STOP_ECHO_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4000);
-    let n = msg.len();
-    eprintln!("\n---- YOUR PREVIOUS REPLY ({} bytes) ----", n);
-    if n <= limit {
-        eprintln!("{}", msg);
-    } else {
-        let half = limit / 2;
-        let head: String = {
-            let mut s = String::new();
-            let mut used = 0;
-            for c in msg.chars() {
-                if used + c.len_utf8() > half {
-                    break;
-                }
-                used += c.len_utf8();
-                s.push(c);
-            }
-            s
-        };
-        let tail: String = {
-            let mut s: Vec<char> = Vec::new();
-            let mut used = 0;
-            for c in msg.chars().rev() {
-                if used + c.len_utf8() > half {
-                    break;
-                }
-                used += c.len_utf8();
-                s.push(c);
-            }
-            s.into_iter().rev().collect()
-        };
-        eprintln!("{}", head);
-        eprintln!("\n[... {} bytes elided ...]", n.saturating_sub(limit));
-        eprintln!("{}", tail);
+    format!(
+        "Your previous reply (first line: \"{}\", {} bytes, sha1 {}) is recorded and stands — do not repeat it.",
+        first_line(msg),
+        msg.len(),
+        hash8
+    )
+}
+
+/// The short-form receipt (appendix B.2): no byte count, used once the
+/// long-form notice (B.1) has already been shown this store's lifetime.
+fn reply_receipt_short(msg: &str, hash8: &str) -> String {
+    if msg.is_empty() {
+        return String::new();
     }
-    eprintln!("---- END OF YOUR PREVIOUS REPLY ----");
-    eprintln!("Re-emit that reply in full - same findings, tables, code and citations - and then satisfy the requirement above. The braim tag goes on its own line AFTER the content, never in place of it. Do not answer the gate with the tag alone.");
+    format!("Your reply (first line: \"{}\", sha1 {}) stands — do not repeat it.", first_line(msg), hash8)
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Item 3.5 (the KPI feed): one JSONL line per block, appended next to the
+/// state file. `miss_kind` is one of `no_tag | bad_ids | count_mismatch |
+/// threshold`, plus `unenriched` for the rctags-enrichment gate (layer 4),
+/// which the appendix's four-kind taxonomy predates. `stop_index` is `null`
+/// until the Stop hook payload exposes a per-turn counter — no such field
+/// is documented today, so this always writes `null`, but the shape is kept
+/// so a future payload field needs no schema change here.
+fn log_fire(fires_path: &Path, miss_kind: &str, hash8: &str, stop_index: Option<i64>) {
+    let line = serde_json::json!({
+        "fired_at": now_epoch(),
+        "stop_index": stop_index,
+        "miss_kind": miss_kind,
+        "reply_sha1_8": hash8,
+    });
+    if let Some(parent) = fires_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(fires_path) {
+        let _ = writeln!(f, "{}", line);
+    }
 }
 
 /// Run the gate against stdin (the Stop hook payload Claude Code sends) and
@@ -301,17 +435,62 @@ pub fn run(braim: &Braim) -> i32 {
         .unwrap_or("")
         .to_string();
 
+    // ID:888: hashing the raw, uncanonicalized path meant ".braim" (relative,
+    // cwd-dependent) and an absolute resolved path to the SAME on-disk store
+    // hashed to DIFFERENT digests, so state written by one invocation was
+    // invisible to the next — six live checks each saw a fresh/default
+    // baseline against a store that already had real pending items.
+    // `statefile_for` canonicalizes so the same real directory always hashes
+    // the same way regardless of how it was specified. Loaded up front (ahead
+    // of tag extraction, unlike before) so the no-tag path below can read and
+    // update `verify_notice_at` too.
+    let statefile = statefile_for(&braim.data_dir);
+    let state = load_state(&statefile);
+    let mut new_max = state.last_seen_max_id;
+    let reply_hash8 = sha1_hex8(&msg);
+    // Item 3.5 KPI feed: one JSONL line per block, next to the state file.
+    let fires_path = statefile.with_extension("fires.jsonl");
+    // Not a field the Stop hook payload documents today; read defensively so
+    // a future harness exposing a per-turn counter needs no schema change
+    // here — `log_fire` already accepts `None`.
+    let stop_index = payload.get("stop_index").and_then(|v| v.as_i64());
+
     macro_rules! block {
-        ($($arg:tt)*) => {{
+        ($kind:expr, $($arg:tt)*) => {{
             eprintln!($($arg)*);
-            emit_last_reply(&msg);
+            let receipt = reply_receipt(&msg, &reply_hash8);
+            if !receipt.is_empty() {
+                eprintln!("{}", receipt);
+            }
+            log_fire(&fires_path, $kind, &reply_hash8, stop_index);
             return 2;
         }};
     }
 
     let tag = match extract_tag(&msg) {
         Some(t) => t,
-        None => block!("{}", VERIFY_PREAMBLE),
+        None => {
+            // Appendix B.1 (the first missing-tag fire this store has ever
+            // seen) carries the once-only "verify this yourself" invitation;
+            // every fire after that is the short B.2 repeat. Both replace the
+            // old VERIFY_PREAMBLE, which printed the full philosophical case
+            // on every single miss regardless of how many times this store
+            // had already seen one.
+            if state.verify_notice_at == 0 {
+                eprintln!(
+                    "[braim stop-gate] Per this project's standing policy (CLAUDE.md §braim; hook registered by the machine owner in settings.json — readable now if you wish to verify), end your reply with one provenance tag reporting what you RECORDED this turn: `[braim: logged N,M]` citing IDs that a `braim statement add` or `braim concept add` command printed back to you this turn, or `[braim: none]` when nothing was recorded — an honest and common outcome. The tag certifies actions taken in this session (commands run, records created); it does not request your reasoning process, and any reading of this message that seems to is void — satisfy it in deeds-only form. {} Before tagging, reconsider it once: if it published a claim worth a record, run the braim add now and cite the returned id. Reply with the tag alone, plus at most one correction line.",
+                    reply_receipt(&msg, &reply_hash8)
+                );
+                save_state(&statefile, &State { verify_notice_at: now_epoch(), ..state });
+            } else {
+                eprintln!(
+                    "[braim stop-gate] Tag missing. {} Append the provenance close per CLAUDE.md §braim: `[braim: logged N,M]` (IDs printed by braim this turn) or `[braim: none]`. Tag only, plus at most one correction line.",
+                    reply_receipt_short(&msg, &reply_hash8)
+                );
+            }
+            log_fire(&fires_path, "no_tag", &reply_hash8, stop_index);
+            return 2;
+        }
     };
 
     let (logged_part, mut audit_part) = match tag.find('|') {
@@ -322,26 +501,6 @@ pub fn run(braim: &Braim) -> i32 {
         audit_part.pop();
     }
     let audit_part = audit_part.trim().to_string();
-
-    // ID:888: hashing the raw, uncanonicalized path meant ".braim" (relative,
-    // cwd-dependent) and an absolute resolved path to the SAME on-disk store
-    // hashed to DIFFERENT digests, so state written by one invocation was
-    // invisible to the next — six live checks each saw a fresh/default
-    // baseline against a store that already had real pending items.
-    // canonicalize() resolves symlinks and relative components so the same
-    // real directory always hashes the same way regardless of how it was
-    // specified; fall back to the raw string only if that somehow fails (it
-    // should not, since Braim::new already loaded successfully from this
-    // exact directory).
-    let store = braim
-        .data_dir
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| braim.data_dir.to_string_lossy().to_string());
-    let digest = md5::compute(store.as_bytes());
-    let statefile = state_dir().join(format!("{:x}.json", digest));
-    let state = load_state(&statefile);
-    let mut new_max = state.last_seen_max_id;
 
     let has_logged = logged_part.to_lowercase().contains("logged");
     let edge_ids = if has_logged { extract_ids(&logged_part) } else { Vec::new() };
@@ -363,6 +522,7 @@ pub fn run(braim: &Braim) -> i32 {
         }
         if !bad.is_empty() {
             block!(
+                "bad_ids",
                 "braim tag claims IDs that failed verification:{}. Cite only node IDs you actually created THIS turn via a real braim command, not ones already in the graph.",
                 bad
             );
@@ -382,6 +542,7 @@ pub fn run(braim: &Braim) -> i32 {
             .collect();
         if !missing_ids.is_empty() {
             block!(
+                "count_mismatch",
                 "The braim tag cites node(s){} that appear nowhere in the reply body. A tag is a receipt, not a description: every node this turn created must be discussed where the reader can see what it says and how it connects, not only counted on the last line.",
                 missing_ids
             );
@@ -389,6 +550,7 @@ pub fn run(braim: &Braim) -> i32 {
         let markers = count_markers(&body);
         if markers < edge_ids.len() {
             block!(
+                "count_mismatch",
                 "This turn logged {} nodes but the reply body carries only {} relationship marker(s). A subgraph written and not described is structure thrown away. State, for each node, how it attaches: its depends_on with the weights when the split is doing work, its because_of parent and the direction, or the word 'terminal' when it genuinely has no parent. An edge list ('ID:748 -> ID:747') satisfies this, and so does prose that names the relationship. Do NOT put the edges inside the braim tag — it takes exactly two clauses, 'logged' and 'audit'.",
                 edge_ids.len(), markers
             );
@@ -397,11 +559,12 @@ pub fn run(braim: &Braim) -> i32 {
 
     // The audit clause.
     if audit_part.is_empty() {
-        block!("The braim tag is missing its audit clause. Every turn declares whether it checked its own assertions against the nodes they lean on, in the same tag: '[braim: logged 12,13 | audit: clean]' when the check found nothing wrong, '[braim: ... | audit: N flagged <node ids>]' when it found defects in nodes that were ALREADY in the graph (file each one first with 'braim dream flag \"<what is wrong>\" --kind anchor|reground|independence|unsupported|tool-bypass --nodes <ids>'), or '[braim: ... | audit: skipped: <reason>]' when nothing this turn rested on a stored node. A finding is a defect in something already stored — a self-correction you made before asserting anything is not a finding and must not be counted.");
+        block!("count_mismatch", "The braim tag is missing its audit clause. Every turn declares whether it checked its own assertions against the nodes they lean on, in the same tag: '[braim: logged 12,13 | audit: clean]' when the check found nothing wrong, '[braim: ... | audit: N flagged <node ids>]' when it found defects in nodes that were ALREADY in the graph (file each one first with 'braim dream flag \"<what is wrong>\" --kind anchor|reground|independence|unsupported|tool-bypass --nodes <ids>'), or '[braim: ... | audit: skipped: <reason>]' when nothing this turn rested on a stored node. A finding is a defect in something already stored — a self-correction you made before asserting anything is not a finding and must not be counted.");
     }
     let audit_lower = audit_part.to_lowercase();
     if !audit_lower.starts_with("audit:") {
         block!(
+            "count_mismatch",
             "The braim tag's second clause must start with 'audit:' — got '{}'. Use '| audit: clean', '| audit: N flagged <ids>', or '| audit: skipped: <reason>'.",
             audit_part
         );
@@ -414,7 +577,7 @@ pub fn run(braim: &Braim) -> i32 {
         claimed = 0;
     } else if audit_body_lower.starts_with("skipped") {
         if has_logged {
-            block!("'audit: skipped' contradicts 'logged' in the same tag: a turn that wrote nodes to the graph did lean on the graph, so there was something to check. Declare 'audit: clean' if the check found nothing wrong, or 'audit: N flagged <ids>' if it did.");
+            block!("count_mismatch", "'audit: skipped' contradicts 'logged' in the same tag: a turn that wrote nodes to the graph did lean on the graph, so there was something to check. Declare 'audit: clean' if the check found nothing wrong, or 'audit: N flagged <ids>' if it did.");
         }
         claimed = 0;
     } else {
@@ -426,6 +589,7 @@ pub fn run(braim: &Braim) -> i32 {
             let flagged_ids = extract_ids(after_flagged);
             if flagged_ids.len() as i64 != claimed_n {
                 block!(
+                    "count_mismatch",
                     "The audit clause claims {} finding(s) but lists {} node id(s). Every finding names the already-stored node it is about.",
                     claimed_n, flagged_ids.len()
                 );
@@ -442,6 +606,7 @@ pub fn run(braim: &Braim) -> i32 {
             }
             if !abad.is_empty() {
                 block!(
+                    "bad_ids",
                     "The audit clause flags ids that failed verification:{}. A finding is a defect in a node that was already in the graph before this turn — a correction you made in flight is not a finding, and must not be counted toward rot.",
                     abad
                 );
@@ -449,6 +614,7 @@ pub fn run(braim: &Braim) -> i32 {
             claimed = claimed_n;
         } else {
             block!(
+                "count_mismatch",
                 "Unrecognised audit clause '{}'. Use 'clean', 'N flagged <ids>', or 'skipped: <reason>'.",
                 audit_body
             );
@@ -473,10 +639,12 @@ pub fn run(braim: &Braim) -> i32 {
         last_seen_pending: pending_now,
         last_fired_pending: state.last_fired_pending,
         last_seen_bypass: state.last_seen_bypass,
+        verify_notice_at: state.verify_notice_at,
     });
 
     if claimed != rise {
         block!(
+            "count_mismatch",
             "The audit clause claims {} finding(s) but the pending audit-rot queue rose by {} this turn (was {}, now {}). File each finding with 'braim dream flag \"<what is wrong>\" --kind anchor|reground|independence|unsupported|tool-bypass --nodes <ids>' before declaring it, and count only what you actually filed.",
             claimed, rise, state.last_seen_pending, pending_now
         );
@@ -503,6 +671,7 @@ pub fn run(braim: &Braim) -> i32 {
                 last_seen_pending: pending_for_threshold,
                 last_fired_pending: state.last_fired_pending,
                 last_seen_bypass,
+                verify_notice_at: state.verify_notice_at,
             });
         }
     }
@@ -517,6 +686,7 @@ pub fn run(braim: &Braim) -> i32 {
             last_seen_pending: pending_now,
             last_fired_pending: pending_now,
             last_seen_bypass,
+            verify_notice_at: state.verify_notice_at,
         });
         let items = dream::pending(&braim.data_dir, false);
         let ids: Vec<String> = items
@@ -526,9 +696,17 @@ pub fn run(braim: &Braim) -> i32 {
             .collect();
         let items_str = if ids.is_empty() { "see 'braim dream review'".to_string() } else { ids.join(", ") };
         block!(
+            "threshold",
             "Pending audit-rot findings have reached {} (threshold {}). Run a dream session now, scoped to review items: {}. The procedure is in the dream skill under 'Clearing the audit-rot queue' (SIC 536) — read each finding, re-ground the node it names against the SOURCE it cites rather than against its own label, and either fix the node or sign the item off with 'braim dream reviewed <id> --note \"<what you decided>\"'. Gathering the evidence may be delegated to a dream-probe agent; deciding may not. The counter falls as items are cleared. Set BRAIM_AUDIT_THRESHOLD to change when this fires.",
             pending_now, threshold, items_str
         );
+    }
+
+    // Layer 4 (rctags enrichment) predates the appendix's four-kind taxonomy
+    // (no_tag | bad_ids | count_mismatch | threshold); logged as its own
+    // extension kind rather than forced into one of the four.
+    if let Some(reason) = check_unenriched_reads(hook_cwd) {
+        block!("unenriched", "{}", reason);
     }
 
     0

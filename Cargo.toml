@@ -30,3 +30,4 @@ chrono = { version = "0.4", features = ["serde"] }
 tiny_http = "0.12"
 fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"], optional = true }
 md5 = "0.8.1"
+sha1 = "0.10"

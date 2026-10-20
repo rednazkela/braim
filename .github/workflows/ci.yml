@@ -34,6 +34,19 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
+  # Pins the deeds-only rewording of model-facing text in hooks/ and
+  # policies/ (session 2026-10-16): a pure grep, no model in the loop, so a
+  # reintroduced extraction-shaped phrase ("reveal the chain of inferences",
+  # "blocked until you comply", ...) fails the PR instead of waiting for the
+  # next model generation to refuse it. See hooks/wording_lint.sh and
+  # tests/prompt_fixtures/README.md for the fixture pair this complements.
+  wording-lint:
+    name: wording lint (model-facing text)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash hooks/wording_lint.sh
+
   # The dependency-light build is a supported configuration, so it must not rot.
   # Linux only — this checks that the feature gating still compiles, not platform
   # behaviour, which the matrix above already covers.

@@ -258,7 +258,13 @@ braim stop-gate                                # what the Stop hook runs (reads 
 
 @[`braim stop-gate` verifies the `[braim: ...]` tag on the reply that just ended and exits 2 to block Stop when it is missing, cites ids that don't check out, omits required edge disclosure, or misstates the audit clause against the real pending audit-rot count; it replaces `hooks/braim_stop_gate.sh` (bash + jq + a path into this checkout) with the same checks emitted from the binary] source: code:src/stop_gate.rs
 
-@[Stop-gate state (last id seen, last pending count, last threshold fired) persists at `~/.claude/braim_stop_state/<md5 of the data dir>.json` — the same location and shape the bash version used, so switching to the native command keeps continuity] source: code:src/stop_gate.rs state_dir, load_state
+@[Stop-gate state (last id seen, last pending count, last threshold fired, and now verify_notice_at) persists at `~/.claude/braim_stop_state/<md5 of the data dir>.json` as a generic JSON object merged in place, not overwritten, so a key owned by `braim policy` (policy_full_at_*/policy_session_key_*) survives a Stop-gate write and vice versa] source: code:src/stop_gate.rs statefile_for, load_state_value, save_state_value
+
+@[A Stop-gate block never re-quotes the gated reply in full; it references it by first line + byte count + a sha1-8 handle, and a missing tag gets the long "verify this is real" notice only on the first fire a given store has ever seen — every later missing-tag fire is a short repeat] source: code:src/stop_gate.rs reply_receipt, reply_receipt_short
+
+@[Every Stop-gate block appends one JSONL line — fired_at, miss_kind (no_tag/bad_ids/count_mismatch/threshold, plus unenriched), the reply's sha1-8 — to `<statefile>.fires.jsonl`, the fire-rate KPI feed] source: code:src/stop_gate.rs log_fire
+
+@[`braim policy perturn`/`traits` are session-aware: the first UserPromptSubmit of a session (tracked per-command in the shared Stop-gate state file) gets the full curriculum, every later prompt gets perturn going silent and traits carrying only a one-line provenance tail — so recurring turns inject under 160 bytes instead of the full policy text] source: code:src/bootstrap.rs policy_body_for_turn
 
 @[`stop-gate` checks the Stop hook payload's `stop_hook_active` field first and allows unconditionally when it is true, capping this gate at one block per turn; this check was absent from both this port and the `hooks/braim_stop_gate.sh` it replaces until it was added after an observed lockup] source: code:src/stop_gate.rs run(), Claude Code hooks reference (Stop input: stop_hook_active)
 

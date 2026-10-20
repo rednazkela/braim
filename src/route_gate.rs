@@ -159,6 +159,79 @@ fn has_bypass_token(cmd: &str) -> bool {
     cmd.split_whitespace().any(|t| t == "RCTAGS_BYPASS=1")
 }
 
+/// The real rctags subcommands that count as "the agent actually engaged the
+/// tool" for the one-shot bypass permit below (reindex and enrich included:
+/// they are real engagement, even though they aren't lookups).
+const RCTAGS_SUBCOMMANDS: [&str; 6] = ["query", "refs", "load", "health", "enrich", "reindex"];
+
+/// True when `rctags` (bare or path-qualified, e.g. `~/.cargo/bin/rctags`) is
+/// immediately followed by one of its real subcommands anywhere in the
+/// tokenized command — reuses `is_grep_family`'s tokenizer so `rctags|query`
+/// and spaced forms match alike. Deliberately NOT command-position-gated
+/// (unlike `is_grep_family`): a false-positive arm here only ever GRANTS an
+/// extra permit, never denies one, so the asymmetric risk favors the loose
+/// check. Returns the matched subcommand for `arm_bypass_permit`'s log line.
+fn rctags_invocation_subcommand(cmd: &str) -> Option<&'static str> {
+    let tokens = tokenize(cmd);
+    for i in 0..tokens.len() {
+        let base = tokens[i].rsplit('/').next().unwrap_or(&tokens[i]);
+        if base != "rctags" {
+            continue;
+        }
+        if let Some(next) = tokens.get(i + 1) {
+            if let Some(&sub) = RCTAGS_SUBCOMMANDS.iter().find(|&&s| s == next.as_str()) {
+                return Some(sub);
+            }
+        }
+    }
+    None
+}
+
+fn bypass_permit_path(root: &Path) -> PathBuf {
+    root.join(".rctags").join("bypass_permit")
+}
+
+/// Arm ONE bypass permit: a genuine rctags invocation just happened, so the
+/// next `RCTAGS_BYPASS=1` grep-family command — and only that one — is
+/// honored. Overwrites any existing permit rather than stacking (repeated
+/// rctags use ahead of a single bypass is not a balance to spend down); the
+/// file's content is diagnostic only, never read back for a decision.
+fn arm_bypass_permit(root: &Path, cwd: &str, subcommand: &str) {
+    let path = bypass_permit_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{}\t{}\trctags {}\n", now_iso(), cwd, subcommand));
+}
+
+/// True, and consumes the permit, exactly when one is currently armed. No
+/// file (never armed, or already spent by a prior bypass) returns false —
+/// the default is deny, not a free first bypass.
+fn consume_bypass_permit(root: &Path) -> bool {
+    let path = bypass_permit_path(root);
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+        true
+    } else {
+        false
+    }
+}
+
+fn deny_json_spent_bypass(root: &Path) -> String {
+    let reason = format!(
+        "rctags-indexed repo ({}). RCTAGS_BYPASS=1 was already spent by an earlier bypass, or never earned: run a real rctags command first (query/refs/load/health/enrich/reindex), then the NEXT bypass — only that one — is honored. The flag is not a standing exemption; it is reissued one use at a time by actually engaging the tool.",
+        root.display()
+    );
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        }
+    })
+    .to_string()
+}
+
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -252,6 +325,15 @@ pub fn run(braim: &Braim) -> i32 {
         .unwrap_or_else(|| PathBuf::from("."));
     let cwd_str = cwd.to_string_lossy().to_string();
 
+    // Arm a bypass permit on genuine rctags engagement, independent of
+    // whether THIS command is also grep-family — the model used the tool,
+    // so one escape hatch is reissued regardless of what it does next.
+    if let Some(sub) = rctags_invocation_subcommand(&cmd) {
+        if let Some(root) = rctags_root_for(&cwd) {
+            arm_bypass_permit(&root, &cwd_str, sub);
+        }
+    }
+
     let bypass = has_bypass_token(&cmd);
     if !is_grep_family(&cmd) {
         return 0;
@@ -261,7 +343,11 @@ pub fn run(braim: &Braim) -> i32 {
         None => return 0,
     };
     if bypass {
-        log_bypass(&root, &cwd_str, &cmd);
+        if consume_bypass_permit(&root) {
+            log_bypass(&root, &cwd_str, &cmd);
+            return 0;
+        }
+        println!("{}", deny_json_spent_bypass(&root));
         return 0;
     }
     if let Err(reason) = rctags_is_healthy(&root, &braim.data_dir) {
@@ -355,6 +441,49 @@ mod tests {
         assert!(has_bypass_token("cat f | RCTAGS_BYPASS=1 grep x"));
         assert!(!has_bypass_token("RCTAGS_BYPASS=10 grep x"));
         assert!(!has_bypass_token("grep RCTAGS_BYPASS=1x"));
+    }
+
+    #[test]
+    fn rctags_invocation_is_detected_bare_path_qualified_and_mid_pipeline() {
+        assert_eq!(rctags_invocation_subcommand("rctags query foo"), Some("query"));
+        assert_eq!(rctags_invocation_subcommand("rctags refs foo"), Some("refs"));
+        assert_eq!(rctags_invocation_subcommand("rctags load f 1 9"), Some("load"));
+        assert_eq!(rctags_invocation_subcommand("rctags health"), Some("health"));
+        assert_eq!(rctags_invocation_subcommand("rctags enrich foo --summary x"), Some("enrich"));
+        assert_eq!(rctags_invocation_subcommand("rctags reindex ."), Some("reindex"));
+        assert_eq!(rctags_invocation_subcommand("/home/x/.cargo/bin/rctags query foo"), Some("query"));
+        assert_eq!(rctags_invocation_subcommand("cd src && rctags query foo"), Some("query"));
+        assert_eq!(rctags_invocation_subcommand("rctags query foo | wc -l"), Some("query"));
+        // Not a real subcommand, not a prefix match, not a bare mention.
+        assert_eq!(rctags_invocation_subcommand("rctags --help"), None);
+        assert_eq!(rctags_invocation_subcommand("rctags"), None);
+        assert_eq!(rctags_invocation_subcommand("echo rctags query foo later"), Some("query"), "loose by design: see doc comment");
+        assert_eq!(rctags_invocation_subcommand("grep rctags src/"), None);
+    }
+
+    #[test]
+    fn a_bypass_permit_is_single_use_and_requires_a_fresh_arm() {
+        let base = std::env::temp_dir().join(format!("braim_rg_permit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Unarmed by default: nothing to consume.
+        assert!(!consume_bypass_permit(&base));
+
+        // One arm grants exactly one consumption.
+        arm_bypass_permit(&base, "/cwd", "query");
+        assert!(bypass_permit_path(&base).is_file());
+        assert!(consume_bypass_permit(&base), "the armed permit is consumed");
+        assert!(!bypass_permit_path(&base).exists(), "consuming removes the file");
+        assert!(!consume_bypass_permit(&base), "a second consume without a re-arm fails");
+
+        // Arming twice does not stack: still exactly one consumption available.
+        arm_bypass_permit(&base, "/cwd", "query");
+        arm_bypass_permit(&base, "/cwd", "health");
+        assert!(consume_bypass_permit(&base));
+        assert!(!consume_bypass_permit(&base), "repeated arms do not stack permits");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

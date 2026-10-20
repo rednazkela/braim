@@ -41,8 +41,11 @@ impl Drop for Scratch {
 }
 
 /// A stand-in `rctags`, returned as the directory to prefix PATH with. `health` records its cwd when RCTAGS_STUB_CWD_FILE is
-/// set and answers per RCTAGS_STUB_MODE (healthy | empty | broken); `query
-/// <sym> --exact` answers from `./.rctags/index.json`, one entry per line.
+/// set and answers per RCTAGS_STUB_MODE (healthy | empty | broken), and —
+/// only in the healthy case — adds a `read_not_enriched` line plus two
+/// `enrich:` suggestion lines when RCTAGS_STUB_READ_NOT_ENRICHED is set;
+/// `query <sym> --exact` answers from `./.rctags/index.json`, one entry per
+/// line.
 fn install_stub(bin_dir: &Path) -> PathBuf {
     fs::create_dir_all(bin_dir).unwrap();
     let stub = bin_dir.join("rctags");
@@ -55,7 +58,13 @@ case "$1" in
     case "${RCTAGS_STUB_MODE:-healthy}" in
       broken) echo "stub: broken" >&2; exit 1;;
       empty) printf 'indexed_files: 0\nmissing_files: 0 (0.0%%)\nunparsed_files: 0\nverdict: OK\n'; exit 0;;
-      *) printf 'indexed_files: 3\nmissing_files: 0 (0.0%%)\nunparsed_files: 0\nverdict: OK\n'; exit 0;;
+      *) printf 'indexed_files: 3\nmissing_files: 0 (0.0%%)\nunparsed_files: 0\nverdict: OK\n';
+         if [ -n "$RCTAGS_STUB_READ_NOT_ENRICHED" ]; then
+           printf 'read_not_enriched: %s\n' "$RCTAGS_STUB_READ_NOT_ENRICHED"
+           printf '  enrich: rctags enrich fooSymbol --file src/foo.rs --summary "..."\n'
+           printf '  enrich: rctags enrich barSymbol --file src/bar.rs --summary "..."\n'
+         fi
+         exit 0;;
     esac;;
   query)
     printf '['
@@ -284,10 +293,25 @@ fn a_declared_bypass_is_allowed_and_logged_by_the_gate_at_the_root() {
     let sub = s.sub("repo/src");
     let bin = install_stub(&s.path().join("bin"));
     let log = root.join(".rctags").join("bypass.log");
+    let permit = root.join(".rctags").join("bypass_permit");
+    let arm = || {
+        let r = braim(&data, &["route-gate"], Some(&pretool("rctags query foo", &sub)), &sub, Some(&bin), &[]);
+        assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+        assert!(permit.is_file(), "a real rctags call must arm the permit");
+    };
 
+    // Unearned: no prior rctags call this test, so the first bypass is denied.
     let r = braim(&data, &["route-gate"], Some(&pretool("RCTAGS_BYPASS=1 grep foo", &sub)), &sub, Some(&bin), &[]);
     assert_eq!(r.code, 0);
-    assert!(deny_reason(&r.stdout).is_none(), "bypass must be allowed: {}", r.stdout);
+    assert!(deny_reason(&r.stdout).is_some(), "unearned bypass must be denied: {}", r.stdout);
+    assert!(!log.exists(), "a denied bypass writes no ledger line");
+
+    // Earned: arm, then the bypass is allowed and logged.
+    arm();
+    let r = braim(&data, &["route-gate"], Some(&pretool("RCTAGS_BYPASS=1 grep foo", &sub)), &sub, Some(&bin), &[]);
+    assert_eq!(r.code, 0);
+    assert!(deny_reason(&r.stdout).is_none(), "earned bypass must be allowed: {}", r.stdout);
+    assert!(!permit.exists(), "the permit is consumed");
     let l = lines(&log);
     assert_eq!(l.len(), 1, "exactly one line at the ROOT, not the cwd: {:?}", l);
     assert!(!sub.join(".rctags").exists(), "nothing is written under the cwd");
@@ -297,23 +321,33 @@ fn a_declared_bypass_is_allowed_and_logged_by_the_gate_at_the_root() {
     assert_eq!(fields[1], sub.to_string_lossy());
     assert_eq!(fields[2], "RCTAGS_BYPASS=1 grep foo");
 
-    // Mid-pipeline and env-prefixed forms also qualify.
+    // Spent: an immediate second bypass with no new rctags call is denied.
+    let r = braim(&data, &["route-gate"], Some(&pretool("RCTAGS_BYPASS=1 grep bar", &sub)), &sub, Some(&bin), &[]);
+    assert!(deny_reason(&r.stdout).is_some(), "a second bypass without a new rctags call must be denied");
+    assert_eq!(lines(&log).len(), 1, "the denied second attempt writes no ledger line");
+
+    // Mid-pipeline and env-prefixed forms also qualify, once re-armed.
+    arm();
     let r = braim(&data, &["route-gate"], Some(&pretool("cat f | RCTAGS_BYPASS=1 grep x", &sub)), &sub, Some(&bin), &[]);
     assert!(r.code == 0 && deny_reason(&r.stdout).is_none());
     assert_eq!(lines(&log).len(), 2);
 
-    // Negative controls.
+    // Negative controls (each needs its own arm, since the prior bypass spent it).
+    arm();
     let r = braim(&data, &["route-gate"], Some(&pretool("grep foo", &sub)), &sub, Some(&bin), &[]);
     assert!(deny_reason(&r.stdout).is_some(), "without the token the same command is denied");
     assert_eq!(lines(&log).len(), 2, "a denial writes no bypass line");
+    assert!(permit.is_file(), "a denial for lacking the token at all does not consume the permit");
 
     let r = braim(&data, &["route-gate"], Some(&pretool("RCTAGS_BYPASS=10 grep foo", &sub)), &sub, Some(&bin), &[]);
     assert!(deny_reason(&r.stdout).is_some(), "RCTAGS_BYPASS=10 is not a bypass");
     assert_eq!(lines(&log).len(), 2);
+    assert!(permit.is_file(), "RCTAGS_BYPASS=10 is not a bypass attempt, so it does not consume the permit either");
 
     let r = braim(&data, &["route-gate"], Some(&pretool("RCTAGS_BYPASS=1 cat foo", &sub)), &sub, Some(&bin), &[]);
     assert!(r.code == 0 && deny_reason(&r.stdout).is_none());
     assert_eq!(lines(&log).len(), 2, "a bypass token on a non-grep command is not a defection");
+    assert!(permit.is_file(), "a non-grep command never consumes the permit, earned or not");
 }
 
 // ───────────────────────── D4: health probe and fail-open ─────────────────────────
@@ -481,6 +515,62 @@ fn sub_threshold_bypasses_accumulate_across_turns() {
     assert_eq!(state_json(&home)["last_seen_bypass"], 8);
 }
 
+// ─────────── D20: the Stop gate blocks a turn with unenriched reads ───────────
+
+#[test]
+fn the_stop_gate_blocks_on_unenriched_reads_and_names_the_enrich_commands() {
+    let s = Scratch::new("enrich");
+    let data = s.sub("store");
+    let root = s.sub("repo");
+    write_index(&root, &[]);
+    let bin = install_stub(&s.path().join("bin"));
+    seed(&data, &root, &bin);
+
+    // Healthy index, nothing unread-and-unenriched: the gate does not block.
+    let r = braim(&data, &["stop-gate"], Some(&stop_payload(&root)), &root, Some(&bin), &[]);
+    assert_eq!(r.code, 0, "clean health must not block: {}", r.stderr);
+
+    // Two unenriched reads: blocked, exit 2, the count and both ready-to-run
+    // enrich commands appear in the message (stderr, since block! prints there).
+    let r = braim(
+        &data,
+        &["stop-gate"],
+        Some(&stop_payload(&root)),
+        &root,
+        Some(&bin),
+        &[("RCTAGS_STUB_READ_NOT_ENRICHED", "2")],
+    );
+    assert_eq!(r.code, 2, "stdout={} stderr={}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("2 symbol(s)"), "{}", r.stderr);
+    assert!(r.stderr.contains("read_not_enriched=2"), "{}", r.stderr);
+    assert!(r.stderr.contains("rctags enrich fooSymbol --file src/foo.rs"), "{}", r.stderr);
+    assert!(r.stderr.contains("rctags enrich barSymbol --file src/bar.rs"), "{}", r.stderr);
+
+    // Fail-open: no rctags on PATH at all must not block, even though the
+    // index exists — same posture as the route gate's own rctags-not-found.
+    let r = braim(
+        &data,
+        &["stop-gate"],
+        Some(&stop_payload(&root)),
+        &root,
+        None,
+        &[("RCTAGS_STUB_READ_NOT_ENRICHED", "2")],
+    );
+    assert_eq!(r.code, 0, "no rctags on PATH must fail open: {}", r.stderr);
+
+    // A cwd outside any indexed tree is also a no-op, matching the bypass sweep.
+    let outside = s.sub("elsewhere");
+    let r = braim(
+        &data,
+        &["stop-gate"],
+        Some(&stop_payload(&outside)),
+        &outside,
+        Some(&bin),
+        &[("RCTAGS_STUB_READ_NOT_ENRICHED", "2")],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+}
+
 // ───────────────────────── D12 / D19: init-time probe and the pointer ─────────────────────────
 
 fn settings_of(path: &Path) -> serde_json::Value {
@@ -630,4 +720,176 @@ fn audit_lists_only_symbol_anchors_rctags_cannot_find_at_that_file() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(r.stdout.contains("rctags unavailable — symbol anchors not checked"), "{}", r.stdout);
     assert!(stale_ids(&r.stdout).is_empty());
+}
+
+// ─────── Item 3: short receipts, once-only verification notice, the fire log ───────
+
+fn stop_payload_no_tag(cwd: &Path) -> String {
+    serde_json::json!({
+        "hook_event_name": "Stop",
+        "last_assistant_message": "This is a reply with no braim tag at all.",
+        "cwd": cwd.to_string_lossy()
+    })
+    .to_string()
+}
+
+fn fires_log_lines(home: &Path) -> Vec<serde_json::Value> {
+    let dir = home.join(".claude").join("braim_stop_state");
+    let path = fs::read_dir(&dir)
+        .expect("state dir exists")
+        .find_map(|e| {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".fires.jsonl") { Some(e.path()) } else { None }
+        })
+        .expect("a *.fires.jsonl file exists next to the state file");
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_missing_tag_gets_the_long_notice_once_then_the_short_repeat_and_never_requotes_the_reply() {
+    let s = Scratch::new("notag");
+    let data = s.sub("store");
+    let root = s.sub("repo");
+    write_index(&root, &[]);
+    let bin = install_stub(&s.path().join("bin"));
+    seed(&data, &root, &bin);
+    let home = root.join("home_for_test");
+    let gate = || braim(&data, &["stop-gate"], Some(&stop_payload_no_tag(&root)), &root, Some(&bin), &[]);
+
+    // First fire this store has ever seen: the long B.1 notice (names the
+    // standing policy, invites the model to verify the gate is real, and
+    // references — never re-quotes in full — the gated reply).
+    let r = gate();
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("standing policy"), "{}", r.stderr);
+    assert!(r.stderr.contains("Before tagging, reconsider it once"), "{}", r.stderr);
+    assert!(r.stderr.contains("This is a reply with no braim tag"), "first line referenced: {}", r.stderr);
+    assert!(!r.stderr.contains("---- YOUR PREVIOUS REPLY"), "the full-reply echo must be gone: {}", r.stderr);
+    assert!(r.stderr.contains("sha1 "), "{}", r.stderr);
+
+    // Second fire, same store: the short B.2 repeat, not the long notice
+    // again, and small — the acceptance budget (<400 bytes per miss) applies
+    // to this steady-state repeat, not the one-time long form above.
+    let r = gate();
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("Tag missing."), "{}", r.stderr);
+    assert!(!r.stderr.contains("standing policy"), "B.1 must not repeat: {}", r.stderr);
+    assert!(!r.stderr.contains("---- YOUR PREVIOUS REPLY"), "{}", r.stderr);
+    assert!(r.stderr.len() < 400, "B.2 should be small: {} bytes: {}", r.stderr.len(), r.stderr);
+
+    // Both fires logged one machine-parseable JSONL line each, kind no_tag.
+    let fires = fires_log_lines(&home);
+    assert_eq!(fires.len(), 2, "{:?}", fires);
+    for f in &fires {
+        assert_eq!(f["miss_kind"], "no_tag");
+        assert_eq!(f["reply_sha1_8"].as_str().unwrap().len(), 8);
+        assert!(f["fired_at"].as_i64().unwrap() > 0);
+    }
+}
+
+#[test]
+fn a_tag_only_follow_up_passes_and_fabricated_ids_still_fail_with_their_own_miss_kind() {
+    let s = Scratch::new("firekinds");
+    let data = s.sub("store");
+    let root = s.sub("repo");
+    write_index(&root, &[]);
+    let bin = install_stub(&s.path().join("bin"));
+    seed(&data, &root, &bin);
+    let home = root.join("home_for_test");
+
+    // A tag-only reply (no echoed prior content) with a well-formed,
+    // honest tag passes cleanly.
+    let r = braim(&data, &["stop-gate"], Some(&stop_payload(&root)), &root, Some(&bin), &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+
+    // Fabricated id: logged IDs must be verified; this one does not exist.
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "last_assistant_message": "done [braim: logged 999999 | audit: clean]",
+        "cwd": root.to_string_lossy()
+    })
+    .to_string();
+    let r = braim(&data, &["stop-gate"], Some(&payload), &root, Some(&bin), &[]);
+    assert_eq!(r.code, 2, "{}", r.stderr);
+    assert!(r.stderr.contains("no-such-node"), "{}", r.stderr);
+
+    let fires = fires_log_lines(&home);
+    assert_eq!(fires.last().unwrap()["miss_kind"], "bad_ids", "{:?}", fires);
+}
+
+// ─────────────── Item 2: session-aware `braim policy` curriculum ───────────────
+
+fn prompt_payload(session_id: &str, cwd: &Path) -> String {
+    serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": session_id,
+        "cwd": cwd.to_string_lossy()
+    })
+    .to_string()
+}
+
+#[test]
+fn the_policy_hooks_emit_full_curriculum_once_per_session_then_a_tail() {
+    let s = Scratch::new("policy");
+    let data = s.sub("store");
+    let root = s.sub("repo");
+    let bin = install_stub(&s.path().join("bin"));
+    seed(&data, &root, &bin);
+
+    let perturn = |session: &str| braim(&data, &["policy", "perturn"], Some(&prompt_payload(session, &root)), &root, Some(&bin), &[]);
+    let traits = |session: &str| braim(&data, &["policy", "traits"], Some(&prompt_payload(session, &root)), &root, Some(&bin), &[]);
+
+    // First prompt of session "s1": both hooks emit their full content.
+    let r = perturn("s1");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("PER-TURN BRAIM LOGGING"), "{}", r.stdout);
+    let r = traits("s1");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("EVIDENCE_CAPTURE_DISCIPLINE"), "{}", r.stdout);
+
+    // Second prompt, same session: perturn (registered first) goes silent —
+    // its content was already delivered — and traits (registered second, so
+    // its output lands LAST) carries only the one-line provenance tail.
+    let r = perturn("s1");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.trim().is_empty(), "perturn should be silent on turn 2: {}", r.stdout);
+    let r = traits("s1");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("End your reply with the provenance tag"), "{}", r.stdout);
+    assert!(!r.stdout.contains("EVIDENCE_CAPTURE_DISCIPLINE"), "full curriculum must not repeat: {}", r.stdout);
+    assert!(r.stdout.len() < 300, "the tail should be small: {} bytes: {}", r.stdout.len(), r.stdout);
+
+    // A new session gets the full curriculum again from both hooks.
+    let r = perturn("s2");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("PER-TURN BRAIM LOGGING"), "{}", r.stdout);
+    let r = traits("s2");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("EVIDENCE_CAPTURE_DISCIPLINE"), "{}", r.stdout);
+}
+
+#[test]
+fn perturn_full_curriculum_adds_the_claude_md_standing_instruction_only_when_absent() {
+    let s = Scratch::new("claudemd");
+    let data = s.sub("store");
+    let root = s.sub("repo");
+    let bin = install_stub(&s.path().join("bin"));
+    seed(&data, &root, &bin);
+
+    let r = braim(&data, &["policy", "perturn"], Some(&prompt_payload("s1", &root)), &root, Some(&bin), &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("Per-turn provenance close"), "{}", r.stdout);
+
+    // A CLAUDE.md that already mentions braim: the standing-instruction text
+    // is not folded in a second time.
+    fs::write(root.join("CLAUDE.md"), "# Project\n\nSee braim for provenance.\n").unwrap();
+    let r = braim(&data, &["policy", "perturn"], Some(&prompt_payload("s2", &root)), &root, Some(&bin), &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!r.stdout.contains("Per-turn provenance close"), "{}", r.stdout);
 }

@@ -47,6 +47,24 @@ braim dream candidates --limit <N> --json         # the worklist
 braim dream candidates --strategy semantic --json # highest precision first
 ```
 
+Before any of the writes below, snapshot the graph — none of dreaming's allowed
+mutations (`merge-nodes`, `statement contradict`, `update-weights`, the
+`why-test`/`why-add` pair) have an undo, and state loss in this project has
+already happened once, in a rehearsal reset that removed a `.braim` directory's
+checkpoints outright (braim ID:532):
+
+```bash
+cp .braim/current.json .braim/current.json.dream-$(date -u +%Y%m%dT%H%M%SZ).bak
+```
+
+A cheap `cp`, not a substitute for the dream ledger or the review queue — it
+only exists so a bad `merge-nodes` call is a restore away from undone instead of
+a report-and-hope.
+
+`--domains <list>` on `dream candidates` restricts the worklist to nodes
+carrying at least one of those domains — use it to spend a whole session on one
+subsystem instead of skimming candidates across the entire graph.
+
 What each audit section is worth to a session:
 
 | section | use it for |
@@ -164,10 +182,19 @@ If either command fails, the node was merged away earlier in this session.
 Record `no-relation` with a note saying so, and move on.
 
 **2. Read the cited sources — actually open them.**
-Every node lists `Sources`. Open the files and line ranges with Read/Grep. This
-is the step that separates a verdict from a guess, and it is where the overnight
-tokens should go. A node label is a pointer, not evidence: if the label and the
-source document disagree, the document wins.
+Every node lists `Sources`. This is the step that separates a verdict from a
+guess, and it is where the overnight tokens should go — which is exactly why it
+should not come from a fresh spawn per pair. Delegate it to the same standing
+`dream-probe` used for audit-rot clearing below: spawn ONE at the start of the
+session (haiku is enough — this is open-the-file-and-quote work, not judgement)
+and message it per pair instead of spawning one per pair. A spawn costs ~42.6k
+tokens, a follow-up message ~681 (see "Clearing the audit-rot queue" for where
+that ratio was measured) — on a 15-pair session that is the difference between
+one spawn plus 15 follow-ups and 15 spawns. The probe quotes what the cited
+files actually say; steps 3 onward, where the verdict gets decided, stay with
+you. A node label is a pointer, not evidence: if the label and the source
+document disagree, the document wins — and "NOT FOUND" from the probe is
+itself a finding, not a failed lookup.
 
 **3. Name the obvious — then discard it.**
 State the shallowest shared category in one line and mark it rejected:
@@ -861,10 +888,11 @@ file only when the symbol is a function that is genuinely gone.
 
 **Delegate the gathering, never the deciding.** Step 2 is open-the-file-and-quote
 work: mechanical, verifiable in one command, and carrying no authority over what
-the evidence means. Spawn ONE `dream-probe` (haiku) at the start of the session
-and message it per item rather than spawning per item — a spawn costs ~42.6k
-tokens, a follow-up message ~681. Steps 3 and 4 stay with you: they change the
-graph, so they belong to the tier that will be held to them.
+the evidence means. This is the same probe pair adjudication's own step 2 above
+already spawned — message it per item here too rather than spawning a second
+one; a spawn costs ~42.6k tokens, a follow-up message ~681. If this is the only
+pass a session runs, spawn the probe here instead. Steps 3 and 4 stay with you:
+they change the graph, so they belong to the tier that will be held to them.
 
 A probe returns quoted text and an `agree: yes|no|NOT FOUND`. If it reports
 NOT FOUND, that is evidence, not a failure to try — treat a missing citation as

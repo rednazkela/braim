@@ -48,7 +48,150 @@ fn wrap_hook_context(event: &str, body: &str) -> String {
             "additionalContext": body
         }
     });
-    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| body.to_string())
+    // Compact, not pretty: this is wire format for the hook harness to parse,
+    // never something a human reads directly, and the one-line provenance
+    // tail (item 2.2) is sized to the acceptance budget (<160 injected bytes)
+    // against the actual additionalContext payload, not an envelope padded
+    // with pretty-printing whitespace on top of it.
+    serde_json::to_string(&payload).unwrap_or_else(|_| body.to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Session-aware curriculum (item 2 of the provenance-reframing handoff).
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `perturn` and `traits` are both wired to UserPromptSubmit and used to emit
+// their FULL payload on every single prompt — the curriculum the model
+// actually needs once per session, repeated in full on every turn after.
+// Now each tracks, in the shared stop-gate state file (no new state
+// location — house rule), whether IT has already shown its full content
+// THIS session:
+//
+//   - first prompt of a session (or the tracked moment is older than the
+//     TTL): the full payload, plus (perturn only) the CLAUDE.md standing
+//     instruction text when the project's CLAUDE.md does not already
+//     mention braim.
+//   - every later prompt: perturn goes silent (its content was already
+//     delivered); traits emits just the one-line provenance tail. Since
+//     traits is the SECOND UserPromptSubmit hook in `install_hooks`'s
+//     wiring order, its output lands last — the recency-weighted position
+//     the tail needs.
+//
+// perturn and traits are tracked under separate keys
+// (`policy_full_at_<name>` / `policy_session_key_<name>`) so the two
+// commands — separate processes, invoked back to back — don't observe each
+// other's write and miscompute "first of session" for themselves.
+
+/// The one-line tail appendix A.4/item 2.2 specifies for every prompt after
+/// the first. Must be the LAST line injected — recency-weighted
+/// instruction-following forgets the tag exactly when it sits far from the
+/// generation point — which is why `traits`, not `perturn`, carries it: see
+/// the module-level note above on hook ordering.
+const PROVENANCE_TAIL: &str =
+    "End your reply with the provenance tag: [braim: logged N,M] for IDs a braim command printed this turn, or [braim: none].";
+
+/// Appendix A.4: the CLAUDE.md standing instruction, injected into the full
+/// `perturn` curriculum when the project's own CLAUDE.md doesn't already
+/// carry it — teaching the discipline even where the project hasn't (yet)
+/// written it down, rather than editing CLAUDE.md on the model's behalf.
+const CLAUDE_MD_STANDING_INSTRUCTION: &str = "Per-turn provenance close. This project keeps an engineering decision record in braim (a local CLI knowledge graph; `braim --help`). End every reply with one literal tag reporting what you RECORDED this turn: `[braim: logged N,M]` citing IDs that `braim statement add` / `braim concept add` printed back to you this turn, or `[braim: none]` (optionally `[braim: none: <why>]`) when the turn produced nothing worth recording — an honest and common outcome. Optional second clause when your reply leaned on stored nodes: `| audit: clean`, `| audit: K flagged <ids>`, or `| audit: skipped: <reason>`. The tag certifies actions taken in this session — nothing else. A Stop hook (registered in settings.json by the machine owner) checks the tag mechanically and will return your turn once if it is missing.";
+
+/// Default TTL for a tracked "full curriculum already shown" moment: mostly
+/// a safety net for the cwd+day fallback key (which already rotates daily on
+/// its own) and for unusually long-lived real session ids. Override with
+/// BRAIM_POLICY_TTL_SECS.
+fn policy_ttl_secs() -> i64 {
+    std::env::var("BRAIM_POLICY_TTL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(6 * 3600)
+}
+
+/// True when `cwd`'s CLAUDE.md is missing or doesn't mention braim at all —
+/// the signal item 2.1 uses to decide whether the standing-instruction text
+/// is worth including in the full curriculum.
+fn claude_md_lacks_braim_section(cwd: &Path) -> bool {
+    match fs::read_to_string(cwd.join("CLAUDE.md")) {
+        Ok(text) => !text.to_lowercase().contains("braim"),
+        Err(_) => true,
+    }
+}
+
+/// Reads and updates `policy_session_key_<which>` / `policy_full_at_<which>`
+/// in the shared stop-gate state file. Returns true exactly when THIS
+/// command, for THIS session key, should emit its full content — a new
+/// session key, or the last full-content moment is older than the TTL.
+/// Each call both decides and records: the field is always rewritten
+/// (to the current session key, and to `now` when the decision is "full"),
+/// so staleness never carries forward on its own.
+fn policy_is_first_turn(data_dir: &Path, which: &str, session_key: &str, now: i64) -> bool {
+    let path = crate::stop_gate::statefile_for(data_dir);
+    let mut v = crate::stop_gate::load_state_value(&path);
+    if !v.is_object() {
+        v = json!({});
+    }
+    let key_field = format!("policy_session_key_{}", which);
+    let at_field = format!("policy_full_at_{}", which);
+    let stored_key = v.get(&key_field).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let stored_at = v.get(&at_field).and_then(|x| x.as_i64()).unwrap_or(0);
+    let first = stored_key != session_key || (now - stored_at) > policy_ttl_secs();
+
+    let obj = v.as_object_mut().expect("just normalized to an object");
+    obj.insert(key_field, Value::String(session_key.to_string()));
+    if first {
+        obj.insert(at_field, json!(now));
+    }
+    crate::stop_gate::save_state_value(&path, &v);
+    first
+}
+
+/// `perturn`'s full body: the embedded JSON payload, with the CLAUDE.md
+/// standing instruction folded into `additionalContext` when the project
+/// lacks one. Falls back to the unmodified payload if the embedded JSON
+/// somehow fails to parse (it always has — see
+/// `perturn_payload_is_valid_json_for_the_hook`).
+fn perturn_full_body(cwd: &Path) -> String {
+    let mut v: Value = match serde_json::from_str(PERTURN) {
+        Ok(v) => v,
+        Err(_) => return PERTURN.to_string(),
+    };
+    if claude_md_lacks_braim_section(cwd) {
+        if let Some(ctx) = v["hookSpecificOutput"]["additionalContext"].as_str() {
+            let combined = format!("{}\n\n{}", ctx, CLAUDE_MD_STANDING_INSTRUCTION);
+            v["hookSpecificOutput"]["additionalContext"] = Value::String(combined);
+        }
+    }
+    serde_json::to_string(&v).unwrap_or_else(|_| PERTURN.to_string())
+}
+
+/// The real entry point the `braim policy` hooks (perturn, traits) call at
+/// runtime — session-aware, unlike `policy_body` above (kept as the pure,
+/// always-full accessor the unit tests and `compaction` use). `compaction`
+/// and any other name fall straight through to `policy_body`: only
+/// perturn/traits are subject to the per-session curriculum.
+pub fn policy_body_for_turn(
+    name: &str,
+    data_dir: &Path,
+    session_key: &str,
+    cwd: &Path,
+    now: i64,
+) -> Result<String, String> {
+    match name.trim().to_lowercase().replace('_', "-").as_str() {
+        "perturn" | "per-turn" | "logging" => {
+            if policy_is_first_turn(data_dir, "perturn", session_key, now) {
+                Ok(perturn_full_body(cwd))
+            } else {
+                // Already delivered this session; `traits` (registered
+                // second) carries the recurring one-line tail instead.
+                Ok(String::new())
+            }
+        }
+        "traits" | "memory" => {
+            if policy_is_first_turn(data_dir, "traits", session_key, now) {
+                Ok(wrap_hook_context("UserPromptSubmit", TRAITS))
+            } else {
+                Ok(wrap_hook_context("UserPromptSubmit", PROVENANCE_TAIL))
+            }
+        }
+        _ => policy_body(name),
+    }
 }
 
 #[derive(Debug, PartialEq)]

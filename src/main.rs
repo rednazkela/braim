@@ -594,6 +594,8 @@ enum DreamCommands {
         include_scratch: bool,
         #[arg(long, help = "Reconsider pairs already recorded in the dream ledger")]
         replay: bool,
+        #[arg(long, help = "Comma-separated: restrict candidate generation to nodes carrying at least one of these domains")]
+        domains: Option<String>,
         #[arg(long, help = "Emit JSON for an agent loop to consume")]
         json: bool,
     },
@@ -2352,6 +2354,7 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             min_semantic,
             include_scratch,
             replay,
+            domains,
             json,
         }) => {
             if let Err(e) = dream::refuse_if_central(&braim.data_dir) {
@@ -2374,11 +2377,21 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                     out
                 }
             };
+            let domains: Vec<String> = domains
+                .as_deref()
+                .map(|list| {
+                    list.split(',')
+                        .map(|d| d.trim().to_string())
+                        .filter(|d| !d.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             let opts = DreamOptions {
                 min_semantic: min_semantic.unwrap_or(dream::DEFAULT_MIN_SEMANTIC),
                 limit,
                 include_scratch,
                 replay,
+                domains,
                 strategies: strategies.clone(),
             };
             let semantic_pairs = if strategies.contains(&Strategy::Semantic) {
@@ -2634,9 +2647,31 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             }
         }
         Commands::Policy { name } => {
-            match bootstrap::policy_body(&name) {
+            // perturn/traits are session-aware (braim ID: provenance
+            // reframing item 2): read the UserPromptSubmit hook payload from
+            // stdin for `session_id` and `cwd` when the harness supplies one.
+            // No payload at all (e.g. a human running `braim policy traits`
+            // directly) degrades gracefully to the cwd+day fallback key,
+            // which still yields a sensible "first of day" full emission.
+            use std::io::Read as _;
+            let mut input = String::new();
+            let _ = std::io::stdin().read_to_string(&mut input);
+            let payload: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+            let hook_cwd = payload.get("cwd").and_then(|v| v.as_str()).map(std::path::PathBuf::from);
+            let cwd = hook_cwd.or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| std::path::PathBuf::from("."));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let session_key = match payload.get("session_id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => format!("{}:{}", cwd.display(), chrono::Utc::now().format("%Y-%m-%d")),
+            };
+            match bootstrap::policy_body_for_turn(&name, &braim.data_dir, &session_key, &cwd, now) {
                 Ok(body) => {
-                    println!("{}", body);
+                    if !body.is_empty() {
+                        println!("{}", body);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),

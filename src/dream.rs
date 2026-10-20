@@ -1221,6 +1221,9 @@ pub struct DreamOptions {
     pub include_scratch: bool,
     /// Re-dream pairs already in the ledger.
     pub replay: bool,
+    /// Restrict candidate generation to nodes carrying at least one of these
+    /// domains. Empty = no restriction (the historical default).
+    pub domains: Vec<String>,
 }
 
 /// Build the ranked worklist. Pure read: never mutates the graph.
@@ -1229,7 +1232,15 @@ pub fn candidates(
     opts: &DreamOptions,
     semantic_pairs: &[(u32, u32, f32)],
 ) -> Vec<Candidate> {
-    let elig_vec = eligible(braim, opts.include_scratch);
+    let mut elig_vec = eligible(braim, opts.include_scratch);
+    if !opts.domains.is_empty() {
+        elig_vec.retain(|id| {
+            braim.state.nodes[id]
+                .domains
+                .iter()
+                .any(|d| opts.domains.contains(d))
+        });
+    }
     let elig: HashSet<u32> = elig_vec.iter().copied().collect();
     let adj = adjacency(braim, &elig);
 
@@ -1448,6 +1459,7 @@ mod tests {
             min_semantic: DEFAULT_MIN_SEMANTIC,
             include_scratch: false,
             replay: false,
+            domains: Vec::new(),
         }
     }
 
@@ -1964,6 +1976,28 @@ mod tests {
         with_scratch.include_scratch = true;
         assert_eq!(candidates(&b, &with_scratch, &[]).len(), 1, "--include-scratch overrides");
         let _ = a;
+    }
+
+    #[test]
+    fn a_domain_filter_restricts_candidates_to_that_domain() {
+        let mut b = temp("domain_filter");
+        b.add_concept("Alpha: first", vec!["d1".into()], vec!["code:one.rs:1".into()], None).unwrap();
+        b.add_concept("Beta: second", vec!["d1".into()], vec!["code:one.rs:1".into()], None).unwrap();
+        b.add_concept("Gamma: third", vec!["d2".into()], vec!["code:two.rs:1".into()], None).unwrap();
+        b.add_concept("Delta: fourth", vec!["d2".into()], vec!["code:two.rs:1".into()], None).unwrap();
+
+        assert_eq!(
+            candidates(&b, &opts(vec![Strategy::SharedSource]), &[]).len(),
+            2,
+            "no filter sees both domains' pairs"
+        );
+
+        let mut d1_only = opts(vec![Strategy::SharedSource]);
+        d1_only.domains = vec!["d1".into()];
+        let found = candidates(&b, &d1_only, &[]);
+        assert_eq!(found.len(), 1, "--domains d1 excludes the d2 pair");
+        assert!(found[0].a_domains.contains(&"d1".to_string()));
+        assert!(found[0].b_domains.contains(&"d1".to_string()));
     }
 
     #[test]
