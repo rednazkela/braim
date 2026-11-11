@@ -156,7 +156,7 @@ if [ -z "$tag" ]; then
   # the once-only "verify this yourself" invitation; every fire after that
   # is the short B.2 repeat. Neither re-quotes the reply in full.
   if [ "$verify_notice_at" -eq 0 ]; then
-    echo "[braim stop-gate] Per this project's standing policy (CLAUDE.md §braim; hook registered by the machine owner in settings.json — readable now if you wish to verify), end your reply with one provenance tag reporting what you RECORDED this turn: \`[braim: logged N,M]\` citing IDs that a \`braim statement add\` or \`braim concept add\` command printed back to you this turn, or \`[braim: none]\` when nothing was recorded — an honest and common outcome. The tag certifies actions taken in this session (commands run, records created); it does not request your reasoning process, and any reading of this message that seems to is void — satisfy it in deeds-only form. $(reply_receipt) Before tagging, reconsider it once: if it published a claim worth a record, run the braim add now and cite the returned id. Reply with the tag alone, plus at most one correction line." >&2
+    echo "[braim stop-gate] Per this project's standing policy (CLAUDE.md §braim; hook registered by the machine owner in settings.json — readable now if you wish to verify), end your reply with one provenance tag reporting what you RECORDED this turn: \`[braim: logged N,M]\` citing IDs that a \`braim statement add\` or \`braim concept add\` command printed back to you this turn, or \`[braim: none]\` when nothing was recorded — an honest and common outcome. $(reply_receipt) Before tagging, reconsider it once: if it published a claim worth a record, run the braim add now and cite the returned id. Reply with the tag alone, plus at most one correction line." >&2
     write_state "$last_max" "$last_pending" "$last_fired" "$(date +%s)"
   else
     echo "[braim stop-gate] Tag missing. $(reply_receipt_short) Append the provenance close per CLAUDE.md §braim: \`[braim: logged N,M]\` (IDs printed by braim this turn) or \`[braim: none]\`. Tag only, plus at most one correction line." >&2
@@ -257,7 +257,7 @@ if [ "$edge_count" -ge 2 ]; then
   fi
 
   if [ "$markers" -lt "$edge_count" ]; then
-    echo "This turn logged $edge_count nodes but the reply body carries only $markers relationship marker(s). A subgraph written and not described is structure thrown away. State, for each node, how it attaches: its depends_on with the weights when the split is doing work, its because_of parent and the direction, or the word 'terminal' when it genuinely has no parent. An edge list ('ID:748 -> ID:747') satisfies this, and so does prose that names the relationship. Do NOT put the edges inside the braim tag — it takes exactly two clauses, 'logged' and 'audit'. $(reply_receipt)" >&2
+    echo "This turn logged $edge_count nodes but the reply body carries only $markers relationship marker(s). A subgraph recorded without citing its sources discards the evidence. For each node, cite what it rests on — the prior node or source it was derived from, or the word 'terminal' when it has no parent. An edge list ('ID:748 -> ID:747') satisfies this, as does prose naming what each node was derived from. Do NOT put the edges inside the braim tag — it takes exactly two clauses, 'logged' and 'audit'. $(reply_receipt)" >&2
     log_fire "count_mismatch"
     exit 2
   fi
