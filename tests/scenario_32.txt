@@ -1,0 +1,28 @@
+SCENARIO 32
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+The borrowing-block explanation on file has several steps chained together.
+One of them — the very bottom of the chain — was already thrown out earlier
+as recorded in error, so it no longer needs a second look. Before deciding
+whether the rest of the explanation needs redoing too, find out which of the
+steps that ARE still standing the rest of the explanation leans on most
+heavily.
+
+Take a closer look at whichever step that turns out to be: what would be
+affected if it stopped holding, what larger question it was originally
+answering, and whether anything recorded since it was first written already
+speaks to whether it still holds up. If anything you find from this closer
+look isn't something you can write down as fact — including any guess about
+what would follow if the step were relaxed — mark it clearly as speculative
+rather than asserting it. If your look turns up a decision that isn't yours
+to make alone, leave a note about it for a human to weigh in on.
+
+Reply with: the command you used to rank the steps and its output (including
+whether the discarded bottom step appears in that ranking), the step you
+examined and the command you used to examine it, what it reported in each
+direction of the look, and the note (if any) you left for a human.

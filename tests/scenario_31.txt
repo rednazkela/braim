@@ -1,0 +1,26 @@
+SCENARIO 31
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Both library documents are fully captured in the graph now, added at
+different times by different people. Before anything new gets layered on
+top, do a sweep for anything that was recorded twice from two different
+angles — an idea captured once from the print side of the library and again,
+separately, from the digital side, without anyone noticing they're the same
+underlying thing.
+
+If the sweep turns up something promising, do not treat it as settled just
+because it looks right — record it as an open question for someone to check,
+not as an established fact, and make a note in the tool so the same pair
+isn't surfaced again from scratch next time someone looks. If the sweep
+turns up nothing worth pursuing, say so and record that outcome too.
+
+Reply with: the command you used to run the sweep and its output, the pair
+(if any) you judged worth a second look and why, what you recorded in the
+graph for it (and whether that entry is a settled fact or an open
+question), and the command you used to close the loop on this pair in the
+tool's own record of past sweeps.

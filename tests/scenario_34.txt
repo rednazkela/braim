@@ -1,0 +1,23 @@
+SCENARIO 34
+
+BEFORE YOU BEGIN
+  - Working directory: provided by operator (cd into it before any command).
+  - Mandatory first step: run `braim --help` and read its output completely.
+    braim's behavior is defined by that help text; do not rely on prior
+    assumptions about how the tool works.
+
+Some time has passed since the pair you flagged as an open question earlier
+was first looked at. Figure out whether it ever got confirmed one way or the
+other, and record your final call on it in the tool's own record of past
+sweeps — overwriting your earlier, tentative call rather than adding a
+second, separate one for the same pair.
+
+Then pull up that record of past sweeps and confirm your final call is in
+it. Finally, repeat the same kind of sweep you ran before and confirm the
+pair you just settled doesn't come back up unless you deliberately ask the
+tool to reconsider pairs it has already judged.
+
+Reply with: how you determined the final call, the command you used to
+record it, the command and output you used to confirm it's in the record,
+and the two sweep commands you ran at the end with their output — one that
+excludes your settled pair and one that deliberately brings it back.
