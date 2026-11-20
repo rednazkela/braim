@@ -13,8 +13,10 @@ mod embed;
 
 use clap::{Parser, Subcommand};
 use dream::{Candidate, DreamOptions, Strategy};
-use graph::{Braim, NodeType, AddSourceResult, VerificationStatus};
+use graph::{Braim, NodeType, AddSourceResult, VerificationStatus, StatementAddItem};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read as _;
 
 #[derive(Parser)]
 #[command(name = "braim")]
@@ -149,6 +151,9 @@ WORKFLOW:\n\
     --domains billing --sources \"code:refund.rs,doc:billing.md\" \\\n\
     --depends \"1:0.5,2:0.5\"\n\
   # → Status: PROVEN (2 PRIMARY types); --domains is free-count, 1 domain ok with 2 sources\n\n\
+  # Adding several statements in one call (one flush instead of one per statement)\n\
+  braim statement add-batch --json '[{\"text\": \"...\", \"domains\": \"billing\", \"sources\": \"code:a.rs,doc:b.md\", \"depends\": \"1:0.5,2:0.5\"}]'\n\
+  braim statement add-batch --file statements.json   # or a JSON array on disk / stdin ('-')\n\n\
   # Upgrade an unproven statement\n\
   braim statement verify-suggest 42\n\n\
   # Query\n\
@@ -204,7 +209,9 @@ FOR AGENTS:\n\
       — node labels are stable identity; put ranges in --sources metadata strings.\n\
     • Deleting and recreating a compound to change dependencies — use\n\
       'braim concept update-deps <id> --add/--remove/--set' to preserve node ID\n\
-      and all referencing statements.")]
+      and all referencing statements.\n\
+    • Calling 'statement add' once per statement when several are ready at once —\n\
+      'statement add-batch' takes a JSON array and writes them in one call.")]
 struct Cli {
     /// SIC ID:608 — the default ".braim" is RELATIVE, so the store silently
     /// follows the shell's cwd. On 2026-09-11 a `cd /home/magnimus/sonar &&`
@@ -466,7 +473,7 @@ enum ConceptCommands {
 
 #[derive(Subcommand)]
 enum StatementCommands {
-    #[command(about = "Add a statement linking concepts with evidence", long_about = "Statement Add: Create a claim linking concepts with verification sources.\n\nBasic statement with typed sources:\n  braim statement add \"Payment requires Invoice\" \\\n    --domains \"payment,payment\" --sources \"code:rules.rs,doc:spec.md\" \\\n    --depends \"1:0.5,2:0.5\"\n  → Status: PROVEN (2 PRIMARY sources: code + doc)\n\nStatement with SECONDARY (contextual) source:\n  braim statement add \"Security assumption\" \\\n    --domains payment --sources \"narrative:assumption\" \\\n    --depends \"1:1.0\"\n  → Status: UNPROVEN (0 PRIMARY sources, only narrative)\n\nInferred statement (derived, not independently verifiable):\n  braim statement add \"Card Payment implies Security\" \\\n    --depends \"1:1.0\" --inferred\n\nArguments:\n  text: The statement claim\n  --domains: Comma-separated domain tags (free count, no parity with sources or depends)\n  --sources: Comma-separated SOURCE_TYPE:location pairs (required, typed prefixes)\n  --depends: Concept IDs with weights (\"ID:weight,...\" must sum to 1.0)\n  --inferred: Mark as derived, not independently verifiable (uses 'inferred' source)\n  --assume: Skip validation checks\n  --strict-sources: Reject if sources contain duplicates or mix PRIMARY+TERTIARY (default: warn)\n  --strict-domains: Reject if domains contain duplicates (default: warn)\n\nSource Types (PRIMARY sources determine verification):\n  PRIMARY (independent evidence): code:, doc:, schema:, config:, transcript:, test:\n  SECONDARY (contextual): phase_N:, agent:, narrative:\n  TERTIARY (derived): logic:, inference:\n\nValidation Rules (enabled by default with warnings; use --strict-* to reject):\n  • Duplicate sources: Same source string appearing multiple times (e.g., doc:a.md,doc:a.md,doc:a.md).\n    Use distinct citations (line numbers, sections) for meaningful source diversity.\n    --strict-sources rejects; default warns and writes the statement.\n  \n  • PRIMARY+TERTIARY mix: Combining evidence (code:, doc:) with derivations (inference:, logic:) on\n    same statement. Muddies verification semantics. Prefer evidence-only sources here; record reasoning\n    separately via label or as dependent inference statement.\n    --strict-sources rejects; default warns and writes.\n  \n  • Duplicate domains: Same domain repeated (e.g., payment,payment,payment). Inflates\n    occurrence counts and obscures actual domain membership. Use distinct domains.\n    --strict-domains rejects; default warns and writes.\n  \n  • Gap register auto-clear: When statement depends on concepts A and B, any registered gap between\n    them is automatically removed. This heuristic may not reflect true semantic resolution—verify\n    connections are correct before relying on cleared gaps.\n\nVerification (auto-calculated from PRIMARY source count):\n  0 PRIMARY → ✗ UNPROVEN (claim, not trusted)\n  1 PRIMARY → ✓ PARTIAL (fact, use with caution)\n  2 PRIMARY (different types) → ✓✓ PROVEN (fact, verified)\n  3+ PRIMARY (different types) → ✓✓✓ PROVEN_STRONG (fact, strongly verified)\n\nNote: Verification status is capped by dependencies (inherits minimum of all depends_on).")]
+    #[command(about = "Add a statement linking concepts with evidence", long_about = "Statement Add: Create a claim linking concepts with verification sources.\n\nBasic statement with typed sources:\n  braim statement add \"Payment requires Invoice\" \\\n    --domains \"payment,payment\" --sources \"code:rules.rs,doc:spec.md\" \\\n    --depends \"1:0.5,2:0.5\"\n  → Status: PROVEN (2 PRIMARY sources: code + doc)\n\nStatement with SECONDARY (contextual) source:\n  braim statement add \"Security assumption\" \\\n    --domains payment --sources \"narrative:assumption\" \\\n    --depends \"1:1.0\"\n  → Status: UNPROVEN (0 PRIMARY sources, only narrative)\n\nInferred statement (derived, not independently verifiable):\n  braim statement add \"Card Payment implies Security\" \\\n    --depends \"1:1.0\" --inferred\n\nArguments:\n  text: The statement claim\n  --domains: Comma-separated domain tags (free count, no parity with sources or depends)\n  --sources: Comma-separated SOURCE_TYPE:location pairs (required, typed prefixes)\n  --depends: Concept IDs with weights (\"ID:weight,...\" must sum to 1.0)\n  --inferred: Mark as derived, not independently verifiable (uses 'inferred' source)\n  --assume: Skip validation checks\n  --strict-sources: Reject if sources contain duplicates or mix PRIMARY+TERTIARY (default: warn)\n  --strict-domains: Reject if domains contain duplicates (default: warn)\n\nSource Types (PRIMARY sources determine verification):\n  PRIMARY (independent evidence): code:, doc:, schema:, config:, transcript:, test:\n  SECONDARY (contextual): phase_N:, agent:, narrative:\n  TERTIARY (derived): logic:, inference:\n\nValidation Rules (enabled by default with warnings; use --strict-* to reject):\n  • Duplicate sources: Same source string appearing multiple times (e.g., doc:a.md,doc:a.md,doc:a.md).\n    Use distinct citations (line numbers, sections) for meaningful source diversity.\n    --strict-sources rejects; default warns and writes the statement.\n  \n  • PRIMARY+TERTIARY mix: Combining evidence (code:, doc:) with derivations (inference:, logic:) on\n    same statement. Muddies verification semantics. Prefer evidence-only sources here; record reasoning\n    separately via label or as dependent inference statement.\n    --strict-sources rejects; default warns and writes.\n  \n  • Duplicate domains: Same domain repeated (e.g., payment,payment,payment). Inflates\n    occurrence counts and obscures actual domain membership. Use distinct domains.\n    --strict-domains rejects; default warns and writes.\n  \n  • Gap register auto-clear: When statement depends on concepts A and B, any registered gap between\n    them is automatically removed. This heuristic may not reflect true semantic resolution—verify\n    connections are correct before relying on cleared gaps.\n\nVerification (auto-calculated from PRIMARY source count):\n  0 PRIMARY → ✗ UNPROVEN (claim, not trusted)\n  1 PRIMARY → ✓ PARTIAL (fact, use with caution)\n  2 PRIMARY (different types) → ✓✓ PROVEN (fact, verified)\n  3+ PRIMARY (different types) → ✓✓✓ PROVEN_STRONG (fact, strongly verified)\n\nNote: Verification status is capped by dependencies (inherits minimum of all depends_on).\n\nAdding several statements? See 'statement add-batch' — same validation per item, one flush for the whole batch instead of one per statement.")]
     Add {
         text: String,
         #[arg(long, help = "Comma-separated domains")]
@@ -487,6 +494,13 @@ enum StatementCommands {
         loose_label: bool,
         #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
+    },
+    #[command(name = "add-batch", about = "Add many statements in one call, flushing once", long_about = "Statement AddBatch: Add several statements per invocation instead of one 'statement add' per statement.\n\nSolves a turn-cap problem: an agent building out a graph section otherwise spends one full tool call per statement. This command runs the exact same per-item validation as 'statement add' (duplicate-source/domain checks, PRIMARY+TERTIARY mix, label-shape rules) on every item, but writes the graph to disk once at the end instead of once per statement.\n\nInput is a JSON array of objects, each with the same fields as 'statement add' flags:\n  text (required), domains (string, comma-separated), sources (string, comma-separated),\n  depends (required, \"ID:weight,ID:weight\"), inferred (bool), assume (bool),\n  strict_sources (bool), strict_domains (bool), loose_label (bool), check_dupes (bool).\nAll booleans default to false; domains/sources may be omitted only when inferred=true.\n\nUsage:\n  braim statement add-batch --file statements.json\n  braim statement add-batch --file -        # read the JSON array from stdin\n  braim statement add-batch --json '[{\"text\": \"...\", \"domains\": \"payment\", \"sources\": \"code:a.rs,doc:b.md\", \"depends\": \"1:0.5,2:0.5\"}]'\n\nExample file:\n  [\n    {\"text\": \"Payment requires Invoice\", \"domains\": \"payment,payment\", \"sources\": \"code:rules.rs,doc:spec.md\", \"depends\": \"1:0.5,2:0.5\"},\n    {\"text\": \"Card Payment implies Security\", \"depends\": \"1:1.0\", \"inferred\": true}\n  ]\n\nBehavior:\n  • Items are independent — one failing validation or graph error does not stop the rest.\n  • One line per item is printed, same format as 'statement add', prefixed with its\n    1-based position in the input array.\n  • A single flush persists every statement that succeeded, after the last item is\n    processed — not one flush per item.\n  • Exit code is non-zero if any item failed, even though the successful ones were\n    still written; the summary line names how many of each.")]
+    AddBatch {
+        #[arg(long, help = "Path to a JSON array of statement objects, or '-' for stdin", conflicts_with = "json")]
+        file: Option<String>,
+        #[arg(long, help = "Inline JSON array of statement objects", conflicts_with = "file")]
+        json: Option<String>,
     },
     #[command(about = "Add verification evidence for a statement", long_about = "Statement Verify: Record evidence that supports a statement.\n\n⚠ NOTE: Verification status is now AUTO-CALCULATED from typed sources at statement creation.\nThis command is maintained for backward compatibility but is rarely needed.\n\nModern approach (preferred):\n  braim statement add \"...\" --sources \"code:a.rs,doc:b.md\" ...\n  → Status auto-calculated to PROVEN (2 PRIMARY sources)\n\nLegacy approach (still supported):\n  braim statement verify 42 wikipedia --note \"https://en.wikipedia.org/wiki/Payment\"\n  braim statement verify 42 rfc --note \"RFC 3501 section 3.2\"\n\nOld Verification Levels (deprecated, kept for audit trail):\n  • 0-1 verified_by domains: Unproven\n  • 2 verified_by domains: Partial\n  • 3+ verified_by domains: Proven\n\nUse statement add with typed sources instead. Sources determine verification automatically.")]
     Verify {
@@ -727,6 +741,174 @@ fn parse_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(|item| item.trim().to_string())
         .collect()
+}
+
+/// One item of a 'statement add-batch' JSON array — same fields as the
+/// 'statement add' CLI flags, with the same defaults.
+#[derive(Deserialize)]
+struct StatementAddInput {
+    text: String,
+    domains: Option<String>,
+    sources: Option<String>,
+    depends: String,
+    #[serde(default)]
+    inferred: bool,
+    #[serde(default)]
+    assume: bool,
+    #[serde(default)]
+    strict_sources: bool,
+    #[serde(default)]
+    strict_domains: bool,
+    #[serde(default)]
+    loose_label: bool,
+    #[serde(default)]
+    check_dupes: bool,
+}
+
+/// Runs the same validation as a single 'statement add' call (inferred/
+/// sources exclusivity, duplicate-source and duplicate-domain checks,
+/// PRIMARY+TERTIARY mix, label-shape and unwired-reference rules) and
+/// builds a `StatementAddItem` ready for `Braim::add_statement` or
+/// `Braim::add_statements_batch`. Shared by both the single `Add` arm and
+/// `AddBatch` so a batched item is validated identically to a standalone
+/// call — same checks, same error text. Returns the built item plus
+/// whether it was `inferred` (only needed for the "inferred statement" vs
+/// "statement" wording when reporting the result).
+fn build_statement_item(
+    braim: &Braim,
+    data_dir: &str,
+    quiet: bool,
+    input: &StatementAddInput,
+) -> Result<(StatementAddItem, bool), String> {
+    if input.check_dupes {
+        dedup_warn(braim, data_dir, &input.text, quiet);
+    }
+    // Validation: inferred flag is mutually exclusive with explicit sources
+    if input.inferred && input.sources.is_some() {
+        return Err("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.".to_string());
+    }
+
+    // Validation: reject manual "inferred" as a source value
+    if !input.inferred && input.sources.is_some() {
+        let sources_str = input.sources.as_ref().unwrap();
+        if sources_str.contains("inferred") {
+            return Err("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.".to_string());
+        }
+    }
+
+    let depends_map = parse_depends(&input.depends)?;
+
+    // Set domains and sources based on inferred flag
+    let (domains_list, sources_list) = if input.inferred {
+        // For inferred statements, default domains to "computation" repeated for each dependency
+        let dep_count = depends_map.len();
+        let doms = input.domains.as_ref()
+            .map(|d| parse_list(d))
+            .unwrap_or_else(|| vec!["computation".to_string(); dep_count]);
+        let sources_vec = vec!["inferred".to_string(); dep_count];
+        (doms, sources_vec)
+    } else {
+        if input.domains.is_none() || input.sources.is_none() {
+            return Err("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.".to_string());
+        }
+        (parse_list(input.domains.as_ref().unwrap()), parse_list(input.sources.as_ref().unwrap()))
+    };
+
+    // Validate duplicate sources (Issue 1)
+    if !input.inferred {
+        let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
+        if has_dup_sources {
+            if input.strict_sources {
+                return Err("Error: duplicate source entries detected".to_string());
+            } else {
+                tips::emit_tip_duplicate_sources(&dup_sources, quiet);
+            }
+        }
+
+        // Validate PRIMARY+TERTIARY mix (Issue 2)
+        if Braim::validate_primary_tertiary_mix(&sources_list) {
+            if input.strict_sources {
+                return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
+            } else {
+                tips::emit_tip_primary_tertiary_mix(quiet);
+            }
+        }
+    }
+
+    // Validate duplicate domains (Issue 3)
+    let (has_dup_domains, dup_domain_counts) = Braim::validate_duplicate_domains(&domains_list);
+    if has_dup_domains {
+        if input.strict_domains {
+            return Err("Error: duplicate domain entries detected".to_string());
+        } else if braim.distinct_domain_count() > 1 {
+            // Suppress in single-domain graphs — uniform repetition is expected
+            tips::emit_tip_duplicate_domains(&dup_domain_counts, quiet);
+        }
+    }
+
+    // Label shape and unwired references (Issue 4) — ENFORCED BY DEFAULT.
+    {
+        let (chars, sentences, named) = Braim::validate_label_shape(&input.text);
+        let cap = if input.loose_label { 400 } else { 250 };
+
+        if sentences > 1 {
+            return Err(format!(
+                "Error: label carries {} sentences. A statement label states ONE claim — put the evidence in --sources and the reasoning in a dependent statement. --loose-label does NOT relax this.",
+                sentences
+            ));
+        }
+        if chars > cap {
+            return Err(format!(
+                "Error: label is {} chars, over the {} limit.{}",
+                chars,
+                cap,
+                if input.loose_label {
+                    " Already using --loose-label; the claim needs splitting, not more room."
+                } else {
+                    " If the single sentence genuinely will not fit, --loose-label raises the cap to 400 — last resort, not routine."
+                }
+            ));
+        }
+        if !named.is_empty() {
+            let list = named
+                .iter()
+                .map(|id| format!("ID:{}", id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let missing: Vec<u32> = named
+                .iter()
+                .copied()
+                .filter(|id| !depends_map.contains_key(id))
+                .collect();
+            return Err(format!(
+                "Error: label names [{}]. A node id belongs in --depends, never in the label — the edge is the reference, and repeating it in prose makes a relationship the graph cannot traverse, weight or contradict. Rewrite the sentence to name the thing rather than its id{}. --loose-label does NOT relax this.",
+                list,
+                if missing.is_empty() {
+                    String::from("; all of them are already dependencies")
+                } else {
+                    format!(
+                        ", and add {} to --depends",
+                        missing
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            ));
+        }
+    }
+
+    Ok((
+        StatementAddItem {
+            text: input.text.clone(),
+            domains: domains_list,
+            sources: sources_list,
+            depends_on: depends_map,
+            assume: input.assume,
+        },
+        input.inferred,
+    ))
 }
 
 fn get_node_symbol(node_type: &NodeType) -> &'static str {
@@ -1035,138 +1217,26 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             loose_label,
             check_dupes,
         }) => {
-            if check_dupes {
-                dedup_warn(&braim, &cli.data_dir, &text, cli.quiet);
-            }
-            // Validation: inferred flag is mutually exclusive with explicit sources
-            if inferred && sources.is_some() {
-                return Err("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.".to_string());
-            }
-
-            // Validation: reject manual "inferred" as a source value
-            if !inferred && sources.is_some() {
-                let sources_str = sources.as_ref().unwrap();
-                if sources_str.contains("inferred") {
-                    return Err("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.".to_string());
-                }
-            }
-
-            let depends_map = match parse_depends(&depends) {
-                Ok(m) => m,
-                Err(e) => {
-                    return Err(format!("{}", e));
-                }
+            let input = StatementAddInput {
+                text,
+                domains,
+                sources,
+                depends,
+                inferred,
+                assume,
+                strict_sources,
+                strict_domains,
+                loose_label,
+                check_dupes,
             };
+            let (item, inferred) = build_statement_item(&braim, &cli.data_dir, cli.quiet, &input)?;
 
-            // Set domains and sources based on inferred flag
-            let (domains_list, sources_list) = if inferred {
-                // For inferred statements, default domains to "computation" repeated for each dependency
-                let dep_count = depends_map.len();
-                let doms = domains.as_ref()
-                    .map(|d| parse_list(d))
-                    .unwrap_or_else(|| vec!["computation".to_string(); dep_count]);
-                let sources_vec = vec!["inferred".to_string(); dep_count];
-                (doms, sources_vec)
-            } else {
-                if domains.is_none() || sources.is_none() {
-                    return Err("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.".to_string());
-                }
-                (parse_list(domains.as_ref().unwrap()), parse_list(sources.as_ref().unwrap()))
-            };
-
-            // Validate duplicate sources (Issue 1)
-            if !inferred {
-                let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
-                if has_dup_sources {
-                    if strict_sources {
-                        return Err("Error: duplicate source entries detected".to_string());
-                    } else {
-                        tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
-                    }
-                }
-
-                // Validate PRIMARY+TERTIARY mix (Issue 2)
-                if Braim::validate_primary_tertiary_mix(&sources_list) {
-                    if strict_sources {
-                        return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
-                    } else {
-                        tips::emit_tip_primary_tertiary_mix(cli.quiet);
-                    }
-                }
-            }
-
-            // Validate duplicate domains (Issue 3)
-            let (has_dup_domains, dup_domain_counts) = Braim::validate_duplicate_domains(&domains_list);
-            if has_dup_domains {
-                if strict_domains {
-                    return Err("Error: duplicate domain entries detected".to_string());
-                } else if braim.distinct_domain_count() > 1 {
-                    // Suppress in single-domain graphs — uniform repetition is expected
-                    tips::emit_tip_duplicate_domains(&dup_domain_counts, cli.quiet);
-                }
-            }
-
-            // Label shape and unwired references (Issue 4) — ENFORCED BY DEFAULT.
-            // Limits are this graph's own founding convention over 461 single-sentence
-            // statements: p90 248 chars, p99 370, max 407 (braim ID:2396).
-            {
-                let (chars, sentences, named) = Braim::validate_label_shape(&text);
-                let cap = if loose_label { 400 } else { 250 };
-
-                if sentences > 1 {
-                    return Err(format!(
-                        "Error: label carries {} sentences. A statement label states ONE claim — put the evidence in --sources and the reasoning in a dependent statement. --loose-label does NOT relax this.",
-                        sentences
-                    ));
-                }
-                if chars > cap {
-                    return Err(format!(
-                        "Error: label is {} chars, over the {} limit.{}",
-                        chars,
-                        cap,
-                        if loose_label {
-                            " Already using --loose-label; the claim needs splitting, not more room."
-                        } else {
-                            " If the single sentence genuinely will not fit, --loose-label raises the cap to 400 — last resort, not routine."
-                        }
-                    ));
-                }
-                if !named.is_empty() {
-                    let list = named
-                        .iter()
-                        .map(|id| format!("ID:{}", id))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let missing: Vec<u32> = named
-                        .iter()
-                        .copied()
-                        .filter(|id| !depends_map.contains_key(id))
-                        .collect();
-                    return Err(format!(
-                        "Error: label names [{}]. A node id belongs in --depends, never in the label — the edge is the reference, and repeating it in prose makes a relationship the graph cannot traverse, weight or contradict. Rewrite the sentence to name the thing rather than its id{}. --loose-label does NOT relax this.",
-                        list,
-                        if missing.is_empty() {
-                            String::from("; all of them are already dependencies")
-                        } else {
-                            format!(
-                                ", and add {} to --depends",
-                                missing
-                                    .iter()
-                                    .map(|id| id.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        }
-                    ));
-                }
-            }
-
-            match braim.add_statement(&text, domains_list.clone(), sources_list.clone(), depends_map, assume) {
+            match braim.add_statement(&item.text, item.domains.clone(), item.sources.clone(), item.depends_on, item.assume) {
                 Ok(id) => {
                     let node = &braim.state.nodes[&id];
                     let stmt_type = if inferred { "inferred statement" } else { "statement" };
                     println!("✓ {} added", stmt_type);
-                    println!("  ID:{}  domains: {:?}  sources: {:?}  {}", id, domains_list, sources_list, text);
+                    println!("  ID:{}  domains: {:?}  sources: {:?}  {}", id, item.domains, item.sources, item.text);
                     print!("  depends_on: {{");
                     let mut first = true;
                     for (dep_id, weight) in &node.depends_on {
@@ -1181,6 +1251,104 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                     Ok(())
                 }
                 Err(e) => Err(e.to_string()),
+            }
+        }
+        Commands::Statement(StatementCommands::AddBatch { file, json }) => {
+            let raw = match (file, json) {
+                (Some(path), None) => {
+                    if path == "-" {
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .map_err(|e| format!("Error: failed to read stdin: {}", e))?;
+                        buf
+                    } else {
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| format!("Error: failed to read {}: {}", path, e))?
+                    }
+                }
+                (None, Some(inline)) => inline,
+                (None, None) => {
+                    return Err("Error: provide --file <path|-> or --json '<array>'".to_string());
+                }
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with rules out --file and --json together"),
+            };
+
+            let inputs: Vec<StatementAddInput> = serde_json::from_str(&raw)
+                .map_err(|e| format!("Error: input must be a JSON array of statement objects: {}", e))?;
+
+            if inputs.is_empty() {
+                return Err("Error: input array is empty — nothing to add".to_string());
+            }
+
+            // Validate every item first, independently of the others; only
+            // the items that pass go to the graph, in the same order.
+            let mut validated: Vec<Option<(StatementAddItem, bool)>> = Vec::with_capacity(inputs.len());
+            let mut validation_errors: Vec<Option<String>> = Vec::with_capacity(inputs.len());
+            for input in &inputs {
+                match build_statement_item(&braim, &cli.data_dir, cli.quiet, input) {
+                    Ok(built) => {
+                        validated.push(Some(built));
+                        validation_errors.push(None);
+                    }
+                    Err(e) => {
+                        validated.push(None);
+                        validation_errors.push(Some(e));
+                    }
+                }
+            }
+
+            let batch_items: Vec<StatementAddItem> = validated
+                .iter()
+                .filter_map(|v| v.as_ref().map(|(item, _)| item.clone()))
+                .collect();
+            let mut batch_results = braim.add_statements_batch(batch_items).into_iter();
+
+            let mut added = 0usize;
+            let mut failed = 0usize;
+            for (i, slot) in validated.iter().enumerate() {
+                let pos = i + 1;
+                match slot {
+                    None => {
+                        failed += 1;
+                        println!("✗ [{}] {}", pos, validation_errors[i].as_ref().unwrap());
+                    }
+                    Some((item, item_inferred)) => {
+                        match batch_results.next().expect("one batch result per validated item") {
+                            Ok(id) => {
+                                added += 1;
+                                let node = &braim.state.nodes[&id];
+                                let stmt_type = if *item_inferred { "inferred statement" } else { "statement" };
+                                println!("✓ [{}] {} added", pos, stmt_type);
+                                println!("    ID:{}  domains: {:?}  sources: {:?}  {}", id, item.domains, item.sources, item.text);
+                                print!("    depends_on: {{");
+                                let mut first = true;
+                                for (dep_id, weight) in &node.depends_on {
+                                    if !first {
+                                        print!(", ");
+                                    }
+                                    print!("{}: {}", dep_id, weight);
+                                    first = false;
+                                }
+                                println!("}}");
+                                tips::emit_tip_statement_add(node, &braim, cli.quiet);
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                println!("✗ [{}] {}", pos, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!("---");
+            println!("{} added, {} failed, {} total", added, failed, inputs.len());
+
+            if failed > 0 {
+                Err(format!("{} of {} statement(s) failed — see per-item output above", failed, inputs.len()))
+            } else {
+                Ok(())
             }
         }
         Commands::Statement(StatementCommands::Verify { statement_id, domain, note }) => {

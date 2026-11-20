@@ -361,6 +361,18 @@ impl From<GraphError> for String {
     }
 }
 
+/// One statement to add as part of `Braim::add_statements_batch`. Mirrors
+/// the parameters of `add_statement` — already-parsed and already-validated
+/// at the CLI layer, same as a single `statement add` call.
+#[derive(Debug, Clone)]
+pub struct StatementAddItem {
+    pub text: String,
+    pub domains: Vec<String>,
+    pub sources: Vec<String>,
+    pub depends_on: HashMap<u32, f64>,
+    pub assume: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Node {
     pub id: u32,
@@ -2833,6 +2845,66 @@ impl Braim {
         depends_on: HashMap<u32, f64>,
         assume: bool,
     ) -> Result<u32, GraphError> {
+        let id = self.add_statement_no_flush(text, domains, sources, depends_on, assume)?;
+        self.flush()?;
+        Ok(id)
+    }
+
+    /// Add many statements in one call, flushing to disk once at the end
+    /// instead of once per statement — a single `add_statement` flush
+    /// rewrites the whole graph file (or every touched domain shard), so
+    /// doing that N times to add N statements is O(N * graph size) of
+    /// disk I/O for work that only needs O(graph size) once.
+    ///
+    /// Items are independent: one failing does not stop the rest. Returns
+    /// one `Result` per input item, in the same order. If at least one item
+    /// succeeded but the final flush itself fails, every success in the
+    /// returned vector is replaced with that flush error — the node is
+    /// already in memory, but no caller can rely on "Ok" meaning "on disk"
+    /// if the one flush that was supposed to persist it did not happen.
+    pub fn add_statements_batch(
+        &mut self,
+        items: Vec<StatementAddItem>,
+    ) -> Vec<Result<u32, GraphError>> {
+        let mut results = Vec::with_capacity(items.len());
+        let mut any_ok = false;
+        for item in items {
+            match self.add_statement_no_flush(
+                &item.text,
+                item.domains,
+                item.sources,
+                item.depends_on,
+                item.assume,
+            ) {
+                Ok(id) => {
+                    any_ok = true;
+                    results.push(Ok(id));
+                }
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        if any_ok {
+            if let Err(e) = self.flush() {
+                let flush_err = GraphError::Other(e);
+                for r in results.iter_mut() {
+                    if r.is_ok() {
+                        *r = Err(flush_err.clone());
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Core of `add_statement`, without the flush — see `add_statements_batch`.
+    fn add_statement_no_flush(
+        &mut self,
+        text: &str,
+        domains: Vec<String>,
+        sources: Vec<String>,
+        depends_on: HashMap<u32, f64>,
+        assume: bool,
+    ) -> Result<u32, GraphError> {
         if depends_on.is_empty() {
             return Err(GraphError::StatementNoDependency);
         }
@@ -2946,7 +3018,6 @@ impl Braim {
         let new_statement_deps: Vec<u32> = depends_on.keys().cloned().collect();
         self.clear_gaps_for_deps(&new_statement_deps);
 
-        self.flush()?;
         Ok(id)
     }
 
@@ -5284,6 +5355,75 @@ impl Braim {
             None => self.flush()?,
         }
         Ok(repairs)
+    }
+}
+
+#[cfg(test)]
+mod statement_batch_tests {
+    use super::*;
+
+    fn temp_braim(name: &str) -> Braim {
+        let dir = std::env::temp_dir().join(format!("braim_batch_test_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Braim::new(dir.to_str().unwrap()).unwrap()
+    }
+
+    fn two_concepts(b: &mut Braim) -> (u32, u32) {
+        let a = b.add_concept("Alpha: first concept", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second concept", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        (a, c)
+    }
+
+    fn item(text: &str, dep: u32) -> StatementAddItem {
+        StatementAddItem {
+            text: text.to_string(),
+            domains: vec!["t".into()],
+            sources: vec!["narrative:claim".into()],
+            depends_on: HashMap::from([(dep, 1.0)]),
+            assume: true,
+        }
+    }
+
+    #[test]
+    fn all_items_land_in_order_with_one_flush() {
+        let mut b = temp_braim("all_ok");
+        let (a, _c) = two_concepts(&mut b);
+        let items = vec![item("first claim", a), item("second claim", a), item("third claim", a)];
+        let results = b.add_statements_batch(items);
+        let ids: Vec<u32> = results.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids assigned in input order: {ids:?}");
+
+        // Reopen from disk — a fresh load only sees what the single flush wrote.
+        let reopened = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        for id in &ids {
+            assert_eq!(reopened.state.nodes[id].label, b.state.nodes[id].label);
+        }
+    }
+
+    #[test]
+    fn one_failing_item_does_not_block_the_others() {
+        let mut b = temp_braim("partial_fail");
+        let (a, _c) = two_concepts(&mut b);
+        let mut bad = item("broken weights", a);
+        bad.depends_on = HashMap::from([(a, 0.4)]); // does not sum to 1.0
+        let items = vec![item("ok before", a), bad, item("ok after", a)];
+        let results = b.add_statements_batch(items);
+
+        assert!(results[0].is_ok(), "first item should succeed");
+        assert!(matches!(results[1], Err(GraphError::WeightsNotOne(_))), "{:?}", results[1]);
+        assert!(results[2].is_ok(), "third item should succeed despite the second failing");
+
+        // The surviving two were still flushed to disk.
+        let reopened = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.state.nodes.len(), b.state.nodes.len());
+    }
+
+    #[test]
+    fn empty_batch_is_a_no_op() {
+        let mut b = temp_braim("empty");
+        let results = b.add_statements_batch(Vec::new());
+        assert!(results.is_empty());
     }
 }
 

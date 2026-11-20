@@ -59,12 +59,12 @@ Serves high-quality context to an LLM with an agent-agnostic, multi-source, cros
 ```text
 concept    add | delete | update-weights |      atomics + compounds
            update-deps
-statement  add | verify | verify-suggest |      claims/facts lifecycle
-           add-source | delete-source |
-           update-sources | contradict |
-           resolve-contradiction | invalidate |
-           revalidate | update-weights |
-           update-deps | delete
+statement  add | add-batch | verify |           claims/facts lifecycle
+           verify-suggest | add-source |
+           delete-source | update-sources |
+           contradict | resolve-contradiction |
+           invalidate | revalidate |
+           update-weights | update-deps | delete
 source     add                                  first-class source entities
 lookup | query | proximity | perspective        discovery and navigation
 why-add | why | why-test | why-remove           causal chains (because_of, Five Whys)
@@ -99,6 +99,20 @@ braim statement add "Payment requires Invoice" \
 ```
 
 @[Statement text mentioning adjacent concept names is validated: if a matching compound exists but is absent from --depends the write errors; if no compound exists braim suggests one; --assume bypasses] source: braim statement add --help + code:src/graph.rs validate_statement_concepts
+
+### Adding many statements at once
+
+```bash
+braim statement add-batch --file statements.json   # JSON array; '-' reads stdin instead
+braim statement add-batch --json '[
+  {"text": "Payment requires Invoice", "domains": "payment", "sources": "code:rules.rs:14,doc:spec.md:3", "depends": "1:0.7,3:0.3"},
+  {"text": "Card Payment implies Security", "depends": "1:1.0", "inferred": true}
+]'
+```
+
+@[Each item runs the same validation as a single 'statement add' call (duplicate-source/domain checks, PRIMARY+TERTIARY mix, label-shape rules); one item failing does not stop the rest, and the graph flushes once for the whole batch instead of once per statement] source: code:src/main.rs build_statement_item, code:src/graph.rs add_statements_batch
+
+@[Exit code is non-zero if any item failed even though the items that passed were still written — the printed summary line names how many of each] source: braim statement add-batch --help
 
 ### Verifying and resolving
 
