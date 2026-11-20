@@ -13,7 +13,7 @@ mod embed;
 
 use clap::{Parser, Subcommand};
 use dream::{Candidate, DreamOptions, Strategy};
-use graph::{Braim, NodeType, AddSourceResult, VerificationStatus, StatementAddItem};
+use graph::{Braim, NodeType, AddSourceResult, VerificationStatus, StatementAddItem, ConceptAddItem};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -151,7 +151,8 @@ WORKFLOW:\n\
     --domains billing --sources \"code:refund.rs,doc:billing.md\" \\\n\
     --depends \"1:0.5,2:0.5\"\n\
   # → Status: PROVEN (2 PRIMARY types); --domains is free-count, 1 domain ok with 2 sources\n\n\
-  # Adding several statements in one call (one flush instead of one per statement)\n\
+  # Adding several concepts or statements in one call (one flush instead of one per item)\n\
+  braim concept add-batch --json '[{\"term\": \"Refund: money returned to a payer\", \"domains\": \"billing\", \"sources\": \"code:refund.rs\"}]'\n\
   braim statement add-batch --json '[{\"text\": \"...\", \"domains\": \"billing\", \"sources\": \"code:a.rs,doc:b.md\", \"depends\": \"1:0.5,2:0.5\"}]'\n\
   braim statement add-batch --file statements.json   # or a JSON array on disk / stdin ('-')\n\n\
   # Upgrade an unproven statement\n\
@@ -210,8 +211,8 @@ FOR AGENTS:\n\
     • Deleting and recreating a compound to change dependencies — use\n\
       'braim concept update-deps <id> --add/--remove/--set' to preserve node ID\n\
       and all referencing statements.\n\
-    • Calling 'statement add' once per statement when several are ready at once —\n\
-      'statement add-batch' takes a JSON array and writes them in one call.")]
+    • Calling 'concept add' or 'statement add' once per item when several are ready at once —\n\
+      'concept add-batch' / 'statement add-batch' take a JSON array and write them in one call.")]
 struct Cli {
     /// SIC ID:608 — the default ".braim" is RELATIVE, so the store silently
     /// follows the shell's cwd. On 2026-09-11 a `cd /home/magnimus/sonar &&`
@@ -433,7 +434,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ConceptCommands {
-    #[command(about = "Add a new atomic or compound concept", long_about = "Concept Add: Create an atomic or compound concept.\n\nAtomic (base unit) — label MUST follow 'Concept: description' format:\n  braim concept add \"Payment: value transfer between two parties\" --domains payment --sources \"code:payment.rs\"\n  braim concept add \"Library: public institution that lends books\" --domains knowledge --sources \"doc:spec.md\"\n\nCompound (depends on 2+ atomics, with weights summing to 1.0; no format constraint on label):\n  braim concept add \"Credit Card Payment\" --domains payment --sources \"code:card.rs\" --depends \"1:0.6,2:0.4\"\n\nArguments:\n  term: For atomics: 'Concept: description' (e.g. 'Library: public lending institution').\n        For compounds: space-separated name, no snake_case.\n  --domains: Comma-separated domain tags (e.g., payment,finance)\n  --sources: Comma-separated SOURCE_TYPE:location pairs (REQUIRED prefix)\n  --depends: Optional dependencies for compounds (format: \"ID:weight,ID:weight\")\n  --strict-sources: Reject if sources contain duplicates or mix PRIMARY+TERTIARY types (default: warn)\n\nSource Types (verification calculated from PRIMARY sources):\n  PRIMARY: code:, doc:, schema:, config:, transcript:, test:\n  SECONDARY: phase_N:, agent:, narrative:\n  TERTIARY: logic:, inference:\n\nValidation Rules:\n  • Atomic labels must use 'Concept: description' format. Auto-normalized: missing or extra spaces\n    around the colon are fixed silently (e.g. 'Payment:transfer' → 'Payment: transfer').\n    Rejected only when no colon is present or either side (name or description) is empty.\n    Enforces self-documenting nodes: the meaning is encoded in the label, not in a separate statement.\n  • Duplicate sources (same string repeated) are allowed by default but warned.\n    Use --strict-sources to reject. Distinct citations (e.g., line numbers) preferred.\n  • Mixing PRIMARY evidence with TERTIARY derivations on same concept discouraged.\n    Use --strict-sources to reject; prefer keeping evidence separate from reasoning.\n  • Multi-word atomic names decomposable into existing atomics trigger hints.\n    Example: Adding \"Library Card: card granting borrowing rights\" when \"Library\" and \"Card\" exist → suggests compound form.\n\nExamples:\n  braim concept add \"Invoice: document requesting payment for goods or services\" --domains payment --sources \"doc:spec.md\"\n  braim concept add \"Fee: fixed charge applied for a service\" --domains payment --sources \"schema:tables.sql\"\n  braim concept add \"Credit Card: payment card linked to a revolving credit line\" --domains payment --sources \"code:card.rs,doc:card.md\"\n\nVerification Status (auto-calculated):\n  0 PRIMARY sources → unproven (not trusted)\n  1 PRIMARY source → partial (use with caution)\n  2 PRIMARY sources → proven (verified)\n  3+ PRIMARY sources → proven_strong (strongly verified)\n\nWeight constraint: All weights must sum to exactly 1.0. Omit --depends for atomics.")]
+    #[command(about = "Add a new atomic or compound concept", long_about = "Concept Add: Create an atomic or compound concept.\n\nAtomic (base unit) — label MUST follow 'Concept: description' format:\n  braim concept add \"Payment: value transfer between two parties\" --domains payment --sources \"code:payment.rs\"\n  braim concept add \"Library: public institution that lends books\" --domains knowledge --sources \"doc:spec.md\"\n\nCompound (depends on 2+ atomics, with weights summing to 1.0; no format constraint on label):\n  braim concept add \"Credit Card Payment\" --domains payment --sources \"code:card.rs\" --depends \"1:0.6,2:0.4\"\n\nArguments:\n  term: For atomics: 'Concept: description' (e.g. 'Library: public lending institution').\n        For compounds: space-separated name, no snake_case.\n  --domains: Comma-separated domain tags (e.g., payment,finance)\n  --sources: Comma-separated SOURCE_TYPE:location pairs (REQUIRED prefix)\n  --depends: Optional dependencies for compounds (format: \"ID:weight,ID:weight\")\n  --strict-sources: Reject if sources contain duplicates or mix PRIMARY+TERTIARY types (default: warn)\n\nSource Types (verification calculated from PRIMARY sources):\n  PRIMARY: code:, doc:, schema:, config:, transcript:, test:\n  SECONDARY: phase_N:, agent:, narrative:\n  TERTIARY: logic:, inference:\n\nValidation Rules:\n  • Atomic labels must use 'Concept: description' format. Auto-normalized: missing or extra spaces\n    around the colon are fixed silently (e.g. 'Payment:transfer' → 'Payment: transfer').\n    Rejected only when no colon is present or either side (name or description) is empty.\n    Enforces self-documenting nodes: the meaning is encoded in the label, not in a separate statement.\n  • Duplicate sources (same string repeated) are allowed by default but warned.\n    Use --strict-sources to reject. Distinct citations (e.g., line numbers) preferred.\n  • Mixing PRIMARY evidence with TERTIARY derivations on same concept discouraged.\n    Use --strict-sources to reject; prefer keeping evidence separate from reasoning.\n  • Multi-word atomic names decomposable into existing atomics trigger hints.\n    Example: Adding \"Library Card: card granting borrowing rights\" when \"Library\" and \"Card\" exist → suggests compound form.\n\nExamples:\n  braim concept add \"Invoice: document requesting payment for goods or services\" --domains payment --sources \"doc:spec.md\"\n  braim concept add \"Fee: fixed charge applied for a service\" --domains payment --sources \"schema:tables.sql\"\n  braim concept add \"Credit Card: payment card linked to a revolving credit line\" --domains payment --sources \"code:card.rs,doc:card.md\"\n\nVerification Status (auto-calculated):\n  0 PRIMARY sources → unproven (not trusted)\n  1 PRIMARY source → partial (use with caution)\n  2 PRIMARY sources → proven (verified)\n  3+ PRIMARY sources → proven_strong (strongly verified)\n\nWeight constraint: All weights must sum to exactly 1.0. Omit --depends for atomics.\n\nAdding several concepts? See 'concept add-batch' — same validation per item, one flush for the whole batch instead of one per concept.")]
     Add {
         term: String,
         #[arg(long, help = "Comma-separated domains (e.g., payment,finance)")]
@@ -446,6 +447,13 @@ enum ConceptCommands {
         strict_sources: bool,
         #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
+    },
+    #[command(name = "add-batch", about = "Add many concepts in one call, flushing once", long_about = "Concept AddBatch: Add several atomic or compound concepts per invocation instead of one 'concept add' per concept.\n\nSame rationale as 'statement add-batch': runs the exact same per-item validation as 'concept add' (atomic 'Concept: description' format, duplicate-source/domain checks, PRIMARY+TERTIARY mix), but writes the graph to disk once at the end instead of once per concept.\n\nInput is a JSON array of objects, each with the same fields as 'concept add' flags:\n  term (required), domains (required, comma-separated), sources (required, comma-separated),\n  depends (omit for atomic; \"ID:weight,ID:weight\" for compound), strict_sources (bool), check_dupes (bool).\nBooleans default to false.\n\nUsage:\n  braim concept add-batch --file concepts.json\n  braim concept add-batch --file -        # read the JSON array from stdin\n  braim concept add-batch --json '[{\"term\": \"Invoice: document requesting payment\", \"domains\": \"payment\", \"sources\": \"doc:spec.md:3\"}]'\n\nExample file:\n  [\n    {\"term\": \"Invoice: document requesting payment for goods or services\", \"domains\": \"payment\", \"sources\": \"doc:spec.md:3\"},\n    {\"term\": \"Credit Card Payment\", \"domains\": \"payment\", \"sources\": \"code:card.rs\", \"depends\": \"1:0.6,2:0.4\"}\n  ]\n\nBehavior: same as 'statement add-batch' — items are independent, one line per item prefixed\nwith its 1-based position, a single flush persists every concept that succeeded, and the\nexit code is non-zero if any item failed even though the successful ones were still written.")]
+    AddBatch {
+        #[arg(long, help = "Path to a JSON array of concept objects, or '-' for stdin", conflicts_with = "json")]
+        file: Option<String>,
+        #[arg(long, help = "Inline JSON array of concept objects", conflicts_with = "file")]
+        json: Option<String>,
     },
     #[command(about = "Delete a concept (requires --force unless unused)", long_about = "Concept Delete: Remove a concept from the graph.\n\nUsage:\n  braim concept delete 42         # Fails if concept is referenced\n  braim concept delete 42 --force # Force delete (dangerous, breaks statements)\n\nSafety: Deleting a concept breaks any statements/compounds that depend on it.\nUse --force only if you're certain no statements reference this ID.")]
     Delete {
@@ -911,6 +919,117 @@ fn build_statement_item(
     ))
 }
 
+/// One item of a 'concept add-batch' JSON array — same fields as the
+/// 'concept add' CLI flags, with the same defaults.
+#[derive(Deserialize)]
+struct ConceptAddInput {
+    term: String,
+    domains: String,
+    sources: String,
+    depends: Option<String>,
+    #[serde(default)]
+    strict_sources: bool,
+    #[serde(default)]
+    check_dupes: bool,
+}
+
+/// Runs the same validation as a single 'concept add' call (duplicate-source
+/// checks, PRIMARY+TERTIARY mix) and builds a `ConceptAddItem` ready for
+/// `Braim::add_concept` or `Braim::add_concepts_batch`. Shared by both the
+/// single `Add` arm and `AddBatch` so a batched item is validated
+/// identically to a standalone call.
+fn build_concept_item(
+    braim: &Braim,
+    data_dir: &str,
+    quiet: bool,
+    input: &ConceptAddInput,
+) -> Result<ConceptAddItem, String> {
+    if input.check_dupes {
+        dedup_warn(braim, data_dir, &input.term, quiet);
+    }
+    let domains_list = parse_list(&input.domains);
+    let sources_list = parse_list(&input.sources);
+
+    let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
+    if has_dup_sources {
+        if input.strict_sources {
+            return Err("Error: duplicate source entries detected".to_string());
+        } else {
+            tips::emit_tip_duplicate_sources(&dup_sources, quiet);
+        }
+    }
+
+    if Braim::validate_primary_tertiary_mix(&sources_list) {
+        if input.strict_sources {
+            return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
+        } else {
+            tips::emit_tip_primary_tertiary_mix(quiet);
+        }
+    }
+
+    let depends_map = match &input.depends {
+        Some(d) => Some(parse_depends(d)?),
+        None => None,
+    };
+
+    Ok(ConceptAddItem {
+        term: input.term.clone(),
+        domains: domains_list,
+        sources: sources_list,
+        depends_on: depends_map,
+    })
+}
+
+/// Prints the result of a successful concept add — shared by the single
+/// `Add` arm (tag "", indent "  ") and `AddBatch` (tag "[N] ", indent
+/// "    "). Reads the just-inserted node back from `braim` rather than the
+/// caller's input so the label reflects any atomic-format normalization
+/// `add_concept` applied (e.g. "Payment:x" -> "Payment: x").
+fn report_concept_added(tag: &str, indent: &str, id: u32, braim: &Braim, quiet: bool) {
+    let node = &braim.state.nodes[&id];
+    let node_type_str = match node.node_type {
+        NodeType::Atomic => "atomic",
+        NodeType::Compound => "compound",
+        NodeType::Statement => "statement",
+        NodeType::Claim => "claim",
+        NodeType::Fact => "fact",
+        NodeType::InvalidStatement => "invalid_statement",
+        NodeType::ContestedStatement => "contested_statement",
+        NodeType::Source => "source",
+    };
+    println!("✓ {}{} concept added", tag, node_type_str);
+    println!("{}ID:{}  domains: {:?}  sources: {:?}  {}", indent, id, node.domains, node.sources, node.label);
+    if !node.depends_on.is_empty() {
+        print!("{}depends_on: {{", indent);
+        let mut first = true;
+        for (dep_id, weight) in &node.depends_on {
+            if !first {
+                print!(", ");
+            }
+            print!("{}: {}", dep_id, weight);
+            first = false;
+        }
+        println!("}}");
+    }
+    tips::emit_tip_concept_add(node, quiet);
+
+    // Check for decomposable atomics (Issue 5)
+    if node.node_type == NodeType::Atomic {
+        let decomposable = braim.find_decomposable_atomics(&node.label);
+        if decomposable.len() >= 2 {
+            let dep_spec = decomposable
+                .iter()
+                .map(|(id, _)| {
+                    let weight = 1.0 / decomposable.len() as f64;
+                    format!("{}:{:.1}", id, weight)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            tips::emit_tip_decomposable_compound(&node.label, &decomposable, &dep_spec, quiet);
+        }
+    }
+}
+
 fn get_node_symbol(node_type: &NodeType) -> &'static str {
     match node_type {
         NodeType::Atomic => "●",
@@ -1029,89 +1148,103 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             strict_sources,
             check_dupes,
         }) => {
-            if check_dupes {
-                dedup_warn(&braim, &cli.data_dir, &term, cli.quiet);
-            }
-            let domains_list = parse_list(&domains);
-            let sources_list = parse_list(&sources);
-
-            // Validate duplicate sources
-            let (has_dup_sources, dup_sources) = Braim::validate_duplicate_sources(&sources_list);
-            if has_dup_sources {
-                if strict_sources {
-                    return Err("Error: duplicate source entries detected".to_string());
-                } else {
-                    tips::emit_tip_duplicate_sources(&dup_sources, cli.quiet);
-                }
-            }
-
-            // Validate PRIMARY+TERTIARY mix
-            if Braim::validate_primary_tertiary_mix(&sources_list) {
-                if strict_sources {
-                    return Err("Error: PRIMARY and TERTIARY sources mixed on same statement".to_string());
-                } else {
-                    tips::emit_tip_primary_tertiary_mix(cli.quiet);
-                }
-            }
-
-            let depends_map = match depends {
-                Some(d) => Some(match parse_depends(&d) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Err(format!("{}", e));
-                    }
-                }),
-                None => None,
+            let input = ConceptAddInput {
+                term,
+                domains,
+                sources,
+                depends,
+                strict_sources,
+                check_dupes,
             };
+            let item = build_concept_item(&braim, &cli.data_dir, cli.quiet, &input)?;
 
-            match braim.add_concept(&term, domains_list.clone(), sources_list.clone(), depends_map) {
+            match braim.add_concept(&item.term, item.domains.clone(), item.sources.clone(), item.depends_on) {
                 Ok(id) => {
-                    let node = &braim.state.nodes[&id];
-                    let node_type_str = match node.node_type {
-                        NodeType::Atomic => "atomic",
-                        NodeType::Compound => "compound",
-                        NodeType::Statement => "statement",
-                        NodeType::Claim => "claim",
-                        NodeType::Fact => "fact",
-                        NodeType::InvalidStatement => "invalid_statement",
-                        NodeType::ContestedStatement => "contested_statement",
-                        NodeType::Source => "source",
-                    };
-                    println!("✓ {} concept added", node_type_str);
-                    println!("  ID:{}  domains: {:?}  sources: {:?}  {}", id, domains_list, sources_list, node.label);
-                    if !node.depends_on.is_empty() {
-                        print!("  depends_on: {{");
-                        let mut first = true;
-                        for (dep_id, weight) in &node.depends_on {
-                            if !first {
-                                print!(", ");
-                            }
-                            print!("{}: {}", dep_id, weight);
-                            first = false;
-                        }
-                        println!("}}");
-                    }
-                    tips::emit_tip_concept_add(node, cli.quiet);
-
-                    // Check for decomposable atomics (Issue 5)
-                    if node.node_type == NodeType::Atomic {
-                        let decomposable = braim.find_decomposable_atomics(&node.label);
-                        if decomposable.len() >= 2 {
-                            let dep_spec = decomposable
-                                .iter()
-                                .map(|(id, _)| {
-                                    let weight = 1.0 / decomposable.len() as f64;
-                                    format!("{}:{:.1}", id, weight)
-                                })
-                                .collect::<Vec<_>>()
-                                .join(",");
-                            tips::emit_tip_decomposable_compound(&node.label, &decomposable, &dep_spec, cli.quiet);
-                        }
-                    }
-
+                    report_concept_added("", "  ", id, &braim, cli.quiet);
                     Ok(())
                 }
                 Err(e) => Err(e.to_string()),
+            }
+        }
+        Commands::Concept(ConceptCommands::AddBatch { file, json }) => {
+            let raw = match (file, json) {
+                (Some(path), None) => {
+                    if path == "-" {
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .map_err(|e| format!("Error: failed to read stdin: {}", e))?;
+                        buf
+                    } else {
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| format!("Error: failed to read {}: {}", path, e))?
+                    }
+                }
+                (None, Some(inline)) => inline,
+                (None, None) => {
+                    return Err("Error: provide --file <path|-> or --json '<array>'".to_string());
+                }
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with rules out --file and --json together"),
+            };
+
+            let inputs: Vec<ConceptAddInput> = serde_json::from_str(&raw)
+                .map_err(|e| format!("Error: input must be a JSON array of concept objects: {}", e))?;
+
+            if inputs.is_empty() {
+                return Err("Error: input array is empty — nothing to add".to_string());
+            }
+
+            // Validate every item first, independently of the others; only
+            // the items that pass go to the graph, in the same order.
+            let mut validated: Vec<Option<ConceptAddItem>> = Vec::with_capacity(inputs.len());
+            let mut validation_errors: Vec<Option<String>> = Vec::with_capacity(inputs.len());
+            for input in &inputs {
+                match build_concept_item(&braim, &cli.data_dir, cli.quiet, input) {
+                    Ok(built) => {
+                        validated.push(Some(built));
+                        validation_errors.push(None);
+                    }
+                    Err(e) => {
+                        validated.push(None);
+                        validation_errors.push(Some(e));
+                    }
+                }
+            }
+
+            let batch_items: Vec<ConceptAddItem> = validated.iter().filter_map(|v| v.clone()).collect();
+            let mut batch_results = braim.add_concepts_batch(batch_items).into_iter();
+
+            let mut added = 0usize;
+            let mut failed = 0usize;
+            for (i, slot) in validated.iter().enumerate() {
+                let pos = i + 1;
+                match slot {
+                    None => {
+                        failed += 1;
+                        println!("✗ [{}] {}", pos, validation_errors[i].as_ref().unwrap());
+                    }
+                    Some(_) => {
+                        match batch_results.next().expect("one batch result per validated item") {
+                            Ok(id) => {
+                                added += 1;
+                                report_concept_added(&format!("[{}] ", pos), "    ", id, &braim, cli.quiet);
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                println!("✗ [{}] {}", pos, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!("---");
+            println!("{} added, {} failed, {} total", added, failed, inputs.len());
+
+            if failed > 0 {
+                Err(format!("{} of {} concept(s) failed — see per-item output above", failed, inputs.len()))
+            } else {
+                Ok(())
             }
         }
         Commands::Concept(ConceptCommands::Delete { id, force }) => {

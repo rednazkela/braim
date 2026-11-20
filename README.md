@@ -57,8 +57,8 @@ Serves high-quality context to an LLM with an agent-agnostic, multi-source, cros
 ## Commands
 
 ```text
-concept    add | delete | update-weights |      atomics + compounds
-           update-deps
+concept    add | add-batch | delete |           atomics + compounds
+           update-weights | update-deps
 statement  add | add-batch | verify |           claims/facts lifecycle
            verify-suggest | add-source |
            delete-source | update-sources |
@@ -100,17 +100,23 @@ braim statement add "Payment requires Invoice" \
 
 @[Statement text mentioning adjacent concept names is validated: if a matching compound exists but is absent from --depends the write errors; if no compound exists braim suggests one; --assume bypasses] source: braim statement add --help + code:src/graph.rs validate_statement_concepts
 
-### Adding many statements at once
+### Adding many concepts or statements at once
 
 ```bash
-braim statement add-batch --file statements.json   # JSON array; '-' reads stdin instead
+braim concept add-batch --file concepts.json       # JSON array; '-' reads stdin instead
+braim concept add-batch --json '[
+  {"term": "Invoice: document requesting payment for goods or services", "domains": "payment", "sources": "doc:spec.md:3"},
+  {"term": "Credit Card Payment", "domains": "payment", "sources": "code:card.rs", "depends": "1:0.6,2:0.4"}
+]'
+
+braim statement add-batch --file statements.json   # same idea, for statements
 braim statement add-batch --json '[
   {"text": "Payment requires Invoice", "domains": "payment", "sources": "code:rules.rs:14,doc:spec.md:3", "depends": "1:0.7,3:0.3"},
   {"text": "Card Payment implies Security", "depends": "1:1.0", "inferred": true}
 ]'
 ```
 
-@[Each item runs the same validation as a single 'statement add' call (duplicate-source/domain checks, PRIMARY+TERTIARY mix, label-shape rules); one item failing does not stop the rest, and the graph flushes once for the whole batch instead of once per statement] source: code:src/main.rs build_statement_item, code:src/graph.rs add_statements_batch
+@[Each item runs the same validation as a single 'concept add' or 'statement add' call (atomic 'Concept: description' format, duplicate-source/domain checks, PRIMARY+TERTIARY mix, label-shape rules); one item failing does not stop the rest, and the graph flushes once for the whole batch instead of once per item] source: code:src/main.rs build_concept_item, code:src/main.rs build_statement_item, code:src/graph.rs add_concepts_batch, code:src/graph.rs add_statements_batch
 
 @[Exit code is non-zero if any item failed even though the items that passed were still written — the printed summary line names how many of each] source: braim statement add-batch --help
 

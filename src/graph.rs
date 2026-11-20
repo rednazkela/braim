@@ -373,6 +373,17 @@ pub struct StatementAddItem {
     pub assume: bool,
 }
 
+/// One concept (atomic or compound) to add as part of
+/// `Braim::add_concepts_batch`. Mirrors the parameters of `add_concept` —
+/// `depends_on: None` makes it atomic, `Some(..)` makes it compound.
+#[derive(Debug, Clone)]
+pub struct ConceptAddItem {
+    pub term: String,
+    pub domains: Vec<String>,
+    pub sources: Vec<String>,
+    pub depends_on: Option<HashMap<u32, f64>>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Node {
     pub id: u32,
@@ -2483,6 +2494,52 @@ impl Braim {
         sources: Vec<String>,
         depends_on: Option<HashMap<u32, f64>>,
     ) -> Result<u32, GraphError> {
+        let id = self.add_concept_no_flush(term, domains, sources, depends_on)?;
+        self.flush()?;
+        Ok(id)
+    }
+
+    /// Add many concepts (atomic or compound) in one call, flushing to disk
+    /// once at the end instead of once per concept — see
+    /// `add_statements_batch` for why that matters. Items are independent:
+    /// one failing does not stop the rest. Returns one `Result` per input
+    /// item, in the same order.
+    pub fn add_concepts_batch(
+        &mut self,
+        items: Vec<ConceptAddItem>,
+    ) -> Vec<Result<u32, GraphError>> {
+        let mut results = Vec::with_capacity(items.len());
+        let mut any_ok = false;
+        for item in items {
+            match self.add_concept_no_flush(&item.term, item.domains, item.sources, item.depends_on) {
+                Ok(id) => {
+                    any_ok = true;
+                    results.push(Ok(id));
+                }
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        if any_ok {
+            if let Err(e) = self.flush() {
+                let flush_err = GraphError::Other(e);
+                for r in results.iter_mut() {
+                    if r.is_ok() {
+                        *r = Err(flush_err.clone());
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Core of `add_concept`, without the flush — see `add_concepts_batch`.
+    fn add_concept_no_flush(
+        &mut self,
+        term: &str,
+        domains: Vec<String>,
+        sources: Vec<String>,
+        depends_on: Option<HashMap<u32, f64>>,
+    ) -> Result<u32, GraphError> {
         Self::validate_non_empty(&domains, &sources)?;
         for source in &sources {
             Self::validate_source_prefix(source)?;
@@ -2579,7 +2636,6 @@ impl Braim {
         }
         self.state.id_to_domain.insert(id, domains[0].clone());
 
-        self.flush()?;
         Ok(id)
     }
 
@@ -5423,6 +5479,83 @@ mod statement_batch_tests {
     fn empty_batch_is_a_no_op() {
         let mut b = temp_braim("empty");
         let results = b.add_statements_batch(Vec::new());
+        assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod concept_batch_tests {
+    use super::*;
+
+    fn temp_braim(name: &str) -> Braim {
+        let dir = std::env::temp_dir().join(format!("braim_concept_batch_test_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Braim::new(dir.to_str().unwrap()).unwrap()
+    }
+
+    fn atomic(term: &str) -> ConceptAddItem {
+        ConceptAddItem {
+            term: term.to_string(),
+            domains: vec!["t".into()],
+            sources: vec!["narrative:x".into()],
+            depends_on: None,
+        }
+    }
+
+    fn compound(term: &str, deps: HashMap<u32, f64>) -> ConceptAddItem {
+        ConceptAddItem {
+            term: term.to_string(),
+            domains: vec!["t".into()],
+            sources: vec!["narrative:x".into()],
+            depends_on: Some(deps),
+        }
+    }
+
+    #[test]
+    fn atomics_and_a_compound_land_in_order_with_one_flush() {
+        let mut b = temp_braim("all_ok");
+        let items = vec![
+            atomic("Alpha: first concept"),
+            atomic("Beta: second concept"),
+            compound("Alpha Beta", HashMap::from([(1u32, 0.5), (2u32, 0.5)])),
+        ];
+        let results = b.add_concepts_batch(items);
+        let ids: Vec<u32> = results.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids assigned in input order: {ids:?}");
+        assert_eq!(b.state.nodes[&ids[0]].node_type, NodeType::Atomic);
+        assert_eq!(b.state.nodes[&ids[2]].node_type, NodeType::Compound);
+
+        // Reopen from disk — a fresh load only sees what the single flush wrote.
+        let reopened = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        for id in &ids {
+            assert_eq!(reopened.state.nodes[id].label, b.state.nodes[id].label);
+        }
+    }
+
+    #[test]
+    fn one_failing_item_does_not_block_the_others() {
+        let mut b = temp_braim("partial_fail");
+        let items = vec![
+            atomic("Alpha: first concept"),
+            atomic("NoColonHere"), // missing 'Concept: description' format
+            atomic("Beta: second concept"),
+        ];
+        let results = b.add_concepts_batch(items);
+
+        assert!(results[0].is_ok(), "first item should succeed");
+        assert!(matches!(&results[1], Err(GraphError::Other(msg)) if msg.contains("must use 'Concept: description' format")), "{:?}", results[1]);
+        assert!(results[2].is_ok(), "third item should succeed despite the second failing");
+
+        // The surviving two were still flushed to disk.
+        let reopened = Braim::new(b.data_dir.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.state.nodes.len(), b.state.nodes.len());
+    }
+
+    #[test]
+    fn empty_batch_is_a_no_op() {
+        let mut b = temp_braim("empty");
+        let results = b.add_concepts_batch(Vec::new());
         assert!(results.is_empty());
     }
 }
