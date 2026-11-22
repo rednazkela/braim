@@ -190,3 +190,131 @@ fn status_rank(status: &VerificationStatus) -> u8 {
         VerificationStatus::ProvenStrong => 5,
     }
 }
+
+// ---------------------------------------------------------------------------
+// SIC ID:608 — the store follows the shell's cwd.
+// ---------------------------------------------------------------------------
+// `--data-dir` defaults to the RELATIVE ".braim", so a `cd` anywhere in a
+// command chain silently re-points the graph. On 2026-09-11 that wrote nodes
+// 28-36 into /home/magnimus/sonar/.braim (27 nodes) instead of the session
+// store at /home/magnimus/sonar/sonar/.braim (390 nodes), and nothing in any
+// output said which store had been used.
+//
+// BRAIM_DATA_DIR (wired on the clap arg) is the fix. This is the detector for
+// the case where it is NOT set: if the cwd chain holds more than one .braim,
+// name the alternates so the wrong one is visible on the first command rather
+// than after nine writes.
+
+/// Other `.braim` directories reachable from `cwd` — its ancestors, and its
+/// immediate children one level down. Pure so it is testable without touching
+/// the process cwd or the environment.
+pub fn ambiguous_stores(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let resolved = cwd.join(".braim");
+    let mut found = Vec::new();
+
+    for ancestor in cwd.ancestors().skip(1) {
+        let candidate = ancestor.join(".braim");
+        if candidate.is_dir() && candidate != resolved {
+            found.push(candidate);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(cwd) {
+        let mut children: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.file_name().map(|n| n != ".braim").unwrap_or(false))
+            .map(|p| p.join(".braim"))
+            .filter(|p| p.is_dir())
+            .collect();
+        children.sort();
+        found.append(&mut children);
+    }
+
+    found
+}
+
+/// Warn when the store was resolved from the cwd-relative default and the cwd
+/// chain offers another one. Silent when `--data-dir` or BRAIM_DATA_DIR pinned
+/// it, and silent when there is nothing to confuse it with.
+pub fn emit_tip_ambiguous_store(data_dir: &str, quiet: bool) {
+    if quiet || tip_disabled() {
+        return;
+    }
+    // Only the unpinned default is ambiguous. An explicit path — from the flag
+    // or from BRAIM_DATA_DIR — is a deliberate choice and needs no warning.
+    if data_dir != ".braim" || std::env::var("BRAIM_DATA_DIR").is_ok() {
+        return;
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let others = ambiguous_stores(&cwd);
+    if others.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "braim tip: store resolved from cwd to {}. Also present: {}. Set BRAIM_DATA_DIR to pin one.",
+        cwd.join(".braim").display(),
+        others
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+#[cfg(test)]
+mod ambiguous_store_tests {
+    use super::ambiguous_stores;
+    use std::fs;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("braim-sic608-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lone_store_is_not_ambiguous() {
+        let root = scratch("lone");
+        fs::create_dir_all(root.join("work/.braim")).unwrap();
+        assert!(ambiguous_stores(&root.join("work")).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn child_store_is_reported() {
+        // The exact 2026-09-11 shape: cwd is the parent, the intended store is
+        // one level down, and both exist.
+        let root = scratch("child");
+        fs::create_dir_all(root.join("sonar/.braim")).unwrap();
+        fs::create_dir_all(root.join("sonar/sonar/.braim")).unwrap();
+        let found = ambiguous_stores(&root.join("sonar"));
+        assert_eq!(found, vec![root.join("sonar/sonar/.braim")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ancestor_store_is_reported() {
+        let root = scratch("ancestor");
+        fs::create_dir_all(root.join("sonar/.braim")).unwrap();
+        fs::create_dir_all(root.join("sonar/sonar/.braim")).unwrap();
+        let found = ambiguous_stores(&root.join("sonar/sonar"));
+        assert_eq!(found, vec![root.join("sonar/.braim")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_resolved_store_is_never_its_own_alternate() {
+        let root = scratch("self");
+        fs::create_dir_all(root.join("a/.braim")).unwrap();
+        let found = ambiguous_stores(&root.join("a"));
+        assert!(!found.contains(&root.join("a/.braim")));
+        let _ = fs::remove_dir_all(&root);
+    }
+}

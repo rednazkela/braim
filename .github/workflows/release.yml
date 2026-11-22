@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be rebuilt without moving a tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach binaries to"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          # Apple Silicon and Intel are built on their OWN runners rather than
+          # cross-compiled, because the embeddings feature links ONNX Runtime
+          # binaries `ort` downloads for the host it builds on.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          # MSVC, not the -gnu target: MSVC is what Windows users actually run,
+          # and it is unreachable from a Linux cross-build (braim ID:266).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # --locked so a release binary is built from the committed dependency
+      # graph rather than whatever resolves that day.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/braim
+          [ "${{ matrix.archive }}" = "zip" ] && BIN="$BIN.exe"
+          # A binary that cannot answer --help, or that shipped without the
+          # commands the hooks call, is not a release (braim ID:249/268).
+          "$BIN" --help > /dev/null
+          for cmd in init policy dream export merge-nodes similar; do
+            "$BIN" "$cmd" --help > /dev/null || { echo "missing command: $cmd"; exit 1; }
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="braim-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/braim.exe" "dist/$NAME/"
+          else
+            cp "target/${{ matrix.target }}/release/braim" "dist/$NAME/"
+          fi
+          cp README.md "dist/$NAME/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$NAME.zip" "$NAME" > /dev/null
+          else
+            tar czf "$NAME.tar.gz" "$NAME"
+          fi
+          # Checksums travel with the artifact so a consumer can verify what it got.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$NAME.${{ matrix.archive }}" > "$NAME.${{ matrix.archive }}.sha256"
+          else
+            shasum -a 256 "$NAME.${{ matrix.archive }}" > "$NAME.${{ matrix.archive }}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # gh is preinstalled on the runner, so no third-party publishing action is
+      # trusted with the release token.
+      - name: Attach binaries to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
