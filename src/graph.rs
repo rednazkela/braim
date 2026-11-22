@@ -822,6 +822,16 @@ pub struct WhyRemoveOutcome {
 const WHY_DEPTH_WARN: usize = 7;
 const WHY_DEPTH_MAX: usize = 10;
 
+/// How perspective/proximity search: `Strict` walks dependency -> dependent
+/// only (and registers a gap on a miss); `Auto` falls back to a direction-blind
+/// search before declaring a gap; `Undirected` skips the directed walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathMode {
+    Strict,
+    Auto,
+    Undirected,
+}
+
 impl Braim {
     pub fn parse_source(source: &str) -> (SourceType, String) {
         if let Some(colon_idx) = source.find(':') {
@@ -1373,6 +1383,95 @@ impl Braim {
                     .and_then(|n| n.source_type.clone())
             })
             .collect()
+    }
+
+    /// Split a typed source string or entity location into (type, path),
+    /// dropping any trailing `:line` or `:start-end` suffix and a leading `./`.
+    fn source_key(raw: &str, fallback_type: Option<&str>) -> Option<(String, String)> {
+        let raw = raw.trim();
+        let (ty, rest) = match raw.split_once(':') {
+            Some((t, r)) if SourceType::from_prefix(t).is_some() => (t.to_string(), r.to_string()),
+            _ => (fallback_type?.to_string(), raw.to_string()),
+        };
+        let mut path = rest.as_str();
+        loop {
+            match path.rsplit_once(':') {
+                Some((head, tail))
+                    if !tail.is_empty()
+                        && tail.chars().all(|c| c.is_ascii_digit() || c == '-') =>
+                {
+                    path = head;
+                }
+                _ => break,
+            }
+        }
+        let path = path.trim_start_matches("./").to_string();
+        if path.is_empty() { None } else { Some((ty, path)) }
+    }
+
+    /// Registered source entities whose location denotes the same file as a
+    /// typed source string (same type; equal path, or one path a `/`-boundary
+    /// suffix of the other). Returns (entity ids, strings that matched none).
+    pub fn match_source_entities(&self, sources: &[String]) -> (Vec<u32>, Vec<String>) {
+        let entities: Vec<(u32, String, String)> = self
+            .state
+            .nodes
+            .values()
+            .filter(|n| n.node_type == NodeType::Source)
+            .filter_map(|n| {
+                let loc = n.location.as_deref()?;
+                let (t, p) = Self::source_key(loc, n.source_type.as_deref())?;
+                Some((n.id, t, p))
+            })
+            .collect();
+        let mut ids: Vec<u32> = Vec::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        for src in sources {
+            if src == "inferred" {
+                continue;
+            }
+            let Some((t, p)) = Self::source_key(src, None) else { continue };
+            let hits: Vec<u32> = entities
+                .iter()
+                .filter(|(_, et, ep)| {
+                    *et == t
+                        && (*ep == p
+                            || ep.ends_with(&format!("/{}", p))
+                            || p.ends_with(&format!("/{}", ep)))
+                })
+                .map(|(id, _, _)| *id)
+                .collect();
+            if hits.is_empty() {
+                unmatched.push(src.clone());
+            }
+            for id in hits {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        (ids, unmatched)
+    }
+
+    /// Attach every registered source entity that matches one of the
+    /// statement's own source strings. Returns (linked ids, unmatched strings).
+    /// Unmatched strings are only reported when at least one entity exists —
+    /// a graph that never registers sources has nothing to link against.
+    pub fn link_registered_sources(&mut self, statement_id: u32) -> (Vec<u32>, Vec<String>) {
+        let Some(stmt) = self.state.nodes.get(&statement_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let strings = stmt.sources.clone();
+        let (ids, unmatched) = self.match_source_entities(&strings);
+        let mut linked = Vec::new();
+        for id in ids {
+            if self.add_source_to_statement(statement_id, id).is_ok() {
+                linked.push(id);
+            }
+        }
+        let any_entities = self.state.nodes.values().any(|n| n.node_type == NodeType::Source);
+        (linked, if any_entities { unmatched } else { Vec::new() })
     }
 
     pub fn add_source_to_statement(
@@ -3356,16 +3455,118 @@ impl Braim {
         }
     }
 
-    fn find_paths(&mut self, ids_a: &[u32], ids_b: &[u32]) -> (Vec<PathInfo>, Option<(u32, u32)>) {
+    /// Shortest connection ignoring edge direction: depends_on is walked both
+    /// ways (weight = the dependent's weight on the dependency) and an active
+    /// because_of link both ways at weight 1.0. Two nodes that share a
+    /// dependent, or a dependency, are connected here even though the directed
+    /// walk (dependency -> dependent) never reaches one from the other.
+    fn undirected_path(&self, from: u32, to: u32) -> Option<PathInfo> {
+        let active = |id: u32| {
+            self.state.nodes.get(&id).map_or(false, |n| n.status == NodeStatus::Active)
+        };
+        let mut adj: HashMap<u32, Vec<(u32, f64)>> = HashMap::new();
+        for node in self.state.nodes.values() {
+            if node.status != NodeStatus::Active {
+                continue;
+            }
+            for (&dep, &w) in &node.depends_on {
+                if active(dep) {
+                    adj.entry(node.id).or_default().push((dep, w));
+                    adj.entry(dep).or_default().push((node.id, w));
+                }
+            }
+        }
+        for edge in &self.state.because_of {
+            if edge.invalid || !active(edge.from) || !active(edge.to) {
+                continue;
+            }
+            adj.entry(edge.from).or_default().push((edge.to, 1.0));
+            adj.entry(edge.to).or_default().push((edge.from, 1.0));
+        }
+        let mut prev: HashMap<u32, (u32, f64)> = HashMap::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        seen.insert(from);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(from);
+        // A claim (unproven), contested or invalid statement does not carry a
+        // connection between the nodes it cites: it can end a path but never
+        // sit in the middle of one, matching the directed walk's rule that a
+        // gap clears only once the connecting statement is a fact.
+        let carries_path = |id: u32| {
+            self.state.nodes.get(&id).map_or(false, |n| {
+                !matches!(
+                    n.node_type,
+                    NodeType::Claim | NodeType::InvalidStatement | NodeType::ContestedStatement
+                )
+            })
+        };
+        while let Some(cur) = queue.pop_front() {
+            if cur == to {
+                break;
+            }
+            if cur != from && !carries_path(cur) {
+                continue;
+            }
+            for &(next, w) in adj.get(&cur).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if seen.insert(next) {
+                    prev.insert(next, (cur, w));
+                    queue.push_back(next);
+                }
+            }
+        }
+        if !seen.contains(&to) {
+            return None;
+        }
+        let mut path = vec![to];
+        let mut acc = 1.0;
+        let mut cur = to;
+        while cur != from {
+            let (p, w) = prev[&cur];
+            acc *= w;
+            path.push(p);
+            cur = p;
+        }
+        path.reverse();
+        let domains: Vec<String> = path
+            .iter()
+            .filter_map(|&id| self.state.nodes.get(&id).map(|n| n.domains[0].clone()))
+            .collect();
+        Some(PathInfo { path, weight: (acc * 10000.0).round() / 10000.0, domains })
+    }
+
+    /// Returns (paths, gap, via_undirected). `via_undirected` is true when the
+    /// paths came from the direction-blind search: either `undirected` was
+    /// asked for, or the directed walk found nothing and the pair is connected
+    /// anyway. A gap is reported only when neither search connects the pair.
+    fn find_paths(
+        &mut self,
+        ids_a: &[u32],
+        ids_b: &[u32],
+        mode: PathMode,
+    ) -> (Vec<PathInfo>, Option<(u32, u32)>, bool) {
         let mut paths = Vec::new();
 
-        for id_a in ids_a {
-            for &id_b in ids_b {
-                let mut visited = HashSet::new();
-                visited.insert(*id_a);
-                let mut path = vec![*id_a];
-                self.dfs(*id_a, id_b, &mut visited, &mut path, 1.0, &mut paths);
+        if mode != PathMode::Undirected {
+            for id_a in ids_a {
+                for &id_b in ids_b {
+                    let mut visited = HashSet::new();
+                    visited.insert(*id_a);
+                    let mut path = vec![*id_a];
+                    self.dfs(*id_a, id_b, &mut visited, &mut path, 1.0, &mut paths);
+                }
             }
+        }
+
+        let mut via_undirected = false;
+        if paths.is_empty() && mode != PathMode::Strict {
+            for &id_a in ids_a {
+                for &id_b in ids_b {
+                    if let Some(p) = self.undirected_path(id_a, id_b) {
+                        paths.push(p);
+                    }
+                }
+            }
+            via_undirected = !paths.is_empty();
         }
 
         let gap = if paths.is_empty() {
@@ -3374,39 +3575,29 @@ impl Braim {
             None
         };
 
+        // A pair that is connected has no gap: drop any stale register entry.
+        if !paths.is_empty() {
+            self.state.gaps.retain(|g| {
+                !(ids_a.contains(&g.concept_a) && ids_b.contains(&g.concept_b)
+                    || ids_a.contains(&g.concept_b) && ids_b.contains(&g.concept_a))
+            });
+        }
+
         paths.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap());
-        (paths, gap)
+        (paths, gap, via_undirected)
     }
 
+    #[allow(dead_code)]
     pub fn proximity(&mut self, term_a: &str, term_b: &str) -> Result<Vec<PathInfo>, String> {
-        let ids_a = self.resolve_term(term_a)?;
-        let ids_b = self.resolve_term(term_b)?;
-
-        if let Some(&shared) = ids_a.iter().find(|id| ids_b.contains(id)) {
-            return Err(format!(
-                "Error: '{}' and '{}' both resolve to ID:{} — no path to compute",
-                term_a, term_b, shared
-            ));
-        }
-
-        let (paths, gap) = self.find_paths(&ids_a, &ids_b);
-
-        if let Some((id_a, id_b)) = gap {
-            let labels = {
-                let node_a = self.state.nodes.get(&id_a).map(|n| n.label.clone());
-                let node_b = self.state.nodes.get(&id_b).map(|n| n.label.clone());
-                (node_a, node_b)
-            };
-            if let (Some(label_a), Some(label_b)) = labels {
-                self.register_gap(id_a, id_b, &label_a, &label_b);
-                self.flush()?;
-            }
-        }
-
-        Ok(paths)
+        self.proximity_ex(term_a, term_b, PathMode::Strict).map(|(p, _)| p)
     }
 
-    pub fn perspective(&mut self, term_a: &str, term_b: &str) -> Result<HashMap<String, f64>, String> {
+    pub fn proximity_ex(
+        &mut self,
+        term_a: &str,
+        term_b: &str,
+        mode: PathMode,
+    ) -> Result<(Vec<PathInfo>, bool), String> {
         let ids_a = self.resolve_term(term_a)?;
         let ids_b = self.resolve_term(term_b)?;
 
@@ -3417,8 +3608,16 @@ impl Braim {
             ));
         }
 
-        let (paths, gap) = self.find_paths(&ids_a, &ids_b);
+        let gaps_before = self.state.gaps.len();
+        let (paths, gap, via_undirected) = self.find_paths(&ids_a, &ids_b, mode);
+        self.record_gap(gap)?;
+        if self.state.gaps.len() < gaps_before {
+            self.flush()?;
+        }
+        Ok((paths, via_undirected))
+    }
 
+    fn record_gap(&mut self, gap: Option<(u32, u32)>) -> Result<(), String> {
         if let Some((id_a, id_b)) = gap {
             let labels = {
                 let node_a = self.state.nodes.get(&id_a).map(|n| n.label.clone());
@@ -3429,6 +3628,36 @@ impl Braim {
                 self.register_gap(id_a, id_b, &label_a, &label_b);
                 self.flush()?;
             }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn perspective(&mut self, term_a: &str, term_b: &str) -> Result<HashMap<String, f64>, String> {
+        self.perspective_ex(term_a, term_b, PathMode::Strict).map(|(d, _)| d)
+    }
+
+    pub fn perspective_ex(
+        &mut self,
+        term_a: &str,
+        term_b: &str,
+        mode: PathMode,
+    ) -> Result<(HashMap<String, f64>, bool), String> {
+        let ids_a = self.resolve_term(term_a)?;
+        let ids_b = self.resolve_term(term_b)?;
+
+        if let Some(&shared) = ids_a.iter().find(|id| ids_b.contains(id)) {
+            return Err(format!(
+                "Error: '{}' and '{}' both resolve to ID:{} — no path to compute",
+                term_a, term_b, shared
+            ));
+        }
+
+        let gaps_before = self.state.gaps.len();
+        let (paths, gap, via_undirected) = self.find_paths(&ids_a, &ids_b, mode);
+        self.record_gap(gap)?;
+        if self.state.gaps.len() < gaps_before {
+            self.flush()?;
         }
 
         let mut domain_weights: HashMap<String, f64> = HashMap::new();
@@ -3438,7 +3667,7 @@ impl Braim {
             }
         }
 
-        Ok(domain_weights)
+        Ok((domain_weights, via_undirected))
     }
 
     fn register_gap(&mut self, id_a: u32, id_b: u32, label_a: &str, label_b: &str) {
@@ -3559,7 +3788,16 @@ impl Braim {
         AuditReport {
             orphans,
             pending,
-            gaps: self.state.gaps.clone(),
+            // A registered pair that has since become connected (through a
+            // fact, in either direction) is no longer a gap; report only the
+            // pairs that remain unconnected.
+            gaps: self
+                .state
+                .gaps
+                .iter()
+                .filter(|g| self.undirected_path(g.concept_a, g.concept_b).is_none())
+                .cloned()
+                .collect(),
             deprecated_referenced,
             refuted_causal_links,
             reinvestigate_flagged,
@@ -5929,6 +6167,43 @@ mod defect_tests {
             !b.state.gaps.iter().any(|g| (g.concept_a == a && g.concept_b == c) || (g.concept_a == c && g.concept_b == a)),
             "gap must auto-clear when the connecting statement gains a source"
         );
+    }
+
+    #[test]
+    fn shared_dependency_fact_connects_pair_and_clears_stale_gap() {
+        let mut b = temp_braim("undirected_shared_dep");
+        let a = b.add_concept("Alpha: first concept", vec!["t".into()], vec!["narrative:x".into()], None).unwrap();
+        let c = b.add_concept("Beta: second concept", vec!["t".into()], vec!["narrative:y".into()], None).unwrap();
+        // Stale entry from before the connecting fact existed.
+        b.register_gap(a, c, "Alpha: first concept", "Beta: second concept");
+        let mut deps = HashMap::new();
+        deps.insert(a, 0.6);
+        deps.insert(c, 0.4);
+        let s = b
+            .add_statement("Alpha relates to Beta", vec!["t".into()], vec!["code:a.rs:f".into(), "doc:b.md:3".into()], deps, false)
+            .unwrap();
+        assert_eq!(b.state.nodes[&s].node_type, NodeType::Fact);
+        let (domains, via_undirected) = b.perspective_ex("Alpha", "Beta", PathMode::Auto).unwrap();
+        assert!(!domains.is_empty(), "connected through a shared fact");
+        assert!(via_undirected, "no directed path, found ignoring direction");
+        assert!(b.state.gaps.is_empty(), "stale gap must clear once a path exists");
+        let (domains, via_undirected) = b.perspective_ex("Alpha", "Beta", PathMode::Undirected).unwrap();
+        assert!(!domains.is_empty() && via_undirected);
+    }
+
+    #[test]
+    fn registered_source_matches_by_type_and_path_suffix_ignoring_line_range() {
+        let mut b = temp_braim("source_entity_match");
+        let ddr = b
+            .add_source("DDR", "doc", Some("doc:sys/ws/dossier/decisions/DDR-F09-B.md".into()), None)
+            .unwrap();
+        let (hit, miss) = b.match_source_entities(&[
+            "doc:dossier/decisions/DDR-F09-B.md:12-18".to_string(),
+            "code:dossier/decisions/DDR-F09-B.md".to_string(),
+            "doc:other.md".to_string(),
+        ]);
+        assert_eq!(hit, vec![ddr]);
+        assert_eq!(miss, vec!["code:dossier/decisions/DDR-F09-B.md".to_string(), "doc:other.md".to_string()]);
     }
 
     #[test]

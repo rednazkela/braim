@@ -23,7 +23,8 @@ use std::io::Read as _;
 #[command(about = "BRAIM: Semantic knowledge graph CLI for building verified domain models")]
 #[command(long_about = "BRAIM stores concepts, statements, and relationships in a semantic graph with native verification.\n\n\
 REQUIRED RULES:\n\
-  1. braim always uses cwd/.braim (or override with --data-dir)\n\
+  1. Store location, highest precedence first: --data-dir, then BRAIM_DATA_DIR, then cwd/.braim.\n\
+     The env var beats the cwd default, so a 'cd' does not move the store when BRAIM_DATA_DIR is set.\n\
   2. Never use jq or other tools directly on current.json\n\
   3. Use 'braim version save' after each batch of commands to checkpoint work\n\
   4. Look for domains before adding nodes (use 'braim domains' to avoid fragmentation)\n\
@@ -276,15 +277,20 @@ enum Commands {
     Proximity {
         term_a: String,
         term_b: String,
+        #[arg(long, help = "Ignore edge direction (a path exists if the nodes are connected at all)")]
+        undirected: bool,
     },
     #[command(about = "Show directed paths from one concept to another", long_about = "Perspective: Show how concept A influences/leads to concept B (directed).\n\nExamples:\n  braim perspective Payment Account\n  braim perspective Invoice PaidStatus\n\nUnlike Query (bidirectional), Perspective only shows paths in A→B direction.\nUses multiplicative weight propagation: relationship_strength = product of edge weights along path.\n\nTraverses both depends_on and because_of (causal) edges. because_of is followed\ncause → consequent at full weight (1.0, unweighted); refuted causal links are\nskipped. Since because_of endpoints are statements, concept-to-concept paths are\nunchanged — pass statement IDs to trace a causal chain. (query stays depends_on-only.)")]
     Perspective {
         term_a: String,
         term_b: String,
+        #[arg(long, help = "Ignore edge direction (a path exists if the nodes are connected at all)")]
+        undirected: bool,
     },
-    #[command(about = "Inspect a node by ID with full details and related nodes", long_about = "Node: Display detailed information about a specific node by ID.\n\nUsage:\n  braim node 42           # Show node 42's details\n  braim node 42 --related # Show node 42 + all nodes it depends on/is depended by\n\nOutputs: ID, label, type, domains, sources, verification status, and dependency graph.\nUse node lookup to map names to IDs first: braim lookup \"concept name\"")]
+    #[command(about = "Inspect a node by ID with full details and related nodes", long_about = "Node: Display detailed information about a specific node by ID.\n\nUsage:\n  braim node 42           # Show node 42's details\n  braim node 42 43 44     # Several nodes in one call (also: braim statement show 42, braim lookup 42)\n  braim node 42 --related # Show node 42 + all nodes it depends on/is depended by\n\nOutputs: ID, label, type, domains, sources, verification status, and dependency graph.\nUse node lookup to map names to IDs first: braim lookup \"concept name\"")]
     Node {
-        id: u32,
+        #[arg(required = true, num_args = 1.., help = "One or more node IDs")]
+        ids: Vec<u32>,
         #[arg(long, help = "Show nodes that depend on or are depended by this node")]
         related: bool,
     },
@@ -391,8 +397,8 @@ enum Commands {
     #[command(about = "Get/set/increment a node's first-class metadata (braim 6336)", long_about = "Meta: structured, queryable node fields — scope, recurrence, status, affected_feature — NOT label/domain encoded.\n\n  braim meta 6318                          # print all metadata for node 6318\n  braim meta 6318 --set scope=deliverable  # set a key\n  braim meta 6318 --inc recurrence         # increment a numeric key, prints new value\n  braim meta 6318 --unset scope             # remove a key entirely\n\nQuery by metadata:  braim list --meta scope=cognitivex_flow")]
     Meta {
         id: u32,
-        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow)", conflicts_with_all = ["inc", "unset"])]
-        set: Option<String>,
+        #[arg(long, help = "Set key=value (e.g. scope=cognitivex_flow); repeat to set several keys in one call", conflicts_with_all = ["inc", "unset"])]
+        set: Vec<String>,
         #[arg(long, help = "Increment a numeric key (e.g. recurrence)", conflicts_with = "unset")]
         inc: Option<String>,
         #[arg(long, help = "Remove a key entirely (e.g. terminal_cause)")]
@@ -481,6 +487,11 @@ enum ConceptCommands {
 
 #[derive(Subcommand)]
 enum StatementCommands {
+    #[command(alias = "get", about = "Show statements by ID (same as 'braim node')", long_about = "Statement Show: print one or more nodes by ID. Alias: 'statement get'. Same output as 'braim node <id>...'.")]
+    Show {
+        #[arg(required = true, num_args = 1.., help = "One or more node IDs")]
+        ids: Vec<u32>,
+    },
     #[command(about = "Add a statement linking concepts with evidence", long_about = "Statement Add: Create a claim linking concepts with verification sources.\n\nBasic statement with typed sources:\n  braim statement add \"Payment requires Invoice\" \\\n    --domains \"payment,payment\" --sources \"code:rules.rs,doc:spec.md\" \\\n    --depends \"1:0.5,2:0.5\"\n  → Status: PROVEN (2 PRIMARY sources: code + doc)\n\nStatement with SECONDARY (contextual) source:\n  braim statement add \"Security assumption\" \\\n    --domains payment --sources \"narrative:assumption\" \\\n    --depends \"1:1.0\"\n  → Status: UNPROVEN (0 PRIMARY sources, only narrative)\n\nInferred statement (derived, not independently verifiable):\n  braim statement add \"Card Payment implies Security\" \\\n    --depends \"1:1.0\" --inferred\n\nArguments:\n  text: The statement claim\n  --domains: Comma-separated domain tags (free count, no parity with sources or depends)\n  --sources: Comma-separated SOURCE_TYPE:location pairs (required, typed prefixes)\n  --depends: Concept IDs with weights (\"ID:weight,...\" must sum to 1.0)\n  --inferred: Mark as derived, not independently verifiable (uses 'inferred' source)\n  --assume: Skip validation checks\n  --strict-sources: Reject if sources contain duplicates or mix PRIMARY+TERTIARY (default: warn)\n  --strict-domains: Reject if domains contain duplicates (default: warn)\n\nSource Types (PRIMARY sources determine verification):\n  PRIMARY (independent evidence): code:, doc:, schema:, config:, transcript:, test:\n  SECONDARY (contextual): phase_N:, agent:, narrative:\n  TERTIARY (derived): logic:, inference:\n\nValidation Rules (enabled by default with warnings; use --strict-* to reject):\n  • Duplicate sources: Same source string appearing multiple times (e.g., doc:a.md,doc:a.md,doc:a.md).\n    Use distinct citations (line numbers, sections) for meaningful source diversity.\n    --strict-sources rejects; default warns and writes the statement.\n  \n  • PRIMARY+TERTIARY mix: Combining evidence (code:, doc:) with derivations (inference:, logic:) on\n    same statement. Muddies verification semantics. Prefer evidence-only sources here; record reasoning\n    separately via label or as dependent inference statement.\n    --strict-sources rejects; default warns and writes.\n  \n  • Duplicate domains: Same domain repeated (e.g., payment,payment,payment). Inflates\n    occurrence counts and obscures actual domain membership. Use distinct domains.\n    --strict-domains rejects; default warns and writes.\n  \n  • Gap register auto-clear: When statement depends on concepts A and B, any registered gap between\n    them is automatically removed. This heuristic may not reflect true semantic resolution—verify\n    connections are correct before relying on cleared gaps.\n\nVerification (auto-calculated from PRIMARY source count):\n  0 PRIMARY → ✗ UNPROVEN (claim, not trusted)\n  1 PRIMARY → ✓ PARTIAL (fact, use with caution)\n  2 PRIMARY (different types) → ✓✓ PROVEN (fact, verified)\n  3+ PRIMARY (different types) → ✓✓✓ PROVEN_STRONG (fact, strongly verified)\n\nNote: Verification status is capped by dependencies (inherits minimum of all depends_on).\n\nAdding several statements? See 'statement add-batch' — same validation per item, one flush for the whole batch instead of one per statement.")]
     Add {
         text: String,
@@ -502,6 +513,8 @@ enum StatementCommands {
         loose_label: bool,
         #[arg(long, help = "Advisory: warn if an existing node is semantically near-duplicate (default build; absent only with --no-default-features)")]
         check_dupes: bool,
+        #[arg(long, help = "Registered source entity IDs to attach, comma-separated (see 'braim sources list'); --sources may then be omitted. Source strings in --sources that name a registered entity's file are attached automatically")]
+        source_ids: Option<String>,
     },
     #[command(name = "add-batch", about = "Add many statements in one call, flushing once", long_about = "Statement AddBatch: Add several statements per invocation instead of one 'statement add' per statement.\n\nSolves a turn-cap problem: an agent building out a graph section otherwise spends one full tool call per statement. This command runs the exact same per-item validation as 'statement add' (duplicate-source/domain checks, PRIMARY+TERTIARY mix, label-shape rules) on every item, but writes the graph to disk once at the end instead of once per statement.\n\nInput is a JSON array of objects, each with the same fields as 'statement add' flags:\n  text (required), domains (string, comma-separated), sources (string, comma-separated),\n  depends (required, \"ID:weight,ID:weight\"), inferred (bool), assume (bool),\n  strict_sources (bool), strict_domains (bool), loose_label (bool), check_dupes (bool).\nAll booleans default to false; domains/sources may be omitted only when inferred=true.\n\nUsage:\n  braim statement add-batch --file statements.json\n  braim statement add-batch --file -        # read the JSON array from stdin\n  braim statement add-batch --json '[{\"text\": \"...\", \"domains\": \"payment\", \"sources\": \"code:a.rs,doc:b.md\", \"depends\": \"1:0.5,2:0.5\"}]'\n\nExample file:\n  [\n    {\"text\": \"Payment requires Invoice\", \"domains\": \"payment,payment\", \"sources\": \"code:rules.rs,doc:spec.md\", \"depends\": \"1:0.5,2:0.5\"},\n    {\"text\": \"Card Payment implies Security\", \"depends\": \"1:1.0\", \"inferred\": true}\n  ]\n\nBehavior:\n  • Items are independent — one failing validation or graph error does not stop the rest.\n  • One line per item is printed, same format as 'statement add', prefixed with its\n    1-based position in the input array.\n  • A single flush persists every statement that succeeded, after the last item is\n    processed — not one flush per item.\n  • Exit code is non-zero if any item failed, even though the successful ones were\n    still written; the summary line names how many of each.")]
     AddBatch {
@@ -692,6 +705,8 @@ enum DreamCommands {
 
 #[derive(Subcommand)]
 enum SourceCommands {
+    #[command(about = "List registered source entities", long_about = "Source List: print every source entity (ID, type, location, label), with the number of statements citing each.\n\nUsage:\n  braim sources list")]
+    List,
     #[command(about = "Add a first-class source entity", long_about = "Source Add: Create a named source entity with a type, location, and ingestion timestamp.\n\nSources created this way have a stable ID that statements can reference.\nThe same source referenced by multiple statements is counted once for PRIMARY-type diversity.\n\nUsage:\n  braim sources add \"Refund design doc section 3.2\" \\\n    --type doc --location \"doc:billing_design.md:3.2\"\n\n  braim sources add \"Billing code review\" \\\n    --type code --location \"code:src/billing.rs:42-98\" \\\n    --ingested-by \"agent:context_phase\"\n\nArguments:\n  label:          Human-readable identifier for the source\n  --type:         Source type prefix (code, doc, schema, config, transcript, test,\n                  phase_N, agent, narrative, logic, inference)\n  --location:     Optional file path, URL, or document reference\n  --ingested-by:  Optional agent name or user ID who ingested this source\n  --strict-sources: Reject if label contains a line-number suffix (default: warn)\n\nLine-number warning:\n  Labels like 'tests/oracle.txt:104-127' or 'file.rs:42' are warned by default\n  and rejected with --strict-sources. Source nodes are stable file-level identity;\n  line numbers belong in --sources metadata strings, not node labels.\n\nOutput:\n  Returns the source ID (e.g., ID:5001) for use with 'statement add --source-ids'.\n\nSource types and verification tiers:\n  PRIMARY (independent evidence):    code, doc, schema, config, transcript, test\n  SECONDARY (derived or contextual): phase_N, agent, narrative\n  TERTIARY (logical derivation):     logic, inference\n\nVerification impact:\n  PRIMARY-typed source entities raise statement verification when referenced.\n  Distinct PRIMARY types from different source entities determine the level:\n    1 PRIMARY type → partial\n    2 PRIMARY types → proven\n    3+ PRIMARY types → proven_strong")]
     Add {
         label: String,
@@ -771,6 +786,57 @@ struct StatementAddInput {
     loose_label: bool,
     #[serde(default)]
     check_dupes: bool,
+    /// Registered source entity IDs ("5,7") to attach — see 'braim sources list'.
+    #[serde(default)]
+    source_ids: Option<String>,
+}
+
+fn parse_source_ids(raw: &Option<String>) -> Result<Vec<u32>, String> {
+    match raw {
+        None => Ok(Vec::new()),
+        Some(list) => list
+            .split(',')
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| {
+                p.trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("Error: --source-ids must be comma-separated numbers (got '{}')", p.trim()))
+            })
+            .collect(),
+    }
+}
+
+/// After a statement is written: attach any --source-ids entities, then every
+/// registered entity whose file a --sources string names. Prints what linked
+/// and warns about strings that matched no registered entity.
+fn link_statement_sources(braim: &mut Braim, id: u32, input: &StatementAddInput, indent: &str, quiet: bool) {
+    let mut linked: Vec<u32> = Vec::new();
+    for sid in parse_source_ids(&input.source_ids).unwrap_or_default() {
+        if braim.add_source_to_statement(id, sid).is_ok() {
+            linked.push(sid);
+        }
+    }
+    let (auto, unmatched) = braim.link_registered_sources(id);
+    for sid in auto {
+        if !linked.contains(&sid) {
+            linked.push(sid);
+        }
+    }
+    if !linked.is_empty() {
+        println!(
+            "{}source entities linked: {}",
+            indent,
+            linked.iter().map(|i| format!("ID:{}", i)).collect::<Vec<_>>().join(", ")
+        );
+    }
+    if !quiet && !input.inferred {
+        for u in unmatched {
+            eprintln!(
+                "{}⚠ source '{}' matches no registered source entity — register it ('braim sources add', see 'braim sources list') or cite a registered file, so the citation links to an entity",
+                indent, u
+            );
+        }
+    }
 }
 
 /// Runs the same validation as a single 'statement add' call (inferred/
@@ -791,9 +857,20 @@ fn build_statement_item(
     if input.check_dupes {
         dedup_warn(braim, data_dir, &input.text, quiet);
     }
-    // Validation: inferred flag is mutually exclusive with explicit sources
-    if input.inferred && input.sources.is_some() {
-        return Err("Error: --inferred and --sources are mutually exclusive. Use --inferred for derived statements.".to_string());
+    // --inferred may carry typed derivation sources (inference:/logic:), which
+    // replace the bare "inferred" marker; evidence sources stay refused, since
+    // an inferred statement is by definition not independently verifiable.
+    if input.inferred {
+        if let Some(sources_str) = input.sources.as_ref() {
+            let typed = parse_list(sources_str);
+            let all_derivation = !typed.is_empty()
+                && typed.iter().all(|s| {
+                    matches!(Braim::parse_source(s).0.tier(), "TERTIARY")
+                });
+            if !all_derivation {
+                return Err("Error: --inferred accepts only inference:/logic: sources (e.g. --sources \"inference:phase_02\"); evidence sources (code:, doc:, ...) make it an explicit statement — drop --inferred.".to_string());
+            }
+        }
     }
 
     // Validation: reject manual "inferred" as a source value
@@ -801,6 +878,16 @@ fn build_statement_item(
         let sources_str = input.sources.as_ref().unwrap();
         if sources_str.contains("inferred") {
             return Err("Error: 'inferred' is a reserved source name. Use --inferred flag for derived statements.".to_string());
+        }
+    }
+
+    // Registered source entities named by --source-ids must exist and be sources.
+    let explicit_entities = parse_source_ids(&input.source_ids)?;
+    for sid in &explicit_entities {
+        match braim.state.nodes.get(sid) {
+            Some(n) if n.node_type == NodeType::Source => {}
+            Some(_) => return Err(format!("Error: ID:{} is not a source entity (see 'braim sources list')", sid)),
+            None => return Err(format!("Error: source ID:{} not found (see 'braim sources list')", sid)),
         }
     }
 
@@ -813,13 +900,40 @@ fn build_statement_item(
         let doms = input.domains.as_ref()
             .map(|d| parse_list(d))
             .unwrap_or_else(|| vec!["computation".to_string(); dep_count]);
-        let sources_vec = vec!["inferred".to_string(); dep_count];
+        let sources_vec = match input.sources.as_ref() {
+            Some(typed) => parse_list(typed),
+            None => vec!["inferred".to_string()],
+        };
         (doms, sources_vec)
     } else {
-        if input.domains.is_none() || input.sources.is_none() {
-            return Err("Error: --domains and --sources are required for explicit statements. Use --inferred for derived statements.".to_string());
+        let sources_from_entities: Option<Vec<String>> = if input.sources.is_none() && !explicit_entities.is_empty() {
+            Some(
+                explicit_entities
+                    .iter()
+                    .filter_map(|sid| braim.state.nodes.get(sid))
+                    .map(|n| {
+                        let loc = n.location.clone().unwrap_or_else(|| n.label.clone());
+                        match (loc.split_once(':'), n.source_type.as_deref()) {
+                            (Some((t, _)), _) if graph::SourceType::from_prefix(t).is_some() => loc,
+                            (_, Some(t)) => format!("{}:{}", t, loc),
+                            _ => loc,
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        if input.domains.is_none() || (input.sources.is_none() && sources_from_entities.is_none()) {
+            return Err("Error: --domains and --sources (or --source-ids) are required for explicit statements. Use --inferred for derived statements.".to_string());
         }
-        (parse_list(input.domains.as_ref().unwrap()), parse_list(input.sources.as_ref().unwrap()))
+        (
+            parse_list(input.domains.as_ref().unwrap()),
+            match sources_from_entities {
+                Some(v) => v,
+                None => parse_list(input.sources.as_ref().unwrap()),
+            },
+        )
     };
 
     // Validate duplicate sources (Issue 1)
@@ -866,10 +980,14 @@ fn build_statement_item(
             ));
         }
         if chars > cap {
+            let kept: String = input.text.chars().take(cap).collect();
+            let dropped: String = input.text.chars().skip(cap).collect();
             return Err(format!(
-                "Error: label is {} chars, over the {} limit.{}",
+                "Error: label is {} chars, over the {} limit (cut point: keeps \"…{}\", drops \"{}…\").{}",
                 chars,
                 cap,
+                kept.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect::<String>(),
+                dropped.chars().take(30).collect::<String>(),
                 if input.loose_label {
                     " Already using --loose-label; the claim needs splitting, not more room."
                 } else {
@@ -1080,6 +1198,8 @@ fn is_read_only(cmd: &Commands) -> bool {
         Commands::Lookup { .. }
             | Commands::Query { .. }
             | Commands::Node { .. }
+            | Commands::Statement(StatementCommands::Show { .. })
+            | Commands::Source(SourceCommands::List)
             | Commands::List { .. }
             | Commands::Domains
             | Commands::Audit { .. }
@@ -1140,6 +1260,10 @@ fn main() {
 /// (braim ID:326).
 fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
     match cli.command {
+        Commands::Statement(StatementCommands::Show { ids }) => {
+            let cli = Cli { command: Commands::Node { ids, related: false }, ..cli };
+            run(cli, braim)
+        }
         Commands::Concept(ConceptCommands::Add {
             term,
             domains,
@@ -1349,6 +1473,7 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             strict_domains,
             loose_label,
             check_dupes,
+            source_ids,
         }) => {
             let input = StatementAddInput {
                 text,
@@ -1361,11 +1486,13 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 strict_domains,
                 loose_label,
                 check_dupes,
+                source_ids,
             };
             let (item, inferred) = build_statement_item(&braim, &cli.data_dir, cli.quiet, &input)?;
 
             match braim.add_statement(&item.text, item.domains.clone(), item.sources.clone(), item.depends_on, item.assume) {
                 Ok(id) => {
+                    link_statement_sources(&mut braim, id, &input, "  ", cli.quiet);
                     let node = &braim.state.nodes[&id];
                     let stmt_type = if inferred { "inferred statement" } else { "statement" };
                     println!("✓ {} added", stmt_type);
@@ -1450,6 +1577,7 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                         match batch_results.next().expect("one batch result per validated item") {
                             Ok(id) => {
                                 added += 1;
+                                link_statement_sources(&mut braim, id, &inputs[i], "    ", cli.quiet);
                                 let node = &braim.state.nodes[&id];
                                 let stmt_type = if *item_inferred { "inferred statement" } else { "statement" };
                                 println!("✓ [{}] {} added", pos, stmt_type);
@@ -1673,6 +1801,12 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             }
         }
         Commands::Lookup { term, include_claims, only_claims, include_invalid, exact, no_related } => {
+            if let Ok(id) = term.trim().parse::<u32>() {
+                if braim.state.nodes.contains_key(&id) {
+                    let cli = Cli { command: Commands::Node { ids: vec![id], related: !no_related }, ..cli };
+                    return run(cli, braim);
+                }
+            }
             let result = if exact {
                 braim.lookup_exact(&term)
             } else {
@@ -1805,17 +1939,20 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Proximity { term_a, term_b } => {
-            match braim.proximity(&term_a, &term_b) {
-                Ok(paths) => {
+        Commands::Proximity { term_a, term_b, undirected } => {
+            match braim.proximity_ex(&term_a, &term_b, if undirected { graph::PathMode::Undirected } else { graph::PathMode::Auto }) {
+                Ok((paths, via_undirected)) => {
                     if paths.is_empty() {
                         println!(
-                            "No paths found between '{}' and '{}'.",
+                            "No paths found between '{}' and '{}' (directed or undirected).",
                             term_a, term_b
                         );
                         println!("  ⚠ Registered to gap register for investigation.");
                     } else {
                         println!("Proximity: '{}' → '{}'  ({} path{})\n", term_a, term_b, paths.len(), if paths.len() == 1 { "" } else { "s" });
+                        if via_undirected {
+                            println!("  note: no directed path (dependency → dependent); the nodes are connected ignoring edge direction. Any gap-register entry for this pair was cleared.\n");
+                        }
                         for (i, path_info) in paths.iter().enumerate() {
                             println!("  Path {}  weight={:.4}", i + 1, path_info.weight);
                             for (j, &node_id) in path_info.path.iter().enumerate() {
@@ -1834,17 +1971,20 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Perspective { term_a, term_b } => {
-            match braim.perspective(&term_a, &term_b) {
-                Ok(domain_weights) => {
+        Commands::Perspective { term_a, term_b, undirected } => {
+            match braim.perspective_ex(&term_a, &term_b, if undirected { graph::PathMode::Undirected } else { graph::PathMode::Auto }) {
+                Ok((domain_weights, via_undirected)) => {
                     if domain_weights.is_empty() {
                         println!(
-                            "No paths found between '{}' and '{}'.",
+                            "No paths found between '{}' and '{}' (directed or undirected).",
                             term_a, term_b
                         );
                         println!("  ⚠ Registered to gap register for investigation.");
                     } else {
                         println!("Perspective: '{}' → '{}'  (grouped by domain)\n", term_a, term_b);
+                        if via_undirected {
+                            println!("  note: no directed path (dependency → dependent); the nodes are connected ignoring edge direction (see 'braim proximity {} {} --undirected' for the route). Any gap-register entry for this pair was cleared.\n", term_a, term_b);
+                        }
                         let mut domains: Vec<_> = domain_weights.iter().collect();
                         domains.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                         for (domain, weight) in domains {
@@ -1857,8 +1997,11 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
             }
         }
         Commands::Version(VersionCommands::Save { description }) => {
+            // An empty message is unsearchable history; fall back to the run id
+            // the dispatcher already set, when there is one.
+            let run_fallback = std::env::var("BRAIM_RUN_ID").unwrap_or_default();
             let desc = if description.is_empty() {
-                ""
+                run_fallback.trim()
             } else {
                 &description
             };
@@ -1892,115 +2035,145 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Node { id, related } => {
-            match braim.get_node(id) {
-                Some(node) => {
-                    let node_type_str = match node.node_type {
-                        NodeType::Atomic => "atomic",
-                        NodeType::Compound => "compound",
-                        NodeType::Statement => "statement",
-                        NodeType::Claim => "claim",
-                        NodeType::Fact => "fact",
-                        NodeType::InvalidStatement => "invalid_statement",
-                        NodeType::ContestedStatement => "contested_statement",
-                        NodeType::Source => "source",
-                    };
-                    let status_str = match node.status {
-                        graph::NodeStatus::Active => "active",
-                        graph::NodeStatus::Pending => "pending",
-                        graph::NodeStatus::Deprecated => "deprecated",
-                    };
-
-                    println!("Node ID:{}", id);
-                    println!("  Type: {}", node_type_str);
-                    println!("  Label: {}", node.label);
-                    println!("  Domains: {:?}", node.domains);
-                    println!("  Sources: {:?}", node.sources);
-                    if !node.source_ids.is_empty() {
-                        println!("  Source entities:");
-                        for &src_id in &node.source_ids {
-                            if let Some(src) = braim.get_node(src_id) {
-                                let type_str = src.source_type.as_deref().unwrap_or("?");
-                                let loc_str = src.location.as_deref().unwrap_or("");
-                                println!("    ID:{}  {}  ({})  {}", src_id, src.label, type_str, loc_str);
-                            } else {
-                                println!("    ID:{}  (not found)", src_id);
-                            }
-                        }
-                    }
-                    println!("  Status: {}", status_str);
-                    println!("  Created: {}", node.created_at);
-
-                    if node.node_type.is_statement_family() {
-                        let verify_str = match node.verification_status {
-                            graph::VerificationStatus::Invalid => "invalid",
-                            graph::VerificationStatus::Unproven => "unproven",
-                            graph::VerificationStatus::Contested => "contested",
-                            graph::VerificationStatus::Partial => "partial",
-                            graph::VerificationStatus::Proven => "proven",
-                            graph::VerificationStatus::ProvenStrong => "proven_strong",
-                        };
-                        println!("  Verification: {} ({} domains)", verify_str, node.verified_by.len());
-                    }
-
-                    if !node.depends_on.is_empty() {
-                        println!("  Depends on:");
-                        for (dep_id, weight) in &node.depends_on {
-                            if let Some(dep_node) = braim.get_node(*dep_id) {
-                                println!("    ID:{}  {}  (weight: {:.4})", dep_id, dep_node.label, weight);
-                            }
-                        }
-                    }
-
-                    let contradicts: Vec<_> = braim.state.contradicts.iter()
-                        .filter(|e| e.from == id || e.to == id)
-                        .collect();
-                    if !contradicts.is_empty() {
-                        println!("  Contradicts:");
-                        for edge in contradicts {
-                            let other_id = if edge.from == id { edge.to } else { edge.from };
-                            if edge.resolved {
-                                println!("    ID:{}  resolved  resolution_kind: {}", other_id,
-                                    edge.resolution_kind.as_deref().unwrap_or("winner"));
-                                if let Some(w) = edge.resolution_winner {
-                                    println!("      winner: ID:{}", w);
-                                }
-                                if let Some(s) = edge.resolution_source {
-                                    println!("      source: ID:{}", s);
-                                }
-                                if let Some(r) = &edge.resolution_reason {
-                                    println!("      reason: {}", r);
-                                }
-                            } else {
-                                println!("    ID:{}  unresolved  reason: {}", other_id, edge.reason);
-                            }
-                        }
-                    }
-
-                    if related {
-                        let (_, depended_by_nodes) = braim.get_related_nodes(id);
-
-                        if !depended_by_nodes.is_empty() {
-                            println!("\n  Referenced by:");
-                            for (ref_id, ref_node) in depended_by_nodes {
-                                println!("    ID:{}  {}  ({})", ref_id, ref_node.label, match ref_node.node_type {
-                                    NodeType::Atomic => "atomic",
-                                    NodeType::Compound => "compound",
-                                    NodeType::Statement => "statement",
-                                    NodeType::Claim => "claim",
-                                    NodeType::Fact => "fact",
-                                    NodeType::InvalidStatement => "invalid_statement",
-                                    NodeType::ContestedStatement => "contested_statement",
-                                    NodeType::Source => "source",
-                                });
-                            }
-                        }
-                    }
-
-                    Ok(())
+        Commands::Node { ids, related } => {
+            let mut errors: Vec<String> = Vec::new();
+            for (n, id) in ids.iter().copied().enumerate() {
+                if n > 0 {
+                    println!();
                 }
-                None => Err(format!("Error: Node ID {} not found", id)),
+                let shown: Result<(), String> = (|| -> Result<(), String> {
+                match braim.get_node(id) {
+                    Some(node) => {
+                        let node_type_str = match node.node_type {
+                            NodeType::Atomic => "atomic",
+                            NodeType::Compound => "compound",
+                            NodeType::Statement => "statement",
+                            NodeType::Claim => "claim",
+                            NodeType::Fact => "fact",
+                            NodeType::InvalidStatement => "invalid_statement",
+                            NodeType::ContestedStatement => "contested_statement",
+                            NodeType::Source => "source",
+                        };
+                        let status_str = match node.status {
+                            graph::NodeStatus::Active => "active",
+                            graph::NodeStatus::Pending => "pending",
+                            graph::NodeStatus::Deprecated => "deprecated",
+                        };
+
+                        println!("Node ID:{}", id);
+                        println!("  Type: {}", node_type_str);
+                        println!("  Label: {}", node.label);
+                        println!("  Domains: {:?}", node.domains);
+                        println!("  Sources: {:?}", node.sources);
+                        if !node.source_ids.is_empty() {
+                            println!("  Source entities:");
+                            for &src_id in &node.source_ids {
+                                if let Some(src) = braim.get_node(src_id) {
+                                    let type_str = src.source_type.as_deref().unwrap_or("?");
+                                    let loc_str = src.location.as_deref().unwrap_or("");
+                                    println!("    ID:{}  {}  ({})  {}", src_id, src.label, type_str, loc_str);
+                                } else {
+                                    println!("    ID:{}  (not found)", src_id);
+                                }
+                            }
+                        }
+                        println!("  Status: {}", status_str);
+                        println!("  Created: {}", node.created_at);
+
+                        if node.node_type.is_statement_family() {
+                            let verify_str = match node.verification_status {
+                                graph::VerificationStatus::Invalid => "invalid",
+                                graph::VerificationStatus::Unproven => "unproven",
+                                graph::VerificationStatus::Contested => "contested",
+                                graph::VerificationStatus::Partial => "partial",
+                                graph::VerificationStatus::Proven => "proven",
+                                graph::VerificationStatus::ProvenStrong => "proven_strong",
+                            };
+                            let primary_types: std::collections::BTreeSet<String> = node
+                                .sources
+                                .iter()
+                                .map(|s| Braim::parse_source(s))
+                                .filter(|(t, _)| t.tier() == "PRIMARY")
+                                .map(|(t, _)| format!("{:?}", t).to_lowercase())
+                                .collect();
+                            println!(
+                                "  Verification: {} (sourced: {} PRIMARY source type{} — a count of citations, not a check)",
+                                verify_str,
+                                primary_types.len(),
+                                if primary_types.len() == 1 { "" } else { "s" }
+                            );
+                            if node.verified_by.is_empty() {
+                                println!("  Verified: no (no 'statement verify' call or recorded check on this node)");
+                            } else {
+                                println!("  Verified: yes (by {:?})", node.verified_by);
+                            }
+                        }
+
+                        if !node.depends_on.is_empty() {
+                            println!("  Depends on:");
+                            for (dep_id, weight) in &node.depends_on {
+                                if let Some(dep_node) = braim.get_node(*dep_id) {
+                                    println!("    ID:{}  {}  (weight: {:.4})", dep_id, dep_node.label, weight);
+                                }
+                            }
+                        }
+
+                        let contradicts: Vec<_> = braim.state.contradicts.iter()
+                            .filter(|e| e.from == id || e.to == id)
+                            .collect();
+                        if !contradicts.is_empty() {
+                            println!("  Contradicts:");
+                            for edge in contradicts {
+                                let other_id = if edge.from == id { edge.to } else { edge.from };
+                                if edge.resolved {
+                                    println!("    ID:{}  resolved  resolution_kind: {}", other_id,
+                                        edge.resolution_kind.as_deref().unwrap_or("winner"));
+                                    if let Some(w) = edge.resolution_winner {
+                                        println!("      winner: ID:{}", w);
+                                    }
+                                    if let Some(s) = edge.resolution_source {
+                                        println!("      source: ID:{}", s);
+                                    }
+                                    if let Some(r) = &edge.resolution_reason {
+                                        println!("      reason: {}", r);
+                                    }
+                                } else {
+                                    println!("    ID:{}  unresolved  reason: {}", other_id, edge.reason);
+                                }
+                            }
+                        }
+
+                        if related {
+                            let (_, depended_by_nodes) = braim.get_related_nodes(id);
+
+                            if !depended_by_nodes.is_empty() {
+                                println!("\n  Referenced by:");
+                                for (ref_id, ref_node) in depended_by_nodes {
+                                    println!("    ID:{}  {}  ({})", ref_id, ref_node.label, match ref_node.node_type {
+                                        NodeType::Atomic => "atomic",
+                                        NodeType::Compound => "compound",
+                                        NodeType::Statement => "statement",
+                                        NodeType::Claim => "claim",
+                                        NodeType::Fact => "fact",
+                                        NodeType::InvalidStatement => "invalid_statement",
+                                        NodeType::ContestedStatement => "contested_statement",
+                                        NodeType::Source => "source",
+                                    });
+                                }
+                            }
+                        }
+
+                        Ok(())
+                    }
+                    None => Err(format!("Error: Node ID {} not found", id)),
+                }
+
+                })();
+                if let Err(e) = shown {
+                    errors.push(e);
+                }
             }
+            if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
         }
         Commands::Audit { semantic } => {
             let report = braim.audit();
@@ -2272,13 +2445,21 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                         ));
                     }
                 }
-            } else if let Some(kv) = set {
-                match kv.split_once('=') {
-                    Some((k, v)) => match braim.set_meta(id, k, v) {
+            } else if !set.is_empty() {
+                // Validate every pair before writing any, so a typo in the
+                // third --set does not leave the first two applied.
+                let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(set.len());
+                for kv in &set {
+                    match kv.split_once('=') {
+                        Some((k, v)) => pairs.push((k, v)),
+                        None => { return Err(format!("--set must be key=value (got '{}')", kv)); }
+                    }
+                }
+                for (k, v) in pairs {
+                    match braim.set_meta(id, k, v) {
                         Ok(_) => println!("set {}.metadata[{}] = {}", id, k, v),
                         Err(e) => { return Err(format!("{}", e)); }
-                    },
-                    None => { return Err("--set must be key=value".to_string()); }
+                    }
                 }
             } else if let Some(k) = inc {
                 match braim.inc_meta(id, &k) {
@@ -2366,6 +2547,38 @@ fn run(cli: Cli, mut braim: Braim) -> Result<(), String> {
                 }
                 Err(e) => Err(e),
             }
+        }
+        Commands::Source(SourceCommands::List) => {
+            let mut sources: Vec<_> = braim
+                .state
+                .nodes
+                .values()
+                .filter(|n| matches!(n.node_type, NodeType::Source))
+                .collect();
+            sources.sort_by_key(|n| n.id);
+            if sources.is_empty() {
+                println!("No source entities registered. Add one with: braim sources add \"label\" --type doc --location \"doc:path\"");
+                return Ok(());
+            }
+            println!("Source entities ({}):\n", sources.len());
+            for src in sources {
+                let cited = braim
+                    .state
+                    .nodes
+                    .values()
+                    .filter(|n| n.source_ids.contains(&src.id))
+                    .count();
+                println!(
+                    "  ID:{}  ({})  {}  {}  [cited by {} node{}]",
+                    src.id,
+                    src.source_type.as_deref().unwrap_or("?"),
+                    src.location.as_deref().unwrap_or("-"),
+                    src.label,
+                    cited,
+                    if cited == 1 { "" } else { "s" }
+                );
+            }
+            Ok(())
         }
         Commands::Source(SourceCommands::Add { label, r#type, location, ingested_by, strict_sources }) => {
             if Braim::label_has_line_number_suffix(&label) {
